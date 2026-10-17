@@ -1,0 +1,10 @@
+# Instalar torch primero desde el índice CPU (esta máquina no tiene GPU NVIDIA):
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+# y después:  pip install -r requirements.txt
+pymupdf>=1.28
+requests>=2.32
+glmocr[layout]==0.1.5        # SDK oficial de GLM-OCR: layout PP-DocLayoutV3 + cliente OpenAI-compatible
+fastapi>=0.115
+uvicorn[standard]>=0.30      # incluye websockets (progreso por WebSocket)
+python-multipart>=0.0.9      # subida de archivos en FastAPI
+markdown>=3.6                # resumen OCR en HTML dentro del demo

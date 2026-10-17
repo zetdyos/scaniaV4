@@ -1,0 +1,15 @@
+# entorno y caché
+.venv/
+__pycache__/
+*.pyc
+
+# datos de prueba y salidas: contienen datos personales de clientes (no versionar por defecto)
+*.pdf
+/old/
+/salida/
+/salida_md/
+/demo_jobs/
+/31143.md
+/31896.md
+/facturas.json
+*.regions.json
