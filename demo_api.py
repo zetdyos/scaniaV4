@@ -469,7 +469,7 @@ function stop(){if(timer){clearInterval(timer);timer=null}if(ws){try{ws.onclose=
 async function poll(){const r=await fetch(`/api/jobs/${current}`);if(r.ok)onStatus(await r.json());}
 async function onStatus(j){if(j.error&&!j.state){$('step').textContent=j.error;return}$('prog').hidden=false;$('bar').value=j.progress;$('pct').textContent=j.progress+'%';let step=j.step||'';if(j.state==='queued'){step=`En cola (posición ${j.queue_position} de ${j.queue_total})`+(j.running_now?` · procesando ahora: ${j.running_now.pdf} ${j.running_now.progress}% — ${j.running_now.step}`:'');}$('step').textContent=step;$('log').textContent=(j.log||[]).join('\n');
  if(j.state==='done'){stop();const rf=await fetch(`/api/jobs/${current}?full=1`);render(await rf.json());refreshJobs();}
- else if(j.state==='error'){stop();$('step').textContent='Error: '+(j.error||'');$('cards').innerHTML=`<div class="card review"><h2>Error</h2><pre>${esc(j.error)}</pre></div>`;refreshJobs();}}
+ else if(j.state==='error'){stop();$('pdfName').textContent=j.pdf||'';$('step').textContent='Error: '+(j.error||'');$('cards').innerHTML=`<div class="card review"><h2>Error</h2><pre>${esc(j.error)}</pre></div>`;refreshJobs();}}
 function showPdf(id,page){$('pdf').src=`/api/jobs/${id}/pdf#page=${page||1}&zoom=page-width`;}
 function goto(page){showPdf(current,page);}
 function copyJson(){navigator.clipboard.writeText($('json').textContent);}
