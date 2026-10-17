@@ -10,6 +10,9 @@ __pycache__/
 /salida_md/
 /demo_jobs/
 /logs/
+
+# API-Tokens de los clientes (secretos)
+/api_keys.json
 /31143.md
 /31896.md
 /facturas.json

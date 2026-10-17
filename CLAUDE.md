@@ -12,7 +12,9 @@ Todo en español. Sin GPU local: los modelos corren en llama-server remotos.
 | `ocr_pipeline.py` | **Fase 1 (CONGELADA).** Página completa + regiones (SDK glmocr, layout PP-DocLayoutV3 en CPU) + verificación de importes y envíos + rescate de precios con Qwen2.5-VL. Expone `run(pdf, ...)`. |
 | `glmocr.yaml` | Configuración del SDK glmocr (copia del `config.yaml` del paquete con cambios mínimos; el cargador NO fusiona YAML parciales). |
 | `facturas_json.py` | **Fase 2.** Divide cada PDF en facturas, construye el JSON del esquema acordado, enriquece con `ocr` y aplica las reglas de evidencia. Expone `build_all(res)`. |
-| `demo_api.py` | Demo FastAPI para evaluación visual: UI en `/`, Swagger `/docs`, ReDoc `/redoc`, WebSocket `/ws/jobs/{id}`. Trabajos en `demo_jobs/`. |
+| `demo_api.py` | API FastAPI (cliente: WTCP) + demo: UI en `/` (solo 127.0.0.1), Swagger `/docs`, ReDoc `/redoc`, WebSocket `/ws/jobs/{id}`. `/api/...` exige `X-API-Key` (tokens en `api_keys.json`, fuera de git). Acepta PDF, PNG, JPG/JPEG, BMP. Trabajos en `demo_jobs/`. |
+| `docs/CONTRATO-WTCP.md` | Contrato con WTCP: qué rutas y campos lee el cliente. **Cualquier cambio de esquema se contrasta con él.** |
+| `deploy/windows/` | Arranque de la API al iniciar sesión en Windows (`SCANIA-api.vbs` → `lanzar_api.ps1`). |
 | `salida/`, `salida_md/` | Salidas del CLI (JSON por PDF y Markdown de la fase 1). |
 | `old/`, `*.pdf` | PDF de prueba del usuario. `Enigdocu.mdb` ya no está en el repo. |
 | `INSTALL.md` | Instalación y despliegue. |
@@ -34,7 +36,10 @@ Todo en español. Sin GPU local: los modelos corren en llama-server remotos.
 ## Esquema de salida
 
 Claves originales del usuario, intactas: `id, estado, motivo_revision, mismatch, total, total_is_printed, version_catalogo, result_version, lineas[]` con `line_kind, seq, descripcion, cantidad, importe_linea, divisa, codigo, hs6, estado, confianza_modelo, candidatos[]`. Los campos arancelarios quedan vacíos.
-Añadidos: `referencia` y los objetos `ocr` (factura y línea; ver docstring de `facturas_json.py`). `importe_linea` = importe total de la línea; las líneas se cuadran contra el **último** "Item(s) Subtotal" (sin envío ni impuestos).
+Añadidos: `referencia`, los objetos `ocr` (factura y línea; ver docstring de `facturas_json.py`) y, por el contrato WTCP, `confianza`, `canal`, `calibrado` (`null`) en cada línea. `importe_linea` = importe total de la línea; las líneas se cuadran contra el **último** "Item(s) Subtotal" (sin envío ni impuestos).
+- `motivo_revision`: `ESTRUCTURA` (sin marcador de pedido y sin líneas) > `LECTURA` > `""`. `CLASIFICACION` reservado para la fase de clasificación. `""` significa que WTCP usa la factura **sin revisión humana**.
+- `mismatch` (y `ocr.incidencias`) en **inglés**: WTCP lo muestra tal cual. `ocr.descuentos[].importe` en positivo.
+- Clasificación arancelaria: fase futura e interna de V4, distinta de V3. Hasta entonces solo se respeta la estructura de esos campos; no crear endpoints ni lógica de clasificación.
 
 ## Hechos documentados (no volver a investigar)
 

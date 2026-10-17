@@ -1,7 +1,8 @@
 """
-Fase 2: estandariza la salida del OCR (fase 1, ocr_pipeline.run) en JSON con el esquema acordado.
-No clasifica: los campos arancelarios (codigo, hs6, candidatos, estado de la línea,
-confianza_modelo, version_catalogo) quedan vacíos para los pasos siguientes.
+Fase 2: estandariza la salida del OCR (fase 1, ocr_pipeline.run) en JSON con el esquema acordado
+(contrato con WTCP: docs/CONTRATO-WTCP.md). No clasifica: los campos arancelarios quedan con su forma
+y sin valor para la fase de clasificación posterior: codigo, hs6, estado de la línea y
+confianza_modelo = "", candidatos = [], confianza / canal / calibrado = null, version_catalogo = "".
 
 Unidad de salida: la FACTURA. Un PDF puede contener varias facturas seguidas. Por cada PDF se
 escribe <salida>/<nombre>.json con un array de facturas. Qué es una factura:
@@ -28,8 +29,9 @@ De dónde salen las líneas de cada factura:
 
 Campos adicionales (objeto `ocr`, anidado para no alterar las claves del esquema):
   - factura.ocr: proveedor, fuente_pdf, paginas, fecha_pedido, subtotal_articulos, envio,
-    impuestos, total_antes_impuestos, descuentos[], metodo_pago, destinatario, direccion_envio,
-    origen_lineas, envios[] (bloques de envío verificados), incidencias[].
+    impuestos, total_antes_impuestos, descuentos[] ({concepto, importe}, importe en positivo),
+    metodo_pago, destinatario, direccion_envio, origen_lineas, envios[] (bloques de envío
+    verificados), incidencias[] (las mismas notas que mismatch, en inglés).
   - linea.ocr: precio_unitario, cantidad_impresa (false si se asumió 1), vendedor, seguimiento,
     estado_envio, condicion, pagina, origen, verificado (cuadró aritméticamente) y evidencia.
   - linea.ocr.evidencia: origen de CADA valor: "leido" (literal en el texto OCR), "aritmetica"
@@ -43,9 +45,13 @@ Campos adicionales (objeto `ocr`, anidado para no alterar las claves del esquema
 
 Convenciones del esquema:
   - importe_linea: importe total de la línea (cantidad x precio unitario cuando el documento
-    imprime precio unitario). divisa: ISO 4217; "$" se registra como "USD".
-  - estado "DONE" al terminar. motivo_revision "LECTURA" si hubo incidencias de lectura; si no "".
-    mismatch: texto con las discrepancias o notas de rescate, o "".
+    imprime precio unitario). divisa: ISO 4217 (tres letras); "$" se registra como "USD"; lo que
+    devuelva un modelo fuera de ese formato se descarta.
+  - estado "DONE" al terminar. motivo_revision (lo decide la lectura, por prioridad):
+    "ESTRUCTURA" si la factura no tiene marcador de pedido ni líneas (no parece una factura de
+    mercadería), "LECTURA" si hubo incidencias de lectura, "" si no. "CLASIFICACION" queda
+    reservado para la fase de clasificación. mismatch: discrepancias o notas de rescate, en
+    inglés (lo muestra WTCP tal cual a quien revisa), o "".
   - total_is_printed: true si el total se leyó impreso; false si se sumó de las líneas.
   - result_version: versión de este formato (1).
 
@@ -188,6 +194,20 @@ def currency_of(text):
     return "USD" if ("USD" in text or "$" in text) else ""
 
 
+ISO_CURRENCY_RE = re.compile(r"^[A-Z]{3}$")
+
+
+def goods_line(seq, l, divisa, ocr):
+    """Línea del esquema. Los campos de clasificación van con su forma y sin valor (ver docstring)."""
+    return {
+        "line_kind": "goods", "seq": seq,
+        "descripcion": l["desc"], "cantidad": str(l["qty"]), "importe_linea": l["amount"], "divisa": divisa,
+        "codigo": "", "hs6": "", "estado": "", "confianza_modelo": "", "candidatos": [],
+        "confianza": None, "canal": None, "calibrado": None,
+        "ocr": ocr,
+    }
+
+
 def lines_sum(ls):
     return sum(float(l["amount"]) for l in ls) if ls and all(l["amount"] for l in ls) else None
 
@@ -199,7 +219,7 @@ ID_LIKE_RE = re.compile(r"^[A-Z]{0,4}[\d-]{9,}$")
 
 def description_issues(lines):
     bad = [l["desc"] for l in lines if ID_LIKE_RE.match(re.sub(r"\s", "", l["desc"] or "")) or not (l["desc"] or "").strip()]
-    return [f"{len(bad)} línea(s) con descripción vacía o que parece un identificador: " + ", ".join(f"«{b}»" for b in bad[:4])] if bad else []
+    return [f"{len(bad)} line(s) with an empty description or one that looks like an identifier: " + ", ".join(f'"{b}"' for b in bad[:4])] if bad else []
 
 
 # ----------------------------------------------------------------------------- división en facturas
@@ -259,7 +279,7 @@ def lines_from_shipments(shipments, unverified, full_texts, regions):
     lines, issues = [], []
     for it in items:
         if it["price"] is None:
-            issues.append(f"artículo sin precio: «{it['desc'][:50]}»")
+            issues.append(f'item without a price: "{it["desc"][:50]}"')
         meta = (metas.get((it["page"], it["ri"])) or [{}])
         meta = meta.pop(0) if meta and meta[0] else {}
         it["_estado"] = meta.get("estado_envio", "")
@@ -270,7 +290,7 @@ def lines_from_shipments(shipments, unverified, full_texts, regions):
                       "extra": dict(meta, determinista=True)})
     for r in shipments:
         if not p1.shipment_ok(r):
-            issues.append(f"envío de {r['total']:.2f} no cuadra (suma {p1.shipment_sum(r):.2f})")
+            issues.append(f"shipment of {r['total']:.2f} does not add up (sum of items {p1.shipment_sum(r):.2f})")
     return lines, issues
 
 
@@ -380,7 +400,7 @@ def invoice_fields(md, full_texts, inv, pdf):
             key = (p1.squash(concepto), d.group(2))
             if key not in seen:
                 seen.add(key)
-                f["descuentos"].append({"concepto": concepto, "importe": "-" + money(d.group(2))})
+                f["descuentos"].append({"concepto": concepto, "importe": money(d.group(2))})
     for text in full_texts:
         lines = text.splitlines()
         for i, line in enumerate(lines):
@@ -477,9 +497,9 @@ def evidence_issues(lines):
     n_ar = sum(1 for l in lines if l.get("evidence", {}).get("cantidad") == "aritmetica")
     n_mod = sum(1 for l in lines if "modelo" in l.get("evidence", {}).values())
     if n_ar:
-        out.append(f"cantidad inferida por aritmética en {n_ar} línea(s)")
+        out.append(f"quantity inferred by arithmetic in {n_ar} line(s)")
     if n_mod:
-        out.append(f"{n_mod} línea(s) con valor(es) sin respaldo en el OCR")
+        out.append(f"{n_mod} line(s) with value(s) not found in the OCR text")
     return out
 
 
@@ -579,7 +599,7 @@ def build_shipment_invoice(inv_id, res, inv, block, k, n, order_fields, order_to
     lines = []
     for it in block["items"]:
         if it["price"] is None:
-            issues.append(f"artículo sin precio: «{it['desc'][:50]}»")
+            issues.append(f'item without a price: "{it["desc"][:50]}"')
         lines.append({"desc": description_from_full_text(it["desc"], it["qty"], full_texts), "qty": it["qty"],
                       "amount": f"{it['qty'] * it['price']:.2f}" if it["price"] is not None else "",
                       "unit": f"{it['price']:.2f}" if it["price"] is not None else "", "qty_printed": True,
@@ -588,13 +608,13 @@ def build_shipment_invoice(inv_id, res, inv, block, k, n, order_fields, order_to
     s = lines_sum(lines)
     total, total_printed = block["total"], bool(block["total"])
     if not total:
-        issues.append("bloque sin línea de total; total calculado como suma de líneas")
+        issues.append("shipment block without a printed total; total computed as the sum of lines")
         total = f"{s:.2f}" if s is not None else ""
     ok = total_printed and s is not None and abs(s - float(total)) < 0.01
     if total_printed and s is not None and not ok:
-        issues.append(f"suma de líneas {s:.2f} vs total del envío {total}")
+        issues.append(f"sum of lines {s:.2f} vs shipment total {total}")
     if any(it["src"] == "qwen" for it in block["items"]):
-        issues.append("precio(s) rescatado(s) con Qwen2.5-VL en la fase 1")
+        issues.append("unit price(s) recovered from the image by the vision model (Qwen2.5-VL)")
     for l in lines:
         l["verified"] = ok
         l["evidence"] = line_evidence(l, "", set(), ok)
@@ -616,12 +636,9 @@ def build_shipment_invoice(inv_id, res, inv, block, k, n, order_fields, order_to
         "motivo_revision": "LECTURA" if issues else "", "mismatch": "; ".join(issues),
         "total": total, "total_is_printed": total_printed,
         "version_catalogo": "", "result_version": RESULT_VERSION,
-        "lineas": [{
-            "line_kind": "goods", "seq": i,
-            "descripcion": l["desc"], "cantidad": str(l["qty"]), "importe_linea": l["amount"], "divisa": divisa,
-            "codigo": "", "hs6": "", "estado": "", "confianza_modelo": "", "candidatos": [],
-            "ocr": line_ocr(l, pagina=order_pages[l["page_rel"] - 1] + 1, verificado=l["verified"], sq_text=sq_text, extra=l["extra"]),
-        } for i, l in enumerate(lines)],
+        "lineas": [goods_line(i, l, divisa, line_ocr(l, pagina=order_pages[l["page_rel"] - 1] + 1, verificado=l["verified"],
+                                                    sq_text=sq_text, extra=l["extra"]))
+                   for i, l in enumerate(lines)],
         "referencia": inv["ref"],
         "ocr": fields,
     }
@@ -651,7 +668,7 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
     total_printed = bool(total)
     target = items_subtotal or total  # suma esperada de las líneas (sin envío ni impuestos)
     if 'title="recuperado con Qwen2.5-VL"' in md:
-        issues.append("precio(s) rescatado(s) con Qwen2.5-VL en la fase 1")
+        issues.append("unit price(s) recovered from the image by the vision model (Qwen2.5-VL)")
 
     if shipments:
         lines, more = lines_from_shipments(shipments, unverified, full_texts, regions)
@@ -664,24 +681,25 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
         for l in data.get("lineas", []):
             amt = money(l.get("importe_linea"))
             if amt and amt not in ocr_amounts:
-                issues.append(f"importe {amt} no hallado en el OCR («{l.get('descripcion', '')[:40]}»)")
+                issues.append(f'amount {amt} not found in the OCR text ("{l.get("descripcion", "")[:40]}")')
             q = re.search(r"\d+", str(l.get("cantidad", "")))
             lines.append({"desc": l.get("descripcion", "").strip(), "qty": int(q.group(0)) if q else 1,
                           "amount": amt, "unit": money(l.get("precio_unitario")), "src": "qwen27b",
                           "extra": {"vendedor": l.get("vendedor", ""), "seguimiento": l.get("seguimiento", ""),
                                     "estado_envio": l.get("estado_envio", "")}})
-            if l.get("divisa"):
-                divisa = l["divisa"]
+            d = str(l.get("divisa") or "").strip().upper()
+            if ISO_CURRENCY_RE.match(d):
+                divisa = d
         t = money(data.get("total"))
         if t and not total:
             if t in ocr_amounts:
                 total, total_printed = t, bool(data.get("total_is_printed", True))
             else:
-                issues.append(f"total {t} devuelto por el modelo no hallado en el OCR")
+                issues.append(f"total {t} returned by the model not found in the OCR text")
         source = "llm"
     else:
         lines, source = [], "ninguna"
-        issues.append("sin bloques de envío y extracción con modelo desactivada")
+        issues.append("no shipment blocks and model extraction disabled")
 
     # Rescate visual: solo en la vía del 27B, cuando la suma no reproduce el total impreso.
     if source == "llm" and total_printed and target and (lines_sum(lines) is None or abs(lines_sum(lines) - float(target)) >= 0.01):
@@ -691,11 +709,12 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
                 vl_lines, _ = lines_with_vl(res["pdf"], pages, vl_server, timeout, log)
             except Exception as e:  # noqa: BLE001
                 vl_lines = []
-                issues.append(f"Qwen2.5-VL falló: {e}")
+                issues.append(f"vision model (Qwen2.5-VL) failed: {e}")
             # Regla dura: sin descripción en el OCR, el artículo se descarta; sin precio literal, no se acepta.
             kept = [v for v in vl_lines if p1.squash(v["desc"])[:20] and p1.squash(v["desc"])[:20] in sq_text]
             if len(kept) < len(vl_lines):
-                issues.append(f"Qwen2.5-VL devolvió {len(vl_lines) - len(kept)} artículo(s) sin descripción en el OCR; descartado(s)")
+                issues.append(f"vision model (Qwen2.5-VL) returned {len(vl_lines) - len(kept)} item(s) whose description "
+                              "is not in the OCR text; discarded")
             literal_price = bool(kept) and all(v.get("unit") and v["unit"] in ocr_amounts for v in kept)
             vl_sum = lines_sum(kept)
             if kept and literal_price and vl_sum is not None and abs(vl_sum - float(target)) < 0.01:
@@ -703,22 +722,29 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
                     for v, o in zip(kept, lines):
                         v["extra"] = o.get("extra", {})
                 lines, source = kept, "qwen-vl"
-                issues = [i for i in issues if not i.startswith("importe ")]
-                issues.append("líneas obtenidas con Qwen2.5-VL (precios literales en el OCR); cantidad x precio reproduce el "
-                              + ("subtotal de artículos impreso" if items_subtotal else "total impreso"))
+                issues = [i for i in issues if not i.startswith("amount ")]
+                issues.append("lines read from the image by the vision model (Qwen2.5-VL), unit prices found literally in "
+                              "the OCR text; quantity x price matches the printed "
+                              + ("items subtotal" if items_subtotal else "total"))
             elif kept and not literal_price:
-                issues.append("Qwen2.5-VL rechazado: precio(s) unitario(s) no están literalmente en el OCR")
+                issues.append("vision model (Qwen2.5-VL) rejected: unit price(s) not found literally in the OCR text")
             else:
-                issues.append("Qwen2.5-VL tampoco cuadra (suma " + ("?" if vl_sum is None else f"{vl_sum:.2f}") + f" vs {target})")
+                issues.append("vision model (Qwen2.5-VL) does not add up either (sum " + ("?" if vl_sum is None else f"{vl_sum:.2f}")
+                              + f" vs {target})")
         else:
-            issues.append(f"Qwen2.5-VL no responde en {vl_server}; sin rescate visual")
+            issues.append(f"vision model (Qwen2.5-VL) not responding at {vl_server}; no visual check")
 
     issues += description_issues(lines)
     if not total and lines_sum(lines) is not None:
         total, total_printed = f"{lines_sum(lines):.2f}", False
         target = total
     if target and lines_sum(lines) is not None and abs(lines_sum(lines) - float(target)) >= 0.01:
-        issues.append(f"suma de líneas {lines_sum(lines):.2f} vs " + ("subtotal de artículos" if items_subtotal else "total") + f" {target}")
+        issues.append(f"sum of lines {lines_sum(lines):.2f} vs " + ("items subtotal" if items_subtotal else "total") + f" {target}")
+    # Sin marcador de pedido y sin ninguna línea: no parece una factura de mercadería (albarán,
+    # confirmación de envío, recibo de pago...). Lo decide una persona: nunca se descarta en silencio.
+    estructura = not inv["tipo"] and not lines
+    if estructura:
+        issues.append("the document does not look like a goods invoice: no order marker and no item lines")
 
     all_ok = bool(target) and lines_sum(lines) is not None and abs(lines_sum(lines) - float(target)) < 0.01
     for l in lines:
@@ -733,19 +759,15 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
     return {
         "id": inv_id,
         "estado": "DONE",
-        "motivo_revision": "LECTURA" if issues else "",
+        "motivo_revision": "ESTRUCTURA" if estructura else "LECTURA" if issues else "",
         "mismatch": "; ".join(issues),
         "total": total,
         "total_is_printed": total_printed,
         "version_catalogo": "",
         "result_version": RESULT_VERSION,
-        "lineas": [{
-            "line_kind": "goods", "seq": i,
-            "descripcion": l["desc"], "cantidad": str(l["qty"]), "importe_linea": l["amount"], "divisa": divisa,
-            "codigo": "", "hs6": "", "estado": "", "confianza_modelo": "", "candidatos": [],
-            "ocr": line_ocr(l, pagina=pages[min(l.get("page_rel", 1), len(pages)) - 1] + 1,
-                            verificado=l["verified"], sq_text=sq_text, extra=l.get("extra")),
-        } for i, l in enumerate(lines)],
+        "lineas": [goods_line(i, l, divisa, line_ocr(l, pagina=pages[min(l.get("page_rel", 1), len(pages)) - 1] + 1,
+                                                    verificado=l["verified"], sq_text=sq_text, extra=l.get("extra")))
+                   for i, l in enumerate(lines)],
         "referencia": inv["ref"],
         "ocr": fields,
     }, source
@@ -783,10 +805,11 @@ def build_all(res, use_llm=True, llm_server=QWEN27_SERVER, vl_server=VL_SERVER, 
                 + (f" ({doc['mismatch']})" if doc["mismatch"] else ""))
             docs.append(doc)
         if dups:
-            note = f"referencia repetida en el PDF (también en otra(s) factura(s) del mismo pedido duplicado)"
+            note = "order reference repeated in the file (the same order appears more than once)"
             for doc in docs:
                 doc["mismatch"] = "; ".join(filter(None, [doc["mismatch"], note]))
-                doc["motivo_revision"] = "LECTURA"
+                if doc["motivo_revision"] != "ESTRUCTURA":
+                    doc["motivo_revision"] = "LECTURA"
                 doc["ocr"]["incidencias"].append(note)
         out.extend(docs)
     return out

@@ -1,10 +1,11 @@
 """
-Demo interno (FastAPI) para evaluar visualmente el OCR de facturas.
+API de OCR de facturas (FastAPI) y demo para evaluarlo visualmente. Contrato con el cliente WTCP:
+docs/CONTRATO-WTCP.md.
 
-- GET  /                      interfaz: subir PDF, barra de progreso, tarjetas de facturas a la
-                              izquierda y el PDF a la derecha, JSON y resumen OCR desplegables.
-- POST /api/jobs              sube un PDF y lo encola (un trabajo a la vez: los llama-server
-                              remotos tienen un solo slot).
+- GET  /                      interfaz (solo desde 127.0.0.1): subir archivo, barra de progreso,
+                              tarjetas de facturas a la izquierda y el PDF a la derecha.
+- POST /api/jobs              sube un PDF o una imagen (PNG, JPG/JPEG, BMP) y lo encola (un
+                              trabajo a la vez: los llama-server remotos tienen un solo slot).
 - GET  /api/jobs              lista de trabajos (los resultados persisten en demo_jobs/).
 - GET  /api/jobs/{id}         estado, progreso y registro; con ?full=1 incluye el JSON y el OCR.
 - GET  /api/jobs/{id}/pdf     el PDF subido (para el visor).
@@ -13,13 +14,19 @@ Demo interno (FastAPI) para evaluar visualmente el OCR de facturas.
 - GET  /api/health           estado de los tres llama-server del host de modelos.
 - GET  /docs  y  /redoc      documentación OpenAPI (Swagger UI y ReDoc).
 
-Sin autenticación: uso interno. Puerto por defecto 8091 (variable DEMO_PORT). Arranque:
+Acceso: todas las rutas /api/... y el WebSocket exigen un API-Token en la cabecera X-API-Key
+(401 si falta o no es válido). Los tokens viven en api_keys.json ({"nombre": "token", ...}, fuera
+de git; otra ruta con SCANIA_API_KEYS_FILE). Desde 127.0.0.1 no se pide token: es la propia demo.
+/docs, /redoc y /openapi.json son públicos (solo esquemas, sin datos).
+
+Puerto por defecto 8091 (variable DEMO_PORT). Arranque:
     .venv/bin/python demo_api.py                                   # 0.0.0.0:8091
     .venv/bin/uvicorn demo_api:app --host 0.0.0.0 --port 8091      # equivalente
 OCR_MODELS_HOST (opcional, por defecto 192.168.1.194) indica dónde están los llama-server.
 """
 
 import asyncio
+import hmac
 import json
 import os
 import re
@@ -28,12 +35,14 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
+import fitz  # PyMuPDF
 import markdown as mdlib
 import requests
-from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, HTTPException, Request, Security, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
 
 import facturas_json as f2
@@ -43,22 +52,75 @@ HERE = Path(__file__).resolve().parent
 JOBS_DIR = HERE / "demo_jobs"
 JOBS_DIR.mkdir(exist_ok=True)
 
+# ----------------------------------------------------------------------------- acceso (API-Token)
+
+API_KEYS_FILE = Path(os.environ.get("SCANIA_API_KEYS_FILE") or HERE / "api_keys.json")
+API_KEYS: dict[str, str] = json.loads(API_KEYS_FILE.read_text(encoding="utf-8")) if API_KEYS_FILE.exists() else {}
+LOCAL_HOSTS = {"127.0.0.1", "::1", "localhost"}
+api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False, description="API-Token del cliente")
+
+
+def is_local(host: Optional[str]) -> bool:
+    return host in LOCAL_HOSTS
+
+
+def key_name(key: Optional[str]) -> Optional[str]:
+    """Nombre del token (p. ej. 'wtcp-produccion') o None. Comparación en tiempo constante."""
+    if not key:
+        return None
+    return next((name for name, value in API_KEYS.items() if hmac.compare_digest(key, value)), None)
+
+
+def require_key(request: Request, key: Optional[str] = Security(api_key_header)) -> str:
+    """Dependencia de todas las rutas /api: devuelve quién llama ('local' para la demo)."""
+    if is_local(request.client.host if request.client else None):
+        return "local"
+    name = key_name(key)
+    if not name:
+        raise HTTPException(401, "missing or invalid API token (X-API-Key header)")
+    return name
+
+
+# ----------------------------------------------------------------------------- entrada
+
+INPUT_TYPES = {".pdf": "pdf", ".png": "png", ".jpg": "jpeg", ".jpeg": "jpeg", ".bmp": "bmp"}
+MAX_UPLOAD_BYTES = 50 * 1024 * 1024
+IMAGE_PAGE_WIDTH_PT = 612  # 8.5 in: la fase 1 está ajustada para escaneos Letter (fit_dpi)
+
+
+def image_to_pdf(data: bytes, filetype: str) -> bytes:
+    """Imagen -> PDF de una página de 8.5 in de ancho con la misma proporción. Así la fase 1 la
+    trata como un escaneo Letter: fit_dpi elige el dpi para no pasar de las 4096 fichas de imagen
+    de llama.cpp. Convertida tal cual, una foto sin metadatos de DPI mediría pixeles = puntos y el
+    piso de 72 dpi de fit_dpi la dejaría muy por encima del límite (reescalado bilineal)."""
+    with fitz.open(stream=data, filetype=filetype) as img:
+        w, h = img[0].rect.width, img[0].rect.height
+    out = fitz.open()
+    page = out.new_page(width=IMAGE_PAGE_WIDTH_PT, height=IMAGE_PAGE_WIDTH_PT * h / w)
+    page.insert_image(page.rect, stream=data)
+    pdf = out.tobytes()
+    out.close()
+    return pdf
+
+
 TAGS = [
-    {"name": "trabajos", "description": "Subida de PDF y consulta de resultados. Un trabajo a la vez: los llama-server tienen un solo slot."},
-    {"name": "archivos", "description": "PDF original y JSON de facturas de un trabajo."},
+    {"name": "trabajos", "description": "Subida de archivos y consulta de resultados. Un trabajo a la vez: los llama-server tienen un solo slot."},
+    {"name": "archivos", "description": "PDF procesado y JSON de facturas de un trabajo."},
     {"name": "sistema", "description": "Salud de los servidores de modelos."},
 ]
 app = FastAPI(
     title="PDF Reder · OCR de facturas",
     version="1.0.0",
     description=(
-        "API del demo interno de OCR de facturas.\n\n"
-        "**Flujo:** `POST /api/jobs` sube un PDF y devuelve un `id`; el progreso llega por WebSocket en "
+        "API de OCR de facturas. Contrato con WTCP en `docs/CONTRATO-WTCP.md` del repositorio.\n\n"
+        "**Acceso:** todas las rutas `/api/...` y el WebSocket exigen el API-Token en la cabecera `X-API-Key` "
+        "(botón *Authorize*); sin token o con uno inválido responden `401`.\n\n"
+        "**Flujo:** `POST /api/jobs` sube un PDF o una imagen (PNG, JPG/JPEG, BMP) y devuelve un `id`; el progreso llega por WebSocket en "
         "`/ws/jobs/{id}` (un JSON por mensaje con `state`, `progress`, `step`, `log`; se cierra al terminar) "
         "o consultando `GET /api/jobs/{id}`; con `?full=1` se obtiene el array de facturas y el OCR en HTML.\n\n"
         "**Fases:** 1) OCR con GLM-OCR (página completa + regiones + verificación + rescate con Qwen2.5-VL); "
         "2) división en facturas y JSON estándar (Qwen3.6-27B para líneas cuando no hay bloques de envío).\n\n"
-        f"**Host de modelos:** `{p1.MODELS_HOST}` (variable de entorno `OCR_MODELS_HOST`). Sin autenticación: uso interno."
+        f"**Host de modelos:** `{p1.MODELS_HOST}` (variable de entorno `OCR_MODELS_HOST`)."
     ),
     openapi_tags=TAGS, docs_url="/docs", redoc_url="/redoc",
 )
@@ -73,13 +135,15 @@ class RunningNow(BaseModel):
 class JobStatus(BaseModel):
     id: str
     pdf: str
-    state: str = Field(description="queued | running | done | error")
+    state: Literal["queued", "running", "done", "error"]
     progress: int = Field(ge=0, le=100)
     step: str = ""
     created: float
     started: Optional[float] = None
     seconds: Optional[float] = None
     error: Optional[str] = None
+    error_code: Optional[Literal["UNREADABLE", "INTERNAL"]] = Field(
+        None, description="solo con state=error. UNREADABLE: el problema es el archivo. INTERNAL: el problema es del servidor (reintentar)")
     n_pages: Optional[int] = None
     n_invoices: Optional[int] = None
     n_lines: Optional[int] = None
@@ -127,7 +191,9 @@ def load_jobs():
         if m.exists():
             job = json.loads(m.read_text(encoding="utf-8"))
             if job.get("state") in ("queued", "running"):
-                job.update(state="error", error="interrumpido al reiniciar el servidor", step="Error")
+                job.update(state="error", error="interrupted by a server restart", step="Error")
+            if job["state"] == "error" and not job.get("error_code"):
+                job["error_code"] = "INTERNAL"  # trabajos anteriores a error_code o interrumpidos: se reintentan
             jobs[job["id"]] = job
 
 
@@ -171,8 +237,10 @@ def process(job_id):
         job.update(state="done", progress=100, step="Listo", n_pages=res["n_pages"], n_invoices=len(out),
                    n_lines=sum(len(i["lineas"]) for i in out), n_review=sum(1 for i in out if i["motivo_revision"]),
                    n_verified=sum(1 for i in out for l in i["lineas"] if l["ocr"]["verificado"]))
-    except Exception as e:  # noqa: BLE001
-        job.update(state="error", error=f"{type(e).__name__}: {e}", step="Error")
+    except fitz.FileDataError as e:  # el archivo no se puede leer (la subida ya lo valida; por si acaso)
+        job.update(state="error", error=f"unreadable file: {e}", error_code="UNREADABLE", step="Error")
+    except Exception as e:  # noqa: BLE001  modelos caídos, red, errores internos: el cliente reintenta
+        job.update(state="error", error=f"{type(e).__name__}: {e}", error_code="INTERNAL", step="Error")
     job["seconds"] = round(time.time() - job["started"], 1)
     save_meta(job)
 
@@ -182,11 +250,16 @@ def public(j):
 
 
 @app.get("/", response_class=HTMLResponse, include_in_schema=False)
-def index():
+def index(request: Request):
+    if not is_local(request.client.host if request.client else None):
+        raise HTTPException(404, "Not Found")  # la demo solo se abre desde la propia máquina
     return HTML
 
 
-@app.get("/api/health", response_model=Health, tags=["sistema"], summary="Estado de los servidores de modelos")
+AUTH = [Security(require_key)]
+
+
+@app.get("/api/health", response_model=Health, tags=["sistema"], summary="Estado de los servidores de modelos", dependencies=AUTH)
 def health():
     out = []
     for name, url in (("GLM-OCR", p1.DEFAULT_SERVER), ("Qwen3.6-27B", f2.QWEN27_SERVER), ("Qwen2.5-VL", f2.VL_SERVER)):
@@ -203,16 +276,42 @@ def health():
                   jobs_queued=sum(1 for j in jobs.values() if j["state"] == "queued"))
 
 
-@app.post("/api/jobs", response_model=JobCreated, status_code=201, tags=["trabajos"], summary="Subir un PDF y encolarlo")
-async def create_job(file: UploadFile = File(..., description="PDF a procesar")):
-    if not (file.filename or "").lower().endswith(".pdf"):
-        raise HTTPException(400, "Solo se aceptan archivos PDF")
+@app.post("/api/jobs", response_model=JobCreated, status_code=201, tags=["trabajos"], summary="Subir un archivo y encolarlo",
+          responses={400: {"description": "archivo no aceptado"}, 413: {"description": "archivo demasiado grande"}})
+async def create_job(file: UploadFile = File(..., description="PDF, PNG, JPG/JPEG o BMP (nombre en ASCII)"),
+                     client: str = Security(require_key)):
+    filename = Path(file.filename or "").name
+    ext = Path(filename).suffix.lower()
+    if ext not in INPUT_TYPES:
+        raise HTTPException(400, "unsupported file type: send a PDF, PNG, JPG/JPEG or BMP file")
+    if not filename.isascii():
+        raise HTTPException(400, "the file name must be ASCII")
+    data = await file.read()
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise HTTPException(413, f"file too large (max {MAX_UPLOAD_BYTES // (1024 * 1024)} MB)")
+    # Validar ANTES de crear el trabajo: PyMuPDF abre de forma perezosa y un archivo dañado puede
+    # fallar recién al cargar la página, así que se carga la primera (y la imagen se convierte aquí).
+    try:
+        with fitz.open(stream=data, filetype=INPUT_TYPES[ext]) as doc:
+            n_pages = doc.page_count
+            if n_pages:
+                doc.load_page(0)
+        pdf_bytes = image_to_pdf(data, INPUT_TYPES[ext]) if ext != ".pdf" and n_pages else None
+    except Exception:  # noqa: BLE001  PyMuPDF lanza distintos tipos según el formato
+        raise HTTPException(400, f"the file cannot be read as {ext[1:].upper()}") from None
+    if n_pages == 0:
+        raise HTTPException(400, "the file has no pages")
     job_id = time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
     d = JOBS_DIR / job_id
     d.mkdir()
-    name = re.sub(r"[^\w.-]", "_", Path(file.filename).name)
-    (d / name).write_bytes(await file.read())
-    job = {"id": job_id, "pdf": name, "state": "queued", "progress": 0, "step": "En cola", "log": [], "created": time.time()}
+    name = re.sub(r"[^\w.-]", "_", filename)
+    (d / name).write_bytes(data)
+    pdf = name
+    if pdf_bytes is not None:  # la fase 1 recibe siempre un PDF
+        pdf = Path(name).stem + ".pdf"
+        (d / pdf).write_bytes(pdf_bytes)
+    job = {"id": job_id, "pdf": pdf, "original": name, "client": client, "state": "queued", "progress": 0,
+           "step": "En cola", "log": [f"subido por {client}: {name}"], "created": time.time()}
     with lock:
         jobs[job_id] = job
     save_meta(job)
@@ -220,7 +319,8 @@ async def create_job(file: UploadFile = File(..., description="PDF a procesar"))
     return {"id": job_id}
 
 
-@app.get("/api/jobs", response_model=list[JobStatus], tags=["trabajos"], summary="Listar trabajos (más recientes primero)")
+@app.get("/api/jobs", response_model=list[JobStatus], tags=["trabajos"], summary="Listar trabajos (más recientes primero)",
+         dependencies=AUTH)
 def list_jobs():
     return [public(j) for j in sorted(jobs.values(), key=lambda j: j["created"], reverse=True)]
 
@@ -245,7 +345,7 @@ def job_status(job_id: str, full: bool = False) -> dict:
 
 
 @app.get("/api/jobs/{job_id}", response_model=JobDetail, response_model_exclude_none=True, tags=["trabajos"],
-         summary="Estado de un trabajo; con full=1 incluye facturas y OCR")
+         summary="Estado de un trabajo; con full=1 incluye facturas y OCR", dependencies=AUTH)
 def get_job(job_id: str, full: int = 0):
     return job_status(job_id, bool(full))
 
@@ -253,7 +353,11 @@ def get_job(job_id: str, full: int = 0):
 @app.websocket("/ws/jobs/{job_id}")
 async def ws_job(ws: WebSocket, job_id: str):
     """Progreso en tiempo real: envía el estado (sin el resultado) cada medio segundo mientras el
-    trabajo está en cola o en ejecución, un último mensaje al terminar y cierra."""
+    trabajo está en cola o en ejecución, un último mensaje al terminar y cierra. Exige X-API-Key
+    salvo desde 127.0.0.1 (sin token: cierra con el código 1008, violación de política)."""
+    if not is_local(ws.client.host if ws.client else None) and not key_name(ws.headers.get("x-api-key")):
+        await ws.close(code=1008, reason="missing or invalid API token")
+        return
     await ws.accept()
     if job_id not in jobs:
         await ws.send_json({"error": "trabajo no encontrado"})
@@ -275,7 +379,8 @@ async def ws_job(ws: WebSocket, job_id: str):
     await ws.close()
 
 
-@app.get("/api/jobs/{job_id}/pdf", response_class=FileResponse, tags=["archivos"], summary="PDF original del trabajo")
+@app.get("/api/jobs/{job_id}/pdf", response_class=FileResponse, tags=["archivos"], dependencies=AUTH,
+         summary="PDF procesado del trabajo (una imagen subida se sirve convertida a PDF)")
 def get_pdf(job_id: str):
     j = jobs.get(job_id)
     if not j:
@@ -284,10 +389,13 @@ def get_pdf(job_id: str):
                         headers={"Content-Disposition": f'inline; filename="{j["pdf"]}"'})
 
 
-@app.get("/api/jobs/{job_id}/result.json", response_class=FileResponse, tags=["archivos"], summary="Descargar el JSON de facturas")
+@app.get("/api/jobs/{job_id}/result.json", response_class=FileResponse, tags=["archivos"], summary="Descargar el JSON de facturas",
+         dependencies=AUTH)
 def get_result(job_id: str):
     j = jobs.get(job_id)
-    if not j or j["state"] != "done":
+    if not j:
+        raise HTTPException(404, "trabajo no encontrado")
+    if j["state"] != "done":
         raise HTTPException(404, "resultado no disponible")
     return FileResponse(JOBS_DIR / job_id / "result.json", media_type="application/json",
                         filename=Path(j["pdf"]).stem + ".facturas.json")
@@ -327,8 +435,8 @@ a.pg{color:var(--accent);text-decoration:none;cursor:pointer}.small{font-size:11
 </style></head><body>
 <header>
   <h1>Demo OCR de facturas</h1>
-  <input type="file" id="file" accept="application/pdf">
-  <button class="primary" id="btn" onclick="upload()">Procesar PDF</button>
+  <input type="file" id="file" accept=".pdf,.png,.jpg,.jpeg,.bmp">
+  <button class="primary" id="btn" onclick="upload()">Procesar</button>
   <span class="muted">o abrir anterior:</span>
   <select id="jobs" onchange="if(this.value)load(this.value)"><option value="">— trabajos anteriores —</option></select>
   <span style="flex:1"></span>
@@ -341,7 +449,7 @@ a.pg{color:var(--accent);text-decoration:none;cursor:pointer}.small{font-size:11
 <details id="dOcr"><summary>Resumen OCR (fase 1: texto de página completa, tablas y verificación)</summary><div class="body ocr" id="ocr"></div></details>
 <details id="dLog"><summary>Registro del proceso</summary><div class="body"><pre id="log"></pre></div></details>
 <main>
-  <section id="cards"><p class="muted" style="padding:12px">Subí un PDF para empezar. Los resultados anteriores quedan guardados en la lista de arriba.</p></section>
+  <section id="cards"><p class="muted" style="padding:12px">Subí un PDF o una imagen (PNG, JPG, BMP) para empezar. Los resultados anteriores quedan guardados en la lista de arriba.</p></section>
   <aside id="viewer"><div class="bar"><span id="pdfName" class="muted">PDF</span><span style="flex:1"></span><span class="small">Evidencia: <span class="ev ev-leido">●</span> leído · <span class="ev ev-aritmetica">≈</span> por aritmética · <span class="ev ev-calculado">=</span> calculado · <span class="ev ev-asumido">1</span> asumido · <span class="ev ev-modelo">?</span> sin respaldo · clic en «pág. N» salta a la página</span></div><iframe id="pdf" title="PDF"></iframe></aside>
 </main>
 <script>
@@ -352,7 +460,7 @@ async function health(){try{const h=await (await fetch('/api/health')).json();$(
 const $=id=>document.getElementById(id);
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 async function refreshJobs(){const r=await fetch('/api/jobs');const js=await r.json();const sel=$('jobs');sel.innerHTML='<option value="">— trabajos anteriores —</option>'+js.map(j=>`<option value="${j.id}" ${current===j.id?'selected':''}>${esc(j.pdf)} · ${j.state}${j.n_invoices!=null?' · '+j.n_invoices+' fact.':''} · ${new Date(j.created*1000).toLocaleString()}</option>`).join('');}
-async function upload(){const f=$('file').files[0];if(!f){alert('Elegí un PDF');return}$('btn').disabled=true;const fd=new FormData();fd.append('file',f);const r=await fetch('/api/jobs',{method:'POST',body:fd});$('btn').disabled=false;if(!r.ok){alert(await r.text());return}const {id}=await r.json();load(id);}
+async function upload(){const f=$('file').files[0];if(!f){alert('Elegí un PDF o una imagen');return}$('btn').disabled=true;const fd=new FormData();fd.append('file',f);const r=await fetch('/api/jobs',{method:'POST',body:fd});$('btn').disabled=false;if(!r.ok){alert(await r.text());return}const {id}=await r.json();load(id);}
 function load(id){current=id;stop();$('cards').innerHTML='';$('json').textContent='';$('ocr').innerHTML='';$('summary').innerHTML='';showPdf(id,1);refreshJobs();
  // progreso por WebSocket; si no está disponible, sondeo cada 1,5 s
  try{ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+`/ws/jobs/${id}`);ws.onmessage=e=>onStatus(JSON.parse(e.data));ws.onerror=()=>{stop();poll();timer=setInterval(poll,1500);};ws.onclose=()=>{if(timer===null&&ws)fetch(`/api/jobs/${id}`).then(r=>r.json()).then(onStatus);};}

@@ -54,14 +54,28 @@ La primera ejecución descarga `PaddlePaddle/PP-DocLayoutV3_safetensors` desde H
 Genera `salida/<nombre>.json` (array de facturas) y, opcionalmente, el Markdown de la fase 1. Solo fase 1:
 `.venv/bin/python ocr_pipeline.py factura.pdf -o factura.md`.
 
-## 6. Demo web (evaluación interna, sin autenticación)
+## 6. API y demo web
+
+**Acceso (contrato WTCP, `docs/CONTRATO-WTCP.md` §7):** todas las rutas `/api/...` y el WebSocket exigen un
+API-Token en la cabecera `X-API-Key`; sin él responden `401`. La página demo `/` solo se abre desde `127.0.0.1`
+(y desde ahí no se pide token). `/docs`, `/redoc` y `/openapi.json` son públicos (solo esquemas).
+
+Los tokens viven en `api_keys.json` en la raíz del repo (**fuera de git**; otra ruta con `SCANIA_API_KEYS_FILE`):
+
+```json
+{"wtcp-prueba": "<token>", "wtcp-produccion": "<token>"}
+```
+
+Crear o rotar un token: `python -c "import secrets; print(secrets.token_urlsafe(32))"`, editar el archivo y
+reiniciar la API. Sin `api_keys.json`, la API solo responde desde `127.0.0.1`.
 
 ```bash
 .venv/bin/python demo_api.py                                  # 0.0.0.0:8091 por defecto (variable DEMO_PORT)
 # equivalente: .venv/bin/uvicorn demo_api:app --host 0.0.0.0 --port 8091
 ```
 
-- Interfaz: `http://<app>:8091/` · Swagger: `/docs` · ReDoc: `/redoc` · salud de modelos: `/api/health`.
+- Interfaz: `http://127.0.0.1:8091/` (solo local) · Swagger: `/docs` (botón *Authorize* para el token) · ReDoc: `/redoc` · salud de modelos: `/api/health`.
+- Entrada: PDF, PNG, JPG/JPEG o BMP, nombre ASCII, hasta 50 MB. Las imágenes se convierten a un PDF de una página.
 - Progreso en tiempo real por WebSocket `/ws/jobs/{id}` (la UI cae a sondeo si el WebSocket falla).
 - Resultados persistentes en `demo_jobs/<id>/` (PDF, `result.json`, `ocr.md`, `ocr.html`, `meta.json`).
 - Parar: `fuser -k 8091/tcp`. Reiniciar: parar y volver a lanzar en una orden separada.
