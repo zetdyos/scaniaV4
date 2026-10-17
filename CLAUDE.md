@@ -20,7 +20,7 @@ Todo en español. Sin GPU local: los modelos corren en llama-server remotos.
 ## Reglas que no se negocian (pedidas por el usuario)
 
 1. **La fase 1 está congelada.** No modificar `ocr_pipeline.py`, `ocr.py` ni `glmocr.yaml` salvo petición explícita. La fase 2 solo consume `ocr_pipeline.run()`. Cambios de host/config son la única excepción aceptada hasta ahora.
-2. **No arrancar servidores de modelos en esta máquina.** Los llama-server viven en el host de modelos (`192.168.1.194`, variable `OCR_MODELS_HOST`): GLM-OCR en 8080, Qwen3.6-27B en 8083 (cargado SIN visión), Qwen2.5-VL-7B en 8088. Antes de usarlos, comprobar `/health` y `/props`.
+2. **No arrancar servidores de modelos en esta máquina.** Los llama-server viven en el host de modelos (`192.168.1.194`, variable `OCR_MODELS_HOST`): GLM-OCR en 8086, Qwen3.6-27B en 8083 (cargado SIN visión), Qwen2.5-VL-7B en 8088. Antes de usarlos, comprobar `/health` y `/props`.
 3. **No experimentar al azar con prompts ni resoluciones.** Cada decisión debe apoyarse en documentación (tarjeta del modelo, repo oficial, código de llama.cpp). Lo verificado está en "Hechos documentados".
 4. **No inventar valores.** Todo lo que venga de un modelo de lenguaje se contrasta con el texto OCR; lo que no tenga respaldo se marca (`evidencia: modelo`) y la línea no se da por verificada.
 5. **Los números manuscritos no interesan.**

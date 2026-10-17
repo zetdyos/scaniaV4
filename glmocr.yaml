@@ -1,7 +1,7 @@
 # Configuración de glmocr para este proyecto (copia del config.yaml del paquete
 # con cambios mínimos: maas.enabled=false, max_workers=4, layout.device=cpu,
 # request_timeout=300). El reconocimiento lo hace el llama-server con GLM-OCR
-# en 192.168.1.194:8080 (o el host de OCR_MODELS_HOST); el layout PP-DocLayoutV3 corre aquí en CPU.
+# en 192.168.1.194:8086 (o el host de OCR_MODELS_HOST); el layout PP-DocLayoutV3 corre aquí en CPU.
 # Uso: .venv/bin/glmocr parse doc.pdf --config glmocr.yaml --mode selfhosted --output salida/
 
 # GLM-OCR Configuration
@@ -67,7 +67,7 @@ pipeline:
   ocr_api:
     # Basic connection
     api_host: 192.168.1.194   # host de los llama-server; ocr_pipeline lo sobreescribe con OCR_MODELS_HOST
-    api_port: 8080
+    api_port: 8086
 
     # Model name included in API requests.
     # Required for mlx_vlm.server (e.g. "mlx-community/GLM-OCR-bf16").

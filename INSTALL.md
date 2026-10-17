@@ -3,7 +3,7 @@
 ## 1. Requisitos
 
 - Máquina de la app: Linux, Python 3.12, sin GPU (el layout PP-DocLayoutV3 corre en CPU; 16 hilos van bien). Internet solo la primera vez (descarga de paquetes y del modelo de layout desde Hugging Face, ~400 MB).
-- Host de modelos (`192.168.1.194` por defecto) con llama.cpp **posterior al 2026-02-18** (arreglo de GLM-OCR, PR 19677) y acceso desde la app a los puertos 8080, 8083 y 8088.
+- Host de modelos (`192.168.1.194` por defecto) con llama.cpp **posterior al 2026-02-18** (arreglo de GLM-OCR, PR 19677) y acceso desde la app a los puertos 8086, 8083 y 8088.
 - Modelos GGUF en el host de modelos: `GLM-OCR-Q8_0.gguf` + `mmproj-GLM-OCR-Q8_0.gguf`, `Qwen2.5-VL-7B-Q4_K_M.gguf` + su mmproj, `Qwen3.6-27B-Q6_K.gguf`.
 
 ## 2. Servidores de modelos (en 192.168.1.194)
@@ -11,8 +11,8 @@
 Un `llama-server` por modelo, escuchando en todas las interfaces:
 
 ```bash
-# GLM-OCR (OCR de página completa y de regiones) — puerto 8080
-llama-server -m GLM-OCR-Q8_0.gguf --mmproj mmproj-GLM-OCR-Q8_0.gguf -ngl 99 -c 16384 --host 0.0.0.0 --port 8080
+# GLM-OCR (OCR de página completa y de regiones) — puerto 8086
+llama-server -m GLM-OCR-Q8_0.gguf --mmproj mmproj-GLM-OCR-Q8_0.gguf -ngl 99 -c 16384 --host 0.0.0.0 --port 8086
 
 # Qwen2.5-VL-7B (rescate visual de precios y cantidades) — puerto 8088
 llama-server -m Qwen2.5-VL-7B-Q4_K_M.gguf --mmproj <mmproj-Qwen2.5-VL-7B>.gguf -ngl 99 -c 12288 --host 0.0.0.0 --port 8088
@@ -24,8 +24,8 @@ llama-server -m Qwen3.6-27B-Q6_K.gguf -ngl 99 -c 16384 --host 0.0.0.0 --port 808
 Notas: `--jinja` es necesario en el 27B para `chat_template_kwargs.enable_thinking=false`. Con un slot por servidor la app procesa un PDF a la vez. Comprobación desde la máquina de la app:
 
 ```bash
-for p in 8080 8083 8088; do curl -s http://192.168.1.194:$p/health; echo; done
-curl -s http://192.168.1.194:8080/props | python3 -m json.tool | grep -E "model_path|n_ctx|build_info"
+for p in 8086 8083 8088; do curl -s http://192.168.1.194:$p/health; echo; done
+curl -s http://192.168.1.194:8086/props | python3 -m json.tool | grep -E "model_path|n_ctx|build_info"
 ```
 
 ## 3. Entorno Python de la app
@@ -99,7 +99,7 @@ export OCR_MODELS_HOST=192.168.1.194
 
 | Síntoma | Causa / solución |
 |---|---|
-| `llama-server no responde en http://…:8080` | Servidor apagado o puerto cerrado. Probar `curl /health`. Si van por túnel, `OCR_MODELS_HOST=127.0.0.1`. |
+| `llama-server no responde en http://…:8086` | Servidor apagado o puerto cerrado. Probar `curl /health`. Si van por túnel, `OCR_MODELS_HOST=127.0.0.1`. |
 | Trabajos del demo "En cola" mucho tiempo | Hay un PDF en proceso (un slot). Ver qué corre en la barra de progreso o en `/api/jobs`. |
 | `Connection aborted` durante la fase 2 | Dos clientes a la vez contra el túnel. Hay reintentos; evitar CLI y demo simultáneos. |
 | El 27B devuelve vacío o tarda mucho | Está pensando: comprobar que el servidor tenga `--jinja` (necesario para `enable_thinking=false`). |

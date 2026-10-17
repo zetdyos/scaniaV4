@@ -12,7 +12,7 @@ Uso:
 
 Requiere: pip install pymupdf requests
 Servidor (debe estar iniciado antes de correr el script):
-    llama-server -m GLM-OCR-Q8_0.gguf --mmproj mmproj-GLM-OCR-Q8_0.gguf -ngl 99 -c 16384 --port 8080
+    llama-server -m GLM-OCR-Q8_0.gguf --mmproj mmproj-GLM-OCR-Q8_0.gguf -ngl 99 -c 16384 --port 8086
 """
 
 import argparse
@@ -23,10 +23,10 @@ import sys
 import fitz  # PyMuPDF
 import requests
 
-# Host donde corren los llama-server (GLM-OCR en 8080, Qwen3.6-27B en 8083, Qwen2.5-VL en 8088).
+# Host donde corren los llama-server (GLM-OCR en 8086, Qwen3.6-27B en 8083, Qwen2.5-VL en 8088).
 # Se puede cambiar con la variable de entorno OCR_MODELS_HOST (p. ej. 127.0.0.1 si van por túnel).
 MODELS_HOST = os.environ.get("OCR_MODELS_HOST", "192.168.1.194")
-DEFAULT_SERVER = f"http://{MODELS_HOST}:8080"
+DEFAULT_SERVER = f"http://{MODELS_HOST}:8086"
 
 PROMPTS = {
     # Prompts nativos de GLM-OCR
