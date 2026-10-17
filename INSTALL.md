@@ -66,6 +66,12 @@ Genera `salida/<nombre>.json` (array de facturas) y, opcionalmente, el Markdown 
 - Resultados persistentes en `demo_jobs/<id>/` (PDF, `result.json`, `ocr.md`, `ocr.html`, `meta.json`).
 - Parar: `fuser -k 8091/tcp`. Reiniciar: parar y volver a lanzar en una orden separada.
 
+Arranque automático en Windows (al iniciar sesión, sin consola): copiar `deploy\windows\SCANIA-api.vbs`
+a la carpeta de Inicio (`Win+R` → `shell:startup`). Llama a `deploy\windows\lanzar_api.ps1`, que usa el
+`pythonw` del `.venv`, fija `OCR_MODELS_HOST=192.168.1.194` si no viene del entorno, no arranca una segunda
+instancia si el puerto ya escucha y deja los logs en `logs\api.out.log` / `logs\api.err.log`.
+Parar en Windows: `Get-NetTCPConnection -LocalPort 8091 -State Listen | % { Stop-Process -Id $_.OwningProcess }`.
+
 Servicio systemd (opcional), `/etc/systemd/system/pdf-reder-demo.service`:
 
 ```ini
