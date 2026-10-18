@@ -17,27 +17,18 @@ Las páginas sin marcador se agregan a la factura en curso (pedidos de varias p�
 `id` es secuencial dentro del PDF (0, 1, 2, ...). Se añade `referencia` (número de pedido leído),
 que NO está en el esquema original: es la clave natural para cruzar con otros sistemas.
 
-De dónde salen las líneas de cada factura (la extracción NO depende del tamaño del documento):
+De dónde salen las líneas de cada factura:
   - Si sus páginas tienen bloques de envío tipo Amazon ("N of: ... $precio", verificados con
     cantidad x precio = total del envío), las líneas salen de ahí sin modelo de lenguaje.
-  - Si no, de las TABLAS DE ARTÍCULOS que ya leyó la fase 1 (HTML de las regiones o Markdown del
-    texto de página completa) cuya cabecera tenga una columna de descripción y una de importe o
-    precio ("Description | Quantity | Amount", "Item | Price/Item | Qty | Line Total"...). Sin
-    modelo: todos los valores son literales del OCR. origen_lineas "tabla".
-  - Si no hay tabla, el Markdown de CADA PÁGINA se pasa por separado a Qwen3.6-27B (llama-server,
-    puerto 8083) con esquema JSON impuesto por gramática, pensamiento desactivado
-    (chat_template_kwargs.enable_thinking=false) y temperatura 0. max_tokens = n_ctx del servidor
-    (/props) - fichas del prompt (/tokenize): la salida de una página está acotada por su contenido,
-    así que no crece con el número de páginas. Si aun así una respuesta se corta
-    (finish_reason "length") o no es JSON, esa página queda marcada para revisión: nunca es un error
-    del trabajo. Cada importe devuelto se contrasta con los que leyó el OCR.
+  - Si no, el Markdown de CADA PÁGINA se pasa por separado a Qwen3.6-27B (llama-server, puerto 8083 del
+    host de modelos) con esquema JSON impuesto por gramática, pensamiento desactivado
+    (chat_template_kwargs.enable_thinking=false) y temperatura 0. max_tokens = n_ctx (/props) - fichas
+    del prompt (/tokenize): la salida no crece con el número de páginas. Si una respuesta se corta
+    (finish_reason "length") o no es JSON, esa página queda para revisión (LECTURA), nunca un error del
+    trabajo. Cada importe devuelto se contrasta con los que leyó el OCR.
   - Si la suma de líneas no reproduce el total impreso, las páginas de la factura van como imagen
     a Qwen2.5-VL (puerto 8088) con el patrón de extracción clave-valor del cookbook de Qwen. Esas
     líneas solo se aceptan si cantidad x precio reproduce el total impreso.
-  - En toda línea con cantidad, precio unitario e importe se comprueba cantidad x precio = importe;
-    si no cuadra, la factura va a revisión (LECTURA).
-  - Un fallo inesperado al construir UNA factura (que no sea de red) la deja en LECTURA con el
-    motivo; el resto del archivo sigue. Los fallos de red sí hacen fallar el trabajo (INTERNAL).
 
 Campos adicionales (objeto `ocr`, anidado para no alterar las claves del esquema):
   - factura.ocr: proveedor, fuente_pdf, paginas, fecha_pedido, subtotal_articulos, envio,
@@ -73,7 +64,6 @@ Uso:
 
 import argparse
 import base64
-import difflib
 import json
 import re
 import sys
@@ -100,12 +90,6 @@ INVOICE_START = [
 AMOUNT_TXT = r"-?\s*\d[\d.,]*(?:[.,]\d{2}|,-)"
 ORDER_TOTAL_RE = re.compile(r"(?:Order|Grand)\s*Total:?\s*(?:USD|\$)?\s*(" + AMOUNT_TXT + ")", re.I)
 ITEMS_SUBTOTAL_RE = re.compile(r"Item\(?s?\)?\s*Subtotal:?\s*(?:USD|\$)?\s*(" + AMOUNT_TXT + ")", re.I)
-# Respaldo sin modelo: una línea que es SOLO "Total" / "Subtotal" + importe (recibos, tablas Markdown).
-# "Total before tax" o "Total for This Shipment" no cuentan: llevan más palabras.
-TOTAL_LINE_RE = re.compile(r"^[\s|]*(?:Grand\s*|Order\s*|Invoice\s*)?Total(?:\s*\(?USD\)?)?\s*:?[\s|]*(?:USD|\$)?\s*("
-                           + AMOUNT_TXT + r")[\s|]*$", re.I | re.M)
-SUBTOTAL_LINE_RE = re.compile(r"^[\s|]*(?:Items?\s*)?Sub\s*-?\s*total(?:\s*\(?USD\)?)?\s*:?[\s|]*(?:USD|\$)?\s*("
-                              + AMOUNT_TXT + r")[\s|]*$", re.I | re.M)
 AMOUNT_RE = re.compile(r"(?:USD|\$)\s*(" + AMOUNT_TXT + r")|(?<![\d.,])(\d{1,3}(?:[.,]\d{3})*[.,]\d{2})(?![\d.,])")
 
 LINES_SCHEMA = {
@@ -313,126 +297,6 @@ def lines_from_shipments(shipments, unverified, full_texts, regions):
     return lines, issues
 
 
-# ----------------------------------------------------------------------------- líneas desde tablas
-
-# Roles de columna por palabras de la cabecera (sin espacios, minúsculas). Se prueban en este orden
-# para que "Price/Item" sea precio y no descripción, y "Line Total" importe.
-COLUMN_KEYS = [
-    ("qty", ("qty", "quantity", "cantidad", "cant.")),
-    ("unit", ("unitprice", "price/item", "priceeach", "itemprice", "preciounitario", "price", "precio")),
-    ("amount", ("amount", "linetotal", "total", "importe", "monto")),
-    ("desc", ("description", "item", "product", "articulo", "artículo", "descripcion", "descripción", "producto", "detail")),
-]
-SUMMARY_KEYS = ("subtotal", "total", "tax", "impuesto", "shipping", "delivery", "envío", "envio", "discount", "descuento",
-                "coupon", "savings", "handling", "balance", "payment", "pago")
-MD_SEPARATOR_CELL_RE = re.compile(r"^:?-{2,}:?$")
-
-
-def html_table_rows(table_html):
-    """Filas de una tabla HTML conservando celdas vacías (p1.rows_of las descarta y desalinea columnas)."""
-    for row in re.findall(r"<tr[^>]*>(.*?)</tr>", table_html, re.S | re.I):
-        cells = [re.sub(r"\s+", " ", f2_unescape(c)).strip() for c in re.findall(r"<t[dh][^>]*>(.*?)</t[dh]>", row, re.S | re.I)]
-        if any(cells):
-            yield cells
-
-
-def md_tables(text):
-    """Tablas Markdown (| a | b |) del texto: lista de tablas, cada una lista de filas de celdas."""
-    tables, cur = [], []
-    for line in (text or "").splitlines():
-        s = line.strip()
-        if s.startswith("|") and s.count("|") >= 3:
-            cells = [c.strip() for c in s.strip("|").split("|")]
-            if not all(MD_SEPARATOR_CELL_RE.match(c) for c in cells if c):  # fila "| :--- | :--- |"
-                cur.append(cells)
-        elif cur:
-            tables.append(cur)
-            cur = []
-    if cur:
-        tables.append(cur)
-    return tables
-
-
-def column_roles(cells):
-    """Cabecera -> {rol: índice de columna}, o None si la fila no es cabecera de una tabla de artículos."""
-    roles = {}
-    for idx, cell in enumerate(cells):
-        key = p1.squash(cell)
-        if not key or len(key) > 30:
-            continue
-        for role, words in COLUMN_KEYS:
-            if any(w in key for w in words):
-                roles.setdefault(role, idx)
-                break
-    return roles if "desc" in roles and ("amount" in roles or "unit" in roles) else None
-
-
-def page_tables(regions, full_text):
-    """Tablas de una página: las HTML de las regiones; si ninguna es de artículos, las del texto de página completa."""
-    html_tables = [t for r in regions for t in re.findall(r"<table.*?</table>", str(r.get("content") or ""), re.S | re.I)]
-    region_tables = [list(html_table_rows(t)) for t in html_tables]
-    if any(column_roles(row) for t in region_tables for row in t[:3]):
-        return region_tables
-    full_html = [list(html_table_rows(t)) for t in re.findall(r"<table.*?</table>", full_text or "", re.S | re.I)]
-    return full_html + md_tables(full_text)
-
-
-def full_text_description(desc, row_amounts, full_text):
-    """La lectura de página completa suele ser más limpia que la de la región. Si una línea de ese texto
-    contiene los mismos importes de la fila y empieza con una descripción parecida, se toma su texto."""
-    best, best_ratio = desc, 0.6
-    for line in (full_text or "").splitlines():
-        if not all(a and a in line for a in row_amounts):
-            continue
-        cand = re.split(r"\s*(?:USD|\$)?\s*\d[\d.,]*\.\d{2}", line, maxsplit=1)[0].strip(" |\t")
-        ratio = difflib.SequenceMatcher(None, p1.squash(cand), p1.squash(desc)).ratio()
-        if len(cand) >= 8 and ratio > best_ratio:
-            best, best_ratio = re.sub(r"\s+", " ", cand), ratio
-    return best
-
-
-def lines_from_tables(regions, full_texts):
-    """Artículos de las tablas de artículos de la factura, en orden de página. Una tabla sin cabecera con el
-    mismo número de columnas que la anterior se lee como su continuación (salto de página)."""
-    lines, roles, width = [], None, 0
-    for page_idx, (regs, full_text) in enumerate(zip(regions, full_texts)):
-        full_amounts = doc_amounts(full_text)  # segunda lectura independiente de la fase 1 (página completa)
-        for table in page_tables(regs, full_text):
-            for row in table:
-                header = column_roles(row)
-                if header:
-                    roles, width = header, len(row)
-                    continue
-                if roles is None or len(row) < width:
-                    continue
-                if len(row) > width:
-                    # el OCR partió una celda (casi siempre la descripción larga) en varias: se unen las sobrantes
-                    # a la descripción y el resto de columnas se alinea por la derecha
-                    extra, d = len(row) - width, roles["desc"]
-                    row = row[:d] + [" ".join(c for c in row[d:d + extra + 1] if c)] + row[d + extra + 1:]
-                cell = lambda role: row[roles[role]] if role in roles and roles[role] < len(row) else ""  # noqa: E731
-                desc = cell("desc")
-                # filas de resumen ("Subtotal", "Sales Tax"...): etiqueta corta y sin cantidad; un artículo
-                # "Tax Organizer" con su cantidad, o "Total Gym XL ..." largo, no lo es
-                if not desc or (not cell("qty").strip() and
-                                any(len(c) <= 30 and p1.squash(c).startswith(SUMMARY_KEYS) for c in row if c)):
-                    continue
-                unit, amount = money(cell("unit")), money(cell("amount"))
-                q = re.search(r"\d+", cell("qty"))
-                qty = int(q.group(0)) if q else 1
-                if not amount and unit:
-                    amount = f"{qty * float(unit):.2f}"
-                if not amount:
-                    continue  # fila de texto sin importe (dirección, "Expect it on ...", título de grupo)
-                raw = [x for x in (cell("unit"), cell("amount")) if money(x)]
-                lines.append({"desc": full_text_description(re.sub(r"\s+", " ", desc), [money(x) for x in raw], full_text),
-                              "qty": qty, "qty_printed": bool(q), "unit": unit, "amount": amount, "src": "tabla",
-                              "page_rel": page_idx + 1, "extra": {},
-                              # importe de la celda que la lectura de página completa no tiene: las dos lecturas discrepan
-                              "unconfirmed": bool(full_amounts) and money(cell("amount") or cell("unit")) not in full_amounts})
-    return lines
-
-
 # ----------------------------------------------------------------------------- líneas con el 27B
 
 PROMPT_MARGIN_TOKENS = 256  # plantilla de chat (roles, marcas) que /tokenize no ve en el texto suelto
@@ -453,8 +317,8 @@ def count_tokens(server, text):
 
 def lines_with_llm(markdown, server, timeout, log):
     """Una llamada al 27B con el Markdown de UNA página. Devuelve (datos, motivo_de_fallo).
-    max_tokens = n_ctx - prompt: la salida usa todo el contexto que queda. Si la respuesta se corta o no
-    es JSON, devuelve (None, motivo) en vez de lanzar: lo decide quien llama (la factura va a revisión)."""
+    max_tokens = n_ctx - prompt (antes 4096 fijo: una factura de 54 artículos se cortaba siempre). Si la
+    respuesta se corta o no es JSON devuelve (None, motivo) en vez de lanzar: la factura va a revisión."""
     user = USER_PROMPT.format(doc=markdown)
     budget = server_n_ctx(server) - count_tokens(server, SYSTEM_PROMPT + "\n" + user) - PROMPT_MARGIN_TOKENS
     if budget < 512:
@@ -616,27 +480,20 @@ def desktop_line_metas(regions):
     return metas
 
 
-def qty_printed(qty, sq_text, desc_key="", unit=""):
+def qty_printed(qty, sq_text, desc_key=""):
     """La cantidad cuenta como impresa solo si aparece junto a la descripción del artículo: "Nof:"
-    inmediatamente delante, o "xN" / "Nx" / "qty:N" en los ~400 caracteres siguientes, o "N x $precio"
-    pegado al precio unitario de la línea (en el texto sin espacios "pack of 8  3 x $18.79" queda
-    "83x$18.79": el dígito de delante no la invalida porque el precio la ancla). Un "x2" en otra parte
-    de la página (p. ej. la línea de cupones) no cuenta."""
+    inmediatamente delante, o "xN" / "Nx" / "qty:N" en los ~400 caracteres siguientes. Un "x2" en
+    otra parte de la página (p. ej. la línea de cupones) no cuenta."""
     if not desc_key:
         return False
-    # Se revisan TODAS las apariciones de la descripción: artículos con el mismo inicio de nombre
-    # (o repetidos, como en Shein) harían mirar solo el primero.
-    for m0 in re.finditer(re.escape(desc_key), sq_text):
-        pos = m0.start()
-        before, after = sq_text[max(0, pos - 12):pos], sq_text[pos:pos + 400]
-        m = re.search(r"(\d+)of:$", before)
-        if m and int(m.group(1)) == qty:
-            return True
-        if unit and re.search(rf"{qty}[x×]\$?{re.escape(unit)}(?!\d)", after):
-            return True
-        if re.search(rf"(?<!\d)(?:qty:?{qty}|[x×]{qty}|{qty}[x×])(?!\d)", after):
-            return True
-    return False
+    pos = sq_text.find(desc_key)
+    if pos < 0:
+        return False
+    before, after = sq_text[max(0, pos - 12):pos], sq_text[pos:pos + 400]
+    m = re.search(r"(\d+)of:$", before)
+    if m and int(m.group(1)) == qty:
+        return True
+    return bool(re.search(rf"(?<!\d)(?:qty:?{qty}|[x×]{qty}|{qty}[x×])(?!\d)", after))
 
 
 QTY_SRC = {"glm": "leido", "qwen": "leido"}
@@ -657,7 +514,7 @@ def line_evidence(l, sq_text, ocr_amounts, arithmetic_ok):
         ev["importe_linea"] = "calculado" if amt else ""
     else:
         ev["importe_linea"] = ("leido" if amt in ocr_amounts else "aritmetica" if arithmetic_ok else "modelo") if amt else ""
-    if l.get("qty_printed") or qty_printed(l["qty"], sq_text, key, l.get("unit") or ""):
+    if l.get("qty_printed") or qty_printed(l["qty"], sq_text, key):
         ev["cantidad"] = "leido"
     elif l["qty"] == 1:
         ev["cantidad"] = "asumido"      # una unidad por defecto; el cuadre con el total lo corrobora
@@ -666,20 +523,6 @@ def line_evidence(l, sq_text, ocr_amounts, arithmetic_ok):
     else:
         ev["cantidad"] = "modelo"
     return ev
-
-
-def arithmetic_issues(lines):
-    """Cantidad x precio unitario debe dar el importe de la línea. Si no (p. ej. "1 x 8.67 = 8.47": uno de
-    los dos importes está mal leído), la línea no se da por verificada y la factura va a revisión."""
-    out = []
-    for seq, l in enumerate(lines):
-        if l.get("unit") and l.get("amount") and l.get("qty"):
-            calc = l["qty"] * float(l["unit"])
-            if abs(calc - float(l["amount"])) >= 0.01:
-                l["arith_bad"] = True
-                out.append(f"line {seq}: quantity x unit price ({l['qty']} x {l['unit']} = {calc:.2f}) "
-                           f"does not match the line amount {l['amount']}")
-    return out
 
 
 def evidence_issues(lines):
@@ -700,8 +543,7 @@ def line_ocr(l, *, pagina, verificado, sq_text, extra=None):
         return v if v and p1.squash(v) in sq_text else ""
     return {
         "precio_unitario": l.get("unit") or (f"{float(l['amount']) / l['qty']:.2f}" if l.get("amount") and l.get("qty") else ""),
-        "cantidad_impresa": bool(l.get("qty_printed")) or qty_printed(l["qty"], sq_text, p1.squash(l.get("desc", ""))[:20],
-                                                                      l.get("unit") or ""),
+        "cantidad_impresa": bool(l.get("qty_printed")) or qty_printed(l["qty"], sq_text, p1.squash(l.get("desc", ""))[:20]),
         "vendedor": e.get("vendedor", "") if e.get("determinista") else seen(e.get("vendedor", "")),
         "seguimiento": e.get("seguimiento", "") if e.get("determinista") else seen(re.sub(r"\s", "", e.get("seguimiento", ""))),
         "estado_envio": e.get("estado_envio", "") if e.get("determinista") else seen(e.get("estado_envio", "")),
@@ -848,7 +690,7 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
     issues = []
     # Con qué deben cuadrar las líneas: el "Item(s) Subtotal" del pedido. El formato de escritorio
     # de Amazon imprime uno por envío y el global al final (caja de pago): se toma el último.
-    subs = ITEMS_SUBTOTAL_RE.findall(md) or SUBTOTAL_LINE_RE.findall(md)
+    subs = ITEMS_SUBTOTAL_RE.findall(md)
     items_subtotal = money(subs[-1]) if subs else ""
 
     shipments, unverified, grand = p1.check_shipments(regions)
@@ -856,25 +698,19 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
     if not total:
         m = ORDER_TOTAL_RE.search(md)
         total = money(m.group(1)) if m else ""
-    if not total:
-        tl = TOTAL_LINE_RE.findall(md)
-        total = money(tl[-1]) if tl else ""
     total_printed = bool(total)
     target = items_subtotal or total  # suma esperada de las líneas (sin envío ni impuestos)
     if 'title="recuperado con Qwen2.5-VL"' in md:
         issues.append("unit price(s) recovered from the image by the vision model (Qwen2.5-VL)")
 
-    table_lines = [] if shipments else lines_from_tables(regions, full_texts)
-    read_failed = False  # alguna página no se pudo leer: no hay líneas porque falló la lectura, no por no ser factura
+    read_failed = False  # alguna página no se pudo leer: sin líneas por fallo de lectura, no por no ser factura
     if shipments:
         lines, more = lines_from_shipments(shipments, unverified, full_texts, regions)
         issues += more
         source = "envios"
-    elif table_lines:
-        lines, source = table_lines, "tabla"
-        log(f"  sin bloques de envío: {len(lines)} línea(s) leídas de tablas de artículos (sin modelo)")
     elif use_llm:
-        log(f"  sin bloques de envío ni tablas: extracción de líneas con Qwen3.6-27B, página por página ({len(pages)})")
+        # Página por página: la salida de cada llamada está acotada por su página, no por el documento.
+        log(f"  sin bloques de envío: extracción de líneas con Qwen3.6-27B, página por página ({len(pages)})")
         lines, model_total = [], None
         for k, (i, regs) in enumerate(zip(pages, regions)):
             data, fail = lines_with_llm(p1.page_markdown(i + 1, res["full_text"].get(i) or "", regs)[0], llm_server, timeout, log)
@@ -906,12 +742,6 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
     else:
         lines, source = [], "ninguna"
         issues.append("no shipment blocks and model extraction disabled")
-    # El total puede haber llegado del modelo: la suma de líneas se compara también en ese caso
-    # (antes el objetivo se fijaba antes y una factura con total del modelo no se comprobaba).
-    target = items_subtotal or total
-    n_unconfirmed = sum(1 for l in lines if l.get("unconfirmed"))
-    if n_unconfirmed:
-        issues.append(f"{n_unconfirmed} line amount(s) found in only one of the two OCR readings (table region vs full page)")
 
     # Rescate visual: solo en la vía del 27B, cuando la suma no reproduce el total impreso.
     if source == "llm" and total_printed and target and (lines_sum(lines) is None or abs(lines_sum(lines) - float(target)) >= 0.01):
@@ -947,7 +777,6 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
             issues.append(f"vision model (Qwen2.5-VL) not responding at {vl_server}; no visual check")
 
     issues += description_issues(lines)
-    issues += arithmetic_issues(lines)
     if not total and lines_sum(lines) is not None:
         total, total_printed = f"{lines_sum(lines):.2f}", False
         target = total
@@ -962,7 +791,7 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
     all_ok = bool(target) and lines_sum(lines) is not None and abs(lines_sum(lines) - float(target)) < 0.01
     for l in lines:
         l["evidence"] = line_evidence(l, sq_text, ocr_amounts, all_ok)
-        l["verified"] = l.get("verified", all_ok) and "modelo" not in l["evidence"].values() and not l.get("arith_bad")
+        l["verified"] = l.get("verified", all_ok) and "modelo" not in l["evidence"].values()
     issues += evidence_issues(lines)
     fields = invoice_fields(md, full_texts, inv, res["pdf"])
     fields["origen_lineas"] = source
@@ -986,20 +815,6 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
     }, source
 
 
-def unprocessed_invoice(inv_id, inv, res, reason):
-    """Factura que no se pudo construir: sin líneas, en LECTURA, con el motivo. Misma forma que las demás."""
-    note = f"the invoice could not be processed automatically ({reason[:200]}); review against the paper"
-    return {
-        "id": inv_id, "estado": "DONE", "motivo_revision": "LECTURA", "mismatch": note,
-        "total": "", "total_is_printed": False, "version_catalogo": "", "result_version": RESULT_VERSION,
-        "lineas": [], "referencia": inv["ref"],
-        "ocr": {"proveedor": inv["tipo"], "fuente_pdf": Path(res["pdf"]).name,
-                "paginas": [inv["pages"][0] + 1, inv["pages"][-1] + 1], "fecha_pedido": "", "subtotal_articulos": "",
-                "envio": "", "impuestos": "", "total_antes_impuestos": "", "descuentos": [], "metodo_pago": "",
-                "destinatario": "", "direccion_envio": "", "origen_lineas": "ninguna", "envios": [], "incidencias": [note]},
-    }
-
-
 def build_all(res, use_llm=True, llm_server=QWEN27_SERVER, vl_server=VL_SERVER, timeout=600, log=None):
     """Divide el resultado de la fase 1 en facturas y construye el JSON de todas (array)."""
     log = log or (lambda m: print(m, file=sys.stderr))
@@ -1013,30 +828,24 @@ def build_all(res, use_llm=True, llm_server=QWEN27_SERVER, vl_server=VL_SERVER, 
         blocks = parse_blocks(regions)
         dups = [j for j, o in enumerate(invoices) if j != g and o["ref"] and o["ref"] == inv["ref"]]
         docs = []
-        try:
-            if blocks:
-                full_texts = [res["full_text"].get(i) or "" for i in pages]
-                md = "\n\n---\n\n".join(p1.page_markdown(i + 1, res["full_text"].get(i) or "", regs)[0] for i, regs in zip(pages, regions))
-                order_fields = invoice_fields(md, full_texts, inv, res["pdf"])
-                m = ORDER_TOTAL_RE.search(md)
-                order_total = money(m.group(1)) if m else ""
-                log(f"  -- pedido {inv['ref'] or 'sin referencia'}: {len(blocks)} bloque(s) de envío -> {len(blocks)} factura(s)")
-                for k, b in enumerate(blocks):
-                    docs.append(build_shipment_invoice(len(out) + len(docs), res, inv, b, k, len(blocks), order_fields, order_total, pages, full_texts, currency_of(md)))
-                    d = docs[-1]
-                    log(f"     factura {d['id']} [{b['estado']}]: {len(d['lineas'])} línea(s), total {d['total'] or '?'}"
-                        f"{'' if d['total_is_printed'] else ' (calculado)'}, revisión: {d['motivo_revision'] or 'no'}" + (f" ({d['mismatch']})" if d["mismatch"] else ""))
-            else:
-                log(f"  -- factura {len(out)} ({inv['ref'] or 'sin referencia'})")
-                doc, source = build_invoice(len(out), res, inv, use_llm, llm_server, vl_server, timeout, log)
-                log(f"     {len(doc['lineas'])} línea(s) (origen: {source}), total {doc['total'] or '?'}, revisión: {doc['motivo_revision'] or 'no'}"
-                    + (f" ({doc['mismatch']})" if doc["mismatch"] else ""))
-                docs.append(doc)
-        except requests.RequestException:
-            raise  # red / modelos caídos: el trabajo falla y el cliente reintenta (INTERNAL)
-        except Exception as e:  # noqa: BLE001  un fallo de contenido no tumba el archivo ni se reintenta sin fin
-            log(f"     ERROR al construir la factura: {type(e).__name__}: {e}; queda para revisión")
-            docs = [unprocessed_invoice(len(out), inv, res, f"{type(e).__name__}: {e}")]
+        if blocks:
+            full_texts = [res["full_text"].get(i) or "" for i in pages]
+            md = "\n\n---\n\n".join(p1.page_markdown(i + 1, res["full_text"].get(i) or "", regs)[0] for i, regs in zip(pages, regions))
+            order_fields = invoice_fields(md, full_texts, inv, res["pdf"])
+            m = ORDER_TOTAL_RE.search(md)
+            order_total = money(m.group(1)) if m else ""
+            log(f"  -- pedido {inv['ref'] or 'sin referencia'}: {len(blocks)} bloque(s) de envío -> {len(blocks)} factura(s)")
+            for k, b in enumerate(blocks):
+                docs.append(build_shipment_invoice(len(out) + len(docs), res, inv, b, k, len(blocks), order_fields, order_total, pages, full_texts, currency_of(md)))
+                d = docs[-1]
+                log(f"     factura {d['id']} [{b['estado']}]: {len(d['lineas'])} línea(s), total {d['total'] or '?'}"
+                    f"{'' if d['total_is_printed'] else ' (calculado)'}, revisión: {d['motivo_revision'] or 'no'}" + (f" ({d['mismatch']})" if d["mismatch"] else ""))
+        else:
+            log(f"  -- factura {len(out)} ({inv['ref'] or 'sin referencia'})")
+            doc, source = build_invoice(len(out), res, inv, use_llm, llm_server, vl_server, timeout, log)
+            log(f"     {len(doc['lineas'])} línea(s) (origen: {source}), total {doc['total'] or '?'}, revisión: {doc['motivo_revision'] or 'no'}"
+                + (f" ({doc['mismatch']})" if doc["mismatch"] else ""))
+            docs.append(doc)
         if dups:
             note = "order reference repeated in the file (the same order appears more than once)"
             for doc in docs:

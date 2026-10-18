@@ -43,7 +43,7 @@ Añadidos: `referencia`, los objetos `ocr` (factura y línea; ver docstring de `
 
 ## Extracción de líneas (fase 2): no depende del tamaño del documento
 
-Orden: bloques de envío de Amazon (`envios`) → **tablas de artículos** que ya leyó la fase 1 (`tabla`, sin modelo; cabecera con descripción + importe/precio) → Qwen3.6-27B **página por página** (`llm`) con `max_tokens = n_ctx (/props) − prompt (/tokenize)` → rescate con Qwen2.5-VL. Si una respuesta del modelo se corta (`finish_reason: length`) o no es JSON, la página queda para revisión (`LECTURA`), nunca un error del trabajo; un fallo de contenido en una factura la deja en `LECTURA` sin tumbar el archivo (solo los de red dan `INTERNAL`). Comprobaciones: cantidad × precio = importe por línea, suma de líneas vs subtotal impreso, importe de tabla presente en la lectura de página completa.
+Orden: bloques de envío de Amazon (`envios`) → Qwen3.6-27B **página por página** (`llm`) con `max_tokens = n_ctx (/props) − prompt (/tokenize)` → rescate con Qwen2.5-VL. Si una respuesta del 27B se corta (`finish_reason: length`) o no es JSON, esa página queda para revisión (`LECTURA`), nunca un error del trabajo.
 Origen del problema que lo motivó: con `max_tokens` 4096 fijo, una factura Shein de 54 artículos se cortaba siempre (`JSONDecodeError`).
 
 ## Hechos documentados (no volver a investigar)
@@ -64,8 +64,8 @@ export OCR_MODELS_HOST=192.168.1.194            # o 127.0.0.1 si los modelos lle
 fuser -k 8091/tcp                                           # parar el demo (NO usar pkill -f con el texto del relanzamiento en la misma línea: se mata a sí mismo)
 ```
 
-Pruebas de regresión manuales: `31143.pdf` (Amazon escritorio → 6 facturas, 4 sin revisión; 2 en LECTURA: bloque sin total y precio rescatado con Qwen2.5-VL), `old/31896.pdf` (Temu → 1 factura, 2 × 9.05 = 18.10 vía Qwen2.5-VL), `old/31112-15-feas.pdf` (app móvil → 15 facturas, 3 a revisar), `d-29484.pdf` (Shein 4 págs → 54 líneas vía `tabla`, LECTURA: la fase 1 funde una de 5 filas idénticas de 3.09, suma 308.21 vs subtotal 311.30), `no-legible_31878.pdf` (Home Depot → tabla, LECTURA por 1 × 8.67 ≠ 8.47), `31019.pdf` (Amazon Marketplace → 1 línea, sin revisión). Los PDF de `old/` no están en esta máquina; los demás están en `demo_jobs/`.
-Método (pedido por el usuario: "no arregles esto y rompas otra cosa"): cachear `ocr_pipeline.run()` por documento y comparar la fase 2 del commit (`git show HEAD:facturas_json.py`) con la nueva sobre la misma caché; explicar cada diferencia. Para fallos de tamaño, añadir facturas sintéticas largas (tabla de 200 artículos, recibo de 120 en texto).
+Pruebas de regresión manuales: `31143.pdf` (Amazon escritorio → 6 facturas, 4 sin revisión; 2 en LECTURA: bloque sin total y precio rescatado con Qwen2.5-VL), `old/31896.pdf` (Temu → 1 factura, 2 × 9.05 = 18.10 vía Qwen2.5-VL), `old/31112-15-feas.pdf` (app móvil → 15 facturas, 3 a revisar), `d-29484.pdf` (Shein 4 págs, 54 artículos: antes JSONDecodeError por max_tokens 4096). Los PDF de `old/` no están en esta máquina; los demás están en `demo_jobs/`.
+Método (pedido por el usuario: "no arregles esto y rompas otra cosa"): cachear `ocr_pipeline.run()` por documento y comparar la fase 2 del commit (`git show HEAD:facturas_json.py`) con la nueva sobre la misma caché; explicar cada diferencia. **No añadir reglas motivadas por una sola factura**: si algo no cuadra, va a LECTURA.
 
 ## Convenciones de trabajo
 
