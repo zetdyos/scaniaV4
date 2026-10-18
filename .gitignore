@@ -17,3 +17,6 @@ __pycache__/
 /31896.md
 /facturas.json
 *.regions.json
+
+# bloqueo entre procesos de los modelos (facturas_json.modelos_lock)
+/.modelos.lock

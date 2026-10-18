@@ -229,8 +229,9 @@ def process(job_id):
             set_step(job, 80 + 18 * k / n, f"Estructurando factura {k + 1} de {n}")
 
     try:
-        res = p1.run(str(d / job["pdf"]), log=log)
-        out = f2.build_all(res, log=log)
+        with f2.modelos_lock(log, on_wait=lambda: set_step(job, 2, "Esperando a los modelos (otro proceso los está usando)")):
+            res = p1.run(str(d / job["pdf"]), log=log)
+            out = f2.build_all(res, log=log)
         (d / "result.json").write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
         (d / "ocr.md").write_text(res["markdown"], encoding="utf-8")
         (d / "ocr.html").write_text(mdlib.markdown(res["markdown"], extensions=["tables"]), encoding="utf-8")

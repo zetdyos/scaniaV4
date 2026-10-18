@@ -72,4 +72,4 @@ Método (pedido por el usuario: "no arregles esto y rompas otra cosa"): cachear 
 
 - Explicar al usuario en español, con decisiones basadas en documentación citada.
 - Antes de tocar la fase 2, correr las tres regresiones. Antes de proponer tocar la fase 1, preguntar.
-- Un trabajo a la vez contra los modelos (1 slot): no correr CLI y demo a la vez contra el mismo host.
+- Un trabajo a la vez contra los modelos (1 slot): la API encola (un hilo) y `facturas_json.modelos_lock()` (bloqueo del SO sobre `.modelos.lock`) hace que API y CLI se esperen entre sí. El CLI suelto de `ocr_pipeline.py` NO toma el bloqueo: no correrlo mientras la API trabaja.

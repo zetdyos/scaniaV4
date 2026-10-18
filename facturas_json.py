@@ -65,9 +65,12 @@ Uso:
 
 import argparse
 import base64
+import contextlib
 import json
+import os
 import re
 import sys
+import time
 from pathlib import Path
 
 import fitz  # PyMuPDF
@@ -879,6 +882,45 @@ def build_all(res, use_llm=True, llm_server=QWEN27_SERVER, vl_server=VL_SERVER, 
     return out
 
 
+LOCK_PATH = Path(__file__).resolve().parent / ".modelos.lock"
+
+
+@contextlib.contextmanager
+def modelos_lock(log=None, on_wait=None):
+    """Un solo trabajo a la vez contra los modelos, también entre procesos (API y CLI).
+    Bloqueo exclusivo del sistema operativo sobre LOCK_PATH: se libera solo si el proceso muere."""
+    log = log or (lambda m: print(m, file=sys.stderr))
+    f = open(LOCK_PATH, "a+b")
+    try:
+        if os.name == "nt":
+            import msvcrt
+            lock = lambda: msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+            unlock = lambda: (f.seek(0), msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1))
+        else:
+            import fcntl
+            lock = lambda: fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            unlock = lambda: fcntl.flock(f, fcntl.LOCK_UN)
+        f.seek(0)
+        waiting = False
+        while True:
+            try:
+                lock()
+                break
+            except OSError:
+                if not waiting:
+                    waiting = True
+                    log("Esperando a los modelos: otro proceso los está usando")
+                    if on_wait:
+                        on_wait()
+                time.sleep(1)
+        try:
+            yield
+        finally:
+            unlock()
+    finally:
+        f.close()
+
+
 def main():
     ap = argparse.ArgumentParser(description="Fase 2: JSON estándar de facturas a partir del OCR de fase 1 (un archivo por PDF)")
     ap.add_argument("pdfs", nargs="+", help="PDF(s) a procesar")
@@ -895,14 +937,15 @@ def main():
     for pdf in args.pdfs:
         stem = Path(pdf).stem
         log(f"=== {pdf} ===")
-        try:
-            res = p1.run(pdf, timeout=args.timeout, log=log)
-        except RuntimeError as e:
-            sys.exit(str(e))
+        with modelos_lock(log):
+            try:
+                res = p1.run(pdf, timeout=args.timeout, log=log)
+            except RuntimeError as e:
+                sys.exit(str(e))
+            out = build_all(res, not args.no_llm, args.llm_server, args.vl_server, args.timeout, log)
         if args.md_dir:
             Path(args.md_dir).mkdir(parents=True, exist_ok=True)
             (Path(args.md_dir) / f"{stem}.md").write_text(res["markdown"], encoding="utf-8")
-        out = build_all(res, not args.no_llm, args.llm_server, args.vl_server, args.timeout, log)
         path = Path(args.out_dir) / f"{stem}.json"
         path.write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
         log(f"  Guardado en {path}")
