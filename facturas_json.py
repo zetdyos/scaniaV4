@@ -33,13 +33,16 @@ De dónde salen las líneas de cada factura:
 Campos adicionales (objeto `ocr`, anidado para no alterar las claves del esquema):
   - factura.ocr: proveedor, fuente_pdf, paginas, fecha_pedido, subtotal_articulos, envio,
     impuestos, total_antes_impuestos, descuentos[] ({concepto, importe}, importe en positivo),
-    other_charges[] (cargos que no encajan en las categorías anteriores; misma forma; hoy siempre []),
+    other_charges[] (cargos que no encajan en las categorías anteriores; misma forma). En la vía del
+    27B, envio / impuestos / descuentos / other_charges que las etiquetas no encuentran se toman de
+    las líneas que el 27B clasificó así, solo si su importe está literal en el OCR,
     metodo_pago, destinatario, direccion_envio, origen_lineas, envios[] (bloques de envío
     verificados), incidencias[] (las mismas notas que mismatch, en inglés).
   - linea.ocr: precio_unitario, cantidad_impresa (false si se asumió 1), vendedor, seguimiento,
     estado_envio, condicion, pagina, origen, verificado (cuadró aritméticamente) y evidencia.
   - linea.ocr.evidencia: origen de CADA valor: "leido" (literal en el texto OCR), "aritmetica"
-    (cantidad > 1 no impresa que solo sostiene el cuadre con el total; genera incidencia),
+    (cantidad > 1 no impresa; sin incidencia si la sostiene la propia línea: precio e importe literales
+    y cantidad x precio = importe; con incidencia si solo la sostiene el cuadre con el total),
     "calculado" (cantidad x precio), "asumido" (cantidad 1 no impresa; sin incidencia si cuadra)
     o "modelo" (sin respaldo: la línea no se da por verificada).
   Reglas duras para lo que devuelve un modelo: un artículo del VL sin descripción en el OCR se
@@ -427,7 +430,7 @@ def invoice_fields(md, full_texts, inv, pdf):
         "total_antes_impuestos": sq_amount(sq, [r"totalbeforetax:?(?:usd)?\$?" + AMT_SQ]),
         "descuentos": [],
         # cargos que no son artículos, envío, impuestos ni descuentos (categoría abierta, acordada con el usuario);
-        # misma forma que descuentos. Aún no hay extracción que lo rellene: siempre [] por ahora.
+        # misma forma que descuentos. Las etiquetas no lo rellenan; en la vía del 27B, build_invoice lo toma de sus líneas other_charges.
         "other_charges": [],
         "metodo_pago": "",
         "destinatario": "",
@@ -532,16 +535,24 @@ def line_evidence(l, sq_text, ocr_amounts, arithmetic_ok):
         ev["cantidad"] = "leido"
     elif l["qty"] == 1:
         ev["cantidad"] = "asumido"      # una unidad por defecto; el cuadre con el total lo corrobora
-    elif arithmetic_ok:
+    elif qty_backed_by_line(l, ev) or arithmetic_ok:
         ev["cantidad"] = "aritmetica"   # p. ej. "x2" ilegible: solo lo sostiene cantidad x precio = total
     else:
         ev["cantidad"] = "modelo"
     return ev
 
 
+def qty_backed_by_line(l, ev):
+    """Cantidad no impresa con un formato reconocible ("3 EA 3"), pero sostenida por la propia línea:
+    precio unitario e importe literales en el OCR y cantidad x precio = importe."""
+    unit, amt = l.get("unit") or "", l.get("amount") or ""
+    return (bool(unit and amt) and ev.get("precio_unitario") == ev.get("importe_linea") == "leido"
+            and abs(l["qty"] * float(unit) - float(amt)) < 0.01)
+
+
 def evidence_issues(lines):
     out = []
-    n_ar = sum(1 for l in lines if l.get("evidence", {}).get("cantidad") == "aritmetica")
+    n_ar = sum(1 for l in lines if l.get("evidence", {}).get("cantidad") == "aritmetica" and not qty_backed_by_line(l, l["evidence"]))
     n_mod = sum(1 for l in lines if "modelo" in l.get("evidence", {}).values())
     if n_ar:
         out.append(f"quantity inferred by arithmetic in {n_ar} line(s)")
@@ -763,6 +774,35 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
     # Se devuelven al final con su line_kind (WTCP solo declara las goods).
     others = [l for l in lines if l.get("kind", "goods") != "goods"]
     lines = [l for l in lines if l.get("kind", "goods") == "goods"]
+    # Contra qué cuadran las líneas, recalculado con lo que trajo el 27B (antes quedaba vacío si el total
+    # solo lo encontraba el modelo). Sin "Item(s) Subtotal" con esa etiqueta: vale una línea que el 27B
+    # clasificó subtotal_or_total, cuyo importe está literal en el OCR e iguala la suma de los artículos.
+    if source == "llm" and not items_subtotal and lines_sum(lines) is not None:
+        s = f"{lines_sum(lines):.2f}"
+        if any(l["kind"] == "subtotal_or_total" and l.get("amount") == s for l in others) and s in ocr_amounts:
+            items_subtotal = s
+    target = items_subtotal or total
+    fields = invoice_fields(md, full_texts, inv, res["pdf"])
+    if source == "llm":  # cabecera que las etiquetas no encontraron: de las líneas clasificadas por el 27B con importe en el OCR
+        backed = [l for l in others if l.get("amount") and l["amount"] in ocr_amounts]
+        for key, kind in (("envio", "shipping"), ("impuestos", "tax")):
+            amts = [float(l["amount"]) for l in backed if l["kind"] == kind]
+            if not fields[key] and amts:
+                fields[key] = f"{sum(amts):.2f}"
+        for key, kind in (("descuentos", "discount"), ("other_charges", "other_charges")):
+            if not fields[key]:
+                fields[key] = [{"concepto": l["desc"], "importe": l["amount"]} for l in backed if l["kind"] == kind]
+        if not fields["subtotal_articulos"]:
+            fields["subtotal_articulos"] = items_subtotal
+        # Sin subtotal de artículos impreso, la cuenta completa de la cabecera también cuadra la factura:
+        # artículos + envío + impuestos + otros cargos − descuentos = total (todos los importes leídos del OCR).
+        s = lines_sum(lines)
+        if not items_subtotal and total and s is not None:
+            extra = (float(fields["envio"] or 0) + float(fields["impuestos"] or 0)
+                     + sum(float(c["importe"] or 0) for c in fields["other_charges"])
+                     - sum(float(d["importe"] or 0) for d in fields["descuentos"]))
+            if abs(s + extra - float(total)) < 0.01:
+                target = f"{s:.2f}"
 
     # Rescate visual: solo en la vía del 27B, cuando la suma no reproduce el total impreso.
     if source == "llm" and total_printed and target and (lines_sum(lines) is None or abs(lines_sum(lines) - float(target)) >= 0.01):
@@ -818,7 +858,6 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
         l["evidence"], l["verified"] = line_evidence(l, sq_text, ocr_amounts, False), False
     if others:  # mismo orden en que el 27B las devolvió; las goods del rescate visual no traen orden y van primero
         lines = sorted(lines + others, key=lambda l: l.get("order", -1))
-    fields = invoice_fields(md, full_texts, inv, res["pdf"])
     fields["origen_lineas"] = source
     fields["envios"] = [{"estado": r["items"][0].get("_estado", "") if r["items"] else "", "total": f"{r['total']:.2f}", "suma_lineas": f"{p1.shipment_sum(r):.2f}",
                          "cuadra": p1.shipment_ok(r), "articulos": len(r["items"])} for r in shipments]
