@@ -33,6 +33,7 @@ De dónde salen las líneas de cada factura:
 Campos adicionales (objeto `ocr`, anidado para no alterar las claves del esquema):
   - factura.ocr: proveedor, fuente_pdf, paginas, fecha_pedido, subtotal_articulos, envio,
     impuestos, total_antes_impuestos, descuentos[] ({concepto, importe}, importe en positivo),
+    other_charges[] (cargos que no encajan en las categorías anteriores; misma forma; hoy siempre []),
     metodo_pago, destinatario, direccion_envio, origen_lineas, envios[] (bloques de envío
     verificados), incidencias[] (las mismas notas que mismatch, en inglés).
   - linea.ocr: precio_unitario, cantidad_impresa (false si se asumió 1), vendedor, seguimiento,
@@ -92,6 +93,9 @@ ORDER_TOTAL_RE = re.compile(r"(?:Order|Grand)\s*Total:?\s*(?:USD|\$)?\s*(" + AMO
 ITEMS_SUBTOTAL_RE = re.compile(r"Item\(?s?\)?\s*Subtotal:?\s*(?:USD|\$)?\s*(" + AMOUNT_TXT + ")", re.I)
 AMOUNT_RE = re.compile(r"(?:USD|\$)\s*(" + AMOUNT_TXT + r")|(?<![\d.,])(\d{1,3}(?:[.,]\d{3})*[.,]\d{2})(?![\d.,])")
 
+# Clase de cada línea que devuelve el 27B: el modelo de datos del proyecto, no una lista de palabras. Solo "goods"
+# es mercadería (lo que WTCP declara); "other_charges" recoge cualquier importe que no encaje en las demás.
+LINE_KINDS = ["goods", "shipping", "tax", "discount", "subtotal_or_total", "other_charges"]
 LINES_SCHEMA = {
     "type": "object",
     "properties": {
@@ -100,9 +104,10 @@ LINES_SCHEMA = {
             "properties": {"descripcion": {"type": "string"}, "cantidad": {"type": "string"},
                            "importe_linea": {"type": "string"}, "divisa": {"type": "string"},
                            "precio_unitario": {"type": "string"}, "vendedor": {"type": "string"},
-                           "seguimiento": {"type": "string"}, "estado_envio": {"type": "string"}},
+                           "seguimiento": {"type": "string"}, "estado_envio": {"type": "string"},
+                           "line_kind": {"type": "string", "enum": LINE_KINDS}},
             "required": ["descripcion", "cantidad", "importe_linea", "divisa",
-                         "precio_unitario", "vendedor", "seguimiento", "estado_envio"]}},
+                         "precio_unitario", "vendedor", "seguimiento", "estado_envio", "line_kind"]}},
         "total": {"type": "string"},
         "total_is_printed": {"type": "boolean"},
     },
@@ -116,8 +121,10 @@ USER_PROMPT = ("OCR text of the document (Markdown; HTML tables are regions dete
                "printed, or \"1\" when a single unit is implied), importe_linea (the amount printed for that line), "
                "divisa (ISO 4217 code; use USD for $), precio_unitario (unit price if printed, else \"\"), vendedor "
                "(seller name after 'Sold by', else \"\"), seguimiento (tracking number printed for that item, else \"\"), "
-               "estado_envio (delivery status text printed for that item such as 'Delivered October 8', else \"\"). "
-               "Also return total (the final amount payable as printed) and total_is_printed (true only if that total "
+               "estado_envio (delivery status text printed for that item such as 'Delivered October 8', else \"\"), "
+               "line_kind (goods if the line is a product or service being purchased; otherwise the kind of amount it "
+               "is: shipping, tax, discount, subtotal_or_total, or other_charges for any other amount that is not a "
+               "purchased item). Also return total (the final amount payable as printed) and total_is_printed (true only if that total "
                "is printed in the document).")
 
 # Patrón "Visual Information Extraction" del cookbook de Qwen: plantilla JSON con claves vacías.
@@ -201,9 +208,10 @@ ISO_CURRENCY_RE = re.compile(r"^[A-Z]{3}$")
 
 
 def goods_line(seq, l, divisa, ocr):
-    """Línea del esquema. Los campos de clasificación van con su forma y sin valor (ver docstring)."""
+    """Línea del esquema. Los campos de clasificación van con su forma y sin valor (ver docstring). line_kind es
+    "goods" salvo en las líneas que el 27B clasificó como otra cosa (LINE_KINDS)."""
     return {
-        "line_kind": "goods", "seq": seq,
+        "line_kind": l.get("kind", "goods"), "seq": seq,
         "descripcion": l["desc"], "cantidad": str(l["qty"]), "importe_linea": l["amount"], "divisa": divisa,
         "codigo": "", "hs6": "", "estado": "", "confianza_modelo": "", "candidatos": [],
         "confianza": None, "canal": None, "calibrado": None,
@@ -415,6 +423,9 @@ def invoice_fields(md, full_texts, inv, pdf):
                                    r"salestax:?(?:usd)?\$?" + AMT_SQ]),
         "total_antes_impuestos": sq_amount(sq, [r"totalbeforetax:?(?:usd)?\$?" + AMT_SQ]),
         "descuentos": [],
+        # cargos que no son artículos, envío, impuestos ni descuentos (categoría abierta, acordada con el usuario);
+        # misma forma que descuentos. Aún no hay extracción que lo rellene: siempre [] por ahora.
+        "other_charges": [],
         "metodo_pago": "",
         "destinatario": "",
         "direccion_envio": "",
@@ -725,6 +736,8 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
                 q = re.search(r"\d+", str(l.get("cantidad", "")))
                 lines.append({"desc": l.get("descripcion", "").strip(), "qty": int(q.group(0)) if q else 1,
                               "amount": amt, "unit": money(l.get("precio_unitario")), "src": "qwen27b", "page_rel": k + 1,
+                              "kind": l.get("line_kind") if l.get("line_kind") in LINE_KINDS else "goods",
+                              "order": len(lines),
                               "extra": {"vendedor": l.get("vendedor", ""), "seguimiento": l.get("seguimiento", ""),
                                         "estado_envio": l.get("estado_envio", "")}})
                 d = str(l.get("divisa") or "").strip().upper()
@@ -742,6 +755,11 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
     else:
         lines, source = [], "ninguna"
         issues.append("no shipment blocks and model extraction disabled")
+    # Las líneas que el 27B clasifica como no-mercadería (envío, impuesto, descuento, subtotal/total, otros cargos)
+    # se apartan: todo lo que sigue (sumas, rescate visual, evidencia, ESTRUCTURA) trabaja solo con las "goods".
+    # Se devuelven al final con su line_kind (WTCP solo declara las goods).
+    others = [l for l in lines if l.get("kind", "goods") != "goods"]
+    lines = [l for l in lines if l.get("kind", "goods") == "goods"]
 
     # Rescate visual: solo en la vía del 27B, cuando la suma no reproduce el total impreso.
     if source == "llm" and total_printed and target and (lines_sum(lines) is None or abs(lines_sum(lines) - float(target)) >= 0.01):
@@ -793,6 +811,10 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
         l["evidence"] = line_evidence(l, sq_text, ocr_amounts, all_ok)
         l["verified"] = l.get("verified", all_ok) and "modelo" not in l["evidence"].values()
     issues += evidence_issues(lines)
+    for l in others:  # no-mercadería: evidencia de sus valores, nunca "verificada" como artículo
+        l["evidence"], l["verified"] = line_evidence(l, sq_text, ocr_amounts, False), False
+    if others:  # mismo orden en que el 27B las devolvió; las goods del rescate visual no traen orden y van primero
+        lines = sorted(lines + others, key=lambda l: l.get("order", -1))
     fields = invoice_fields(md, full_texts, inv, res["pdf"])
     fields["origen_lineas"] = source
     fields["envios"] = [{"estado": r["items"][0].get("_estado", "") if r["items"] else "", "total": f"{r['total']:.2f}", "suma_lineas": f"{p1.shipment_sum(r):.2f}",
