@@ -100,8 +100,9 @@ ITEMS_SUBTOTAL_RE = re.compile(r"Item\(?s?\)?\s*Subtotal:?\s*(?:USD|\$)?\s*(" + 
 AMOUNT_RE = re.compile(r"(?:USD|\$)\s*(" + AMOUNT_TXT + r")|(?<![\d.,])(\d{1,3}(?:[.,]\d{3})*[.,]\d{2})(?![\d.,])")
 
 # Clase de cada línea que devuelve el 27B: el modelo de datos del proyecto, no una lista de palabras. Solo "goods"
-# es mercadería (lo que WTCP declara); "other_charges" recoge cualquier importe que no encaje en las demás.
-LINE_KINDS = ["goods", "shipping", "tax", "discount", "subtotal_or_total", "other_charges"]
+# es mercadería (lo que WTCP declara); "other_charges" recoge cualquier cargo que no encaje en las demás;
+# "payment" es dinero pagado o pendiente (tarjeta cobrada, saldo), que no es un cargo y no entra en ninguna cuenta.
+LINE_KINDS = ["goods", "shipping", "tax", "discount", "subtotal_or_total", "other_charges", "payment"]
 LINES_SCHEMA = {
     "type": "object",
     "properties": {
@@ -123,14 +124,16 @@ SYSTEM_PROMPT = ("You extract purchase line items from the OCR text of invoices 
                  "Copy every value exactly as printed in the document. Never invent, estimate or compute values. "
                  "If a value is not visible, return an empty string.")
 USER_PROMPT = ("OCR text of the document (Markdown; HTML tables are regions detected separately):\n\n{doc}\n\n"
-               "Return every purchased item line with: descripcion (product name as printed), cantidad (quantity as "
+               "Return every line of the document that carries an amount: each purchased item AND each amount of "
+               "the order summary or totals section (in whatever language it is printed), with: descripcion (product name as printed), cantidad (quantity as "
                "printed, or \"1\" when a single unit is implied), importe_linea (the amount printed for that line), "
                "divisa (ISO 4217 code; use USD for $), precio_unitario (unit price if printed, else \"\"), vendedor "
                "(seller name after 'Sold by', else \"\"), seguimiento (tracking number printed for that item, else \"\"), "
                "estado_envio (delivery status text printed for that item such as 'Delivered October 8', else \"\"), "
                "line_kind (goods if the line is a product or service being purchased; otherwise the kind of amount it "
-               "is: shipping, tax, discount, subtotal_or_total, or other_charges for any other amount that is not a "
-               "purchased item). Also return total (the final amount payable as printed) and total_is_printed (true only if that total "
+               "is: shipping, tax, discount, subtotal_or_total, payment for money paid or still due (amount charged "
+               "to a payment method, balance due), or other_charges for any other charge that is not a purchased "
+               "item). Also return total (the final amount payable as printed) and total_is_printed (true only if that total "
                "is printed in the document).")
 
 # Patrón "Visual Information Extraction" del cookbook de Qwen: plantilla JSON con claves vacías.
@@ -784,14 +787,18 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
     target = items_subtotal or total
     fields = invoice_fields(md, full_texts, inv, res["pdf"])
     if source == "llm":  # cabecera que las etiquetas no encontraron: de las líneas clasificadas por el 27B con importe en el OCR
+        # Un mismo resumen impreso en varias páginas no se suma dos veces: importes idénticos cuentan una vez
+        # (si eran cargos distintos, la cuenta de cabecera no cierra y la factura va a revisión).
         backed = [l for l in others if l.get("amount") and l["amount"] in ocr_amounts]
         for key, kind in (("envio", "shipping"), ("impuestos", "tax")):
-            amts = [float(l["amount"]) for l in backed if l["kind"] == kind]
+            amts = list(dict.fromkeys(l["amount"] for l in backed if l["kind"] == kind))
             if not fields[key] and amts:
-                fields[key] = f"{sum(amts):.2f}"
+                fields[key] = f"{sum(float(a) for a in amts):.2f}"
         for key, kind in (("descuentos", "discount"), ("other_charges", "other_charges")):
             if not fields[key]:
-                fields[key] = [{"concepto": l["desc"], "importe": l["amount"]} for l in backed if l["kind"] == kind]
+                seen = dict.fromkeys((p1.squash(l["desc"]), l["amount"]) for l in backed if l["kind"] == kind)
+                fields[key] = [{"concepto": next(l["desc"] for l in backed if (p1.squash(l["desc"]), l["amount"]) == k),
+                                "importe": k[1]} for k in seen]
         if not fields["subtotal_articulos"]:
             fields["subtotal_articulos"] = items_subtotal
         # Sin subtotal de artículos impreso, la cuenta completa de la cabecera también cuadra la factura:

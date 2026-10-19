@@ -87,14 +87,14 @@ Un array de facturas, como hoy.
 | `ocr.envio` | importe o `""` | Envío. Se muestra. |
 | `ocr.impuestos` | importe o `""` | Impuestos. Se muestran. |
 | `ocr.descuentos` | lista de `{"concepto": texto, "importe": importe}` **(forma nueva)** | WTCP suma los `importe` y lo muestra como descuento. Cada `importe` va en positivo. |
-| `ocr.other_charges` | lista de `{"concepto": texto, "importe": importe}` **(añadido por SCANIA, 2026-10-18)** | Cargos que no son artículos, envío, impuestos ni descuentos. Se muestran; no son mercadería. Hoy siempre `[]`. |
+| `ocr.other_charges` | lista de `{"concepto": texto, "importe": importe}` **(añadido por SCANIA, 2026-10-18)** | Cargos que no son artículos, envío, impuestos ni descuentos. Se muestran; no son mercadería. Se rellena con las líneas `other_charges` cuyo importe está literal en el OCR. |
 | `lineas` | lista | Ver 5.2. |
 
 ### 5.2 Lo que WTCP lee de cada línea
 
 | Campo | Formato | Qué hace WTCP |
 |---|---|---|
-| `line_kind` | texto: `goods`, `shipping`, `tax`, `discount`, `subtotal_or_total` u `other_charges` **(valores desde 2026-10-18)** | Solo las líneas `goods` son mercadería, y son las que WTCP declara. Las demás se ignoran para el SED (se pueden mostrar en la revisión). |
+| `line_kind` | texto: `goods`, `shipping`, `tax`, `discount`, `subtotal_or_total`, `other_charges` o `payment` (dinero pagado o pendiente: cobro a tarjeta, saldo) **(valores desde 2026-10-18; `payment` desde 2026-10-18 noche)** | Solo las líneas `goods` son mercadería, y son las que WTCP declara. Las demás se ignoran para el SED (se pueden mostrar en la revisión). |
 | `seq` | entero | Junto con el `id` de la factura, identifica la línea. |
 | `descripcion` | texto | Va al SED y a la pantalla de revisión. |
 | `cantidad` | número en texto | Se guarda y se muestra. |
