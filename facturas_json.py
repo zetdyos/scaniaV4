@@ -1311,6 +1311,8 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
                         log(f"  cantidad leída en la imagen (Qwen2.5-VL): {l['qty']} x {l['unit']} = {l['amount']} «{l['desc'][:40]}»")
                 lines = merged
                 target = items_subtotal or f"{lines_sum(lines):.2f}"
+                # las lecturas del VL que se descartaron no se usaron: su aviso no es motivo de revisión
+                issues = [i for i in issues if not i.startswith("vision model (Qwen2.5-VL) returned")]
                 log(f"  con esas cantidades, cantidad x precio literal = {target}: cuadra exactamente con lo impreso")
             elif kept and literal_price and vl_sum is not None and abs(vl_sum - vl_goal) < 0.01:
                 if len(kept) == len(lines):
