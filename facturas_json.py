@@ -234,6 +234,13 @@ def goods_line(seq, l, divisa, ocr):
     }
 
 
+def printed_negative(amt, text):
+    """El importe ('48.15') aparece impreso con signo menos en el texto ("-$48.15", "- USD 1,234.56")."""
+    v = float(amt)
+    nums = "|".join(re.escape(n) for n in dict.fromkeys((f"{v:.2f}", f"{v:,.2f}")))
+    return bool(re.search(r"-\s*(?:USD\s*)?\$?\s*(?:" + nums + r")(?![\d])", text or ""))
+
+
 def lines_sum(ls):
     return sum(float(l["amount"]) for l in ls) if ls and all(l["amount"] for l in ls) else None
 
@@ -424,6 +431,7 @@ def lines_with_vl(pdf, pages, server, timeout, log):
 # ----------------------------------------------------------------------------- campos adicionales desde el OCR
 
 AMT_SQ = r"(-?\d[\d.,]*(?:[.,]\d{2}|,-))"  # importe dentro de texto sin espacios
+VL_CELL_RE = re.compile(r'<td title="recuperado con Qwen2\.5-VL">.*?</td>', re.S)  # celda del rescate visual de la fase 1
 DATE_RE = re.compile(r"Order\s*(?:Placed|placed|time):?\s*([A-Z][a-z]{2,8}\.?\s*\d{1,2},?\s*\d{4})")
 PAY_RE = re.compile(r"(Your Bank|Visa|Master\s?Card|Amex|American Express|Discover|PayPal)\D{0,25}?(\d{4})\b", re.I)
 ADDR_START_RE = re.compile(r"^\s*(Ship to|Shipping Address:?|Shipping address)\s*$", re.I)
@@ -855,7 +863,7 @@ def parse_blocks(regions):
                 first, txt = p1.squash(cells[0]), re.sub(r"\s+", " ", " ".join(cells))
                 norm = p1.squash(txt)
                 if len(cells) == 1 and len(first) < 40 and first.startswith(p1.BLOCK_KEYS):
-                    cur = {"estado": re.sub(r"\s+", " ", cells[0]).strip(), "items": [], "subtotal": "", "envio": "",
+                    cur = {"estado": re.sub(r"\s+", " ", cells[0]).strip(), "items": [], "subtotal": "", "descuento": "", "envio": "",
                            "impuestos": "", "antes_impuestos": "", "total": "", "pages": [pi], "last_item": None}
                     blocks.append(cur)
                     continue
@@ -868,9 +876,17 @@ def parse_blocks(regions):
                     price = p1.first_amount(" ".join(cells[1:]))
                     if price is None:
                         price = p1.first_amount(cells[0].split("of:", 1)[1])
+                    # La fase 1 lanza el rescate visual cuando el envío no cuadra, aunque GLM-OCR SÍ haya leído el
+                    # precio (p. ej. el total del envío ya trae un cupón descontado). Si GLM leyó el mismo precio
+                    # que el VL, el precio es literal del OCR: no cuenta como rescatado.
+                    vl = 'title="recuperado con Qwen2.5-VL"' in raw
+                    if vl:
+                        glm = [c for c in (f2_unescape(c) for c in re.findall(r"<td[^>]*>(.*?)</td>", VL_CELL_RE.sub("", raw), re.S)) if c]
+                        glm_price = p1.first_amount(" ".join(glm[1:])) if len(glm) > 1 else None
+                        vl = not (glm_price is not None and price is not None and abs(glm_price - price) < 0.005)
                     item = {"qty": int(m.group(1)), "price": price, "desc": p1.item_description(cells[0]),
                             "text": cells[0][:60], "page_rel": pi + 1, "ri": ri, "vendedor": "", "condicion": "",
-                            "src": "qwen" if 'title="recuperado con Qwen2.5-VL"' in raw else "glm"}
+                            "src": "qwen" if vl else "glm"}
                     cur["items"].append(item)
                     cur["last_item"] = item
                 if cur["last_item"] is not None and not re.search(r"subtotal|shipping|total|tax", norm):
@@ -880,6 +896,7 @@ def parse_blocks(regions):
                     if cond and not cur["last_item"]["condicion"]:
                         cur["last_item"]["condicion"] = cond.group(1)
                 for key, pats in (("subtotal", [r"item\(?s?\)?subtotal:?(?:usd)?\$?" + AMT_SQ]),
+                                  ("descuento", [r"(?:savings|discount|promotionapplied):?-?(?:usd)?-?\$?" + AMT_SQ]),
                                   ("envio", [r"shipping&handling:?(?:usd)?\$?" + AMT_SQ]),
                                   ("antes_impuestos", [r"totalbeforetax:?(?:usd)?\$?" + AMT_SQ]),
                                   ("impuestos", [r"salestax:?(?:usd)?\$?" + AMT_SQ, r"estimatedtaxtobecollected:?(?:usd)?\$?" + AMT_SQ])):
@@ -912,6 +929,11 @@ def build_shipment_invoice(inv_id, res, inv, block, k, n, order_fields, order_to
         issues.append("shipment block without a printed total; total computed as the sum of lines")
         total = f"{s:.2f}" if s is not None else ""
     ok = total_printed and s is not None and abs(s - float(total)) < 0.01
+    # El total del envío puede traer envío, impuestos y un cupón: cuadra si artículos + envío + impuestos − descuento
+    # (todos impresos en el propio bloque) = total del envío.
+    extra = sum(float(block[k] or 0) for k in ("envio", "impuestos")) - float(block.get("descuento") or 0)
+    if total_printed and s is not None and not ok and extra and abs(s + extra - float(total)) < 0.01:
+        ok = True
     if total_printed and s is not None and not ok:
         issues.append(f"sum of lines {s:.2f} vs shipment total {total}")
     if any(it["src"] == "qwen" for it in block["items"]):
@@ -998,6 +1020,7 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
                 q = re.search(r"\d+", str(l.get("cantidad", "")))
                 lines.append({"desc": l.get("descripcion", "").strip(), "qty": int(q.group(0)) if q else 1,
                               "amount": amt, "unit": money(l.get("precio_unitario")), "src": "qwen27b", "page_rel": k + 1,
+                              "neg": bool(amt) and str(l.get("importe_linea", "")).strip().startswith("-") and printed_negative(amt, md),
                               "kind": l.get("line_kind") if l.get("line_kind") in LINE_KINDS else "goods",
                               "order": len(lines),
                               "extra": {"vendedor": l.get("vendedor", ""), "seguimiento": l.get("seguimiento", ""),
@@ -1093,9 +1116,16 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
             cands[key] = list(dict.fromkeys([v for v in (fields[key], from_llm) if v] + [""]))
         for key, kind in (("descuentos", "discount"), ("other_charges", "other_charges")):
             if not fields[key]:
-                seen = dict.fromkeys((p1.squash(l["desc"]), l["amount"]) for l in backed if l["kind"] == kind)
-                fields[key] = [{"concepto": next(l["desc"] for l in backed if (p1.squash(l["desc"]), l["amount"]) == k),
+                src = [l for l in backed if l["kind"] == kind and not (kind == "other_charges" and l.get("neg"))]
+                seen = dict.fromkeys((p1.squash(l["desc"]), l["amount"]) for l in src)
+                fields[key] = [{"concepto": next(l["desc"] for l in src if (p1.squash(l["desc"]), l["amount"]) == k),
                                 "importe": k[1]} for k in seen]
+        # Créditos: un "cargo" o "pago" impreso en NEGATIVO ("Refund -$48.15", "Gift Card Amount -$14.99") resta del
+        # total; el signo es el del documento. Van con los descuentos (importe en positivo), como candidatos del cuadre.
+        for l in backed:
+            if l.get("neg") and l["kind"] in ("other_charges", "payment") and \
+                    not any(d["importe"] == l["amount"] for d in fields["descuentos"]):
+                fields["descuentos"].append({"concepto": l["desc"], "importe": l["amount"]})
         if not fields["subtotal_articulos"]:
             fields["subtotal_articulos"] = items_subtotal
         # Un único artículo sin importe: el importe que cuadra el resumen impreso, si es único y está literal en el OCR.
@@ -1130,6 +1160,11 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
             fields["envio"], fields["impuestos"], fields["descuentos"], fields["other_charges"] = pick
         else:
             fields["envio"], fields["impuestos"] = cands["envio"][0], cands["impuestos"][0]
+            # Las líneas pueden cuadrar con el "Item(s) Subtotal" y aun así la cabecera no cerrar con el total
+            # (un cargo o crédito mal clasificado): esos campos van a WTCP, así que nunca sin revisión.
+            if items_subtotal and total and base is not None:
+                issues.append(f"order summary does not add up: items {base:.2f} + shipping + tax + other charges "
+                              f"- discounts does not match total {total}")
         # Sin subtotal de artículos impreso, la cuenta completa de la cabecera también cuadra la factura:
         # artículos + envío + impuestos + otros cargos − descuentos = total (todos los importes leídos del OCR).
         extra = (float(fields["envio"] or 0) + float(fields["impuestos"] or 0)
