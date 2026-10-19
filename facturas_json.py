@@ -43,7 +43,9 @@ Campos adicionales (objeto `ocr`, anidado para no alterar las claves del esquema
   - linea.ocr.evidencia: origen de CADA valor: "leido" (literal en el texto OCR), "aritmetica"
     (cantidad > 1 no impresa; sin incidencia si la sostiene la propia línea: precio e importe literales
     y cantidad x precio = importe; con incidencia si solo la sostiene el cuadre con el total),
-    "calculado" (cantidad x precio), "asumido" (cantidad 1 no impresa; sin incidencia si cuadra)
+    "calculado" (cantidad x precio), "asumido" (cantidad 1 no impresa; sin incidencia si cuadra),
+    "imagen" (cantidad leída por Qwen2.5-VL sobre la foto, confirmada porque cantidad x precio literal
+    cuadra exactamente con lo impreso)
     o "modelo" (sin respaldo: la línea no se da por verificada).
   Reglas duras para lo que devuelve un modelo: un artículo del VL sin descripción en el OCR se
   descarta; las líneas del VL solo se aceptan si todos sus precios unitarios están literalmente en
@@ -574,6 +576,8 @@ def line_evidence(l, sq_text, ocr_amounts, arithmetic_ok, ocr_units=frozenset())
         ev["importe_linea"] = ("leido" if amt in ocr_amounts else "aritmetica" if arithmetic_ok else "modelo") if amt else ""
     if l.get("qty_printed") or qty_printed(l["qty"], sq_text, key):
         ev["cantidad"] = "leido"
+    elif l.get("qty_vl"):  # leída en la imagen (Amazon la pone sobre la foto) y confirmada por el cuadre exacto
+        ev["cantidad"] = "imagen" if arithmetic_ok else "modelo"
     elif l["qty"] == 1:
         ev["cantidad"] = "asumido"      # una unidad por defecto; el cuadre con el total lo corrobora
     elif qty_backed_by_line(l, ev) or arithmetic_ok:
@@ -750,6 +754,35 @@ def choose_header(base, total, cands, descuentos, otros, max_items=6):
                     if abs(fixed + val(o) - val(d) - total) < 0.01:
                         return e, t, d, o
     return None
+
+
+def vl_quantities(lines, vl_lines, literal, sq_text, goal):
+    """Cantidades que solo se ven en la imagen (Amazon las pone sobre la foto del producto; el OCR no las lee).
+    Las líneas del 27B se quedan; de Qwen2.5-VL solo se toma la CANTIDAD del mismo artículo (mismo precio
+    unitario literal y descripción casi igual), nunca sobre una cantidad impresa. Se acepta solo si entonces
+    cantidad x precio de TODOS los artículos da exactamente lo impreso (goal); si no, None."""
+    used, out, changed = set(), [], 0
+    for l in lines:
+        unit = l.get("unit") if literal(l.get("unit")) else (l.get("amount") if l["qty"] == 1 and literal(l.get("amount")) else "")
+        if not unit or float(unit) <= 0:
+            return None
+        key = desc_key(l.get("desc"))[:30]
+        m = None
+        if not (l.get("qty_printed") or qty_printed(l["qty"], sq_text, p1.squash(l.get("desc", ""))[:20])):
+            sim = lambda k: difflib.SequenceMatcher(None, desc_key(vl_lines[k]["desc"])[:30], key).ratio()
+            cands = [k for k, v in enumerate(vl_lines) if k not in used and v.get("unit") == unit and v["qty"] >= 1]
+            best = max(cands, key=sim, default=None)
+            if best is not None and sim(best) >= 0.8:
+                m = best
+                used.add(m)
+        q = vl_lines[m]["qty"] if m is not None else l["qty"]
+        if q != l["qty"]:
+            changed += 1
+            out.append(dict(l, qty=q, unit=unit, amount=f"{q * float(unit):.2f}", amount_calc=True, qty_vl=True))
+        else:
+            out.append(l)
+    s = lines_sum(out)
+    return out if changed and s is not None and abs(s - goal) < 0.01 else None
 
 
 def qty_backed_by_line(l, ev):
@@ -1178,7 +1211,15 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
                               "as items; discarded")
             literal_price = bool(kept) and all(v.get("unit") and (v["unit"] in ocr_amounts or v["unit"] in ocr_units) for v in kept)
             vl_sum = lines_sum(kept)
-            if kept and literal_price and vl_sum is not None and abs(vl_sum - vl_goal) < 0.01:
+            merged = vl_quantities(lines, kept, literal, sq_text, vl_goal) if kept else None
+            if merged:
+                for l in merged:
+                    if l.get("qty_vl"):
+                        log(f"  cantidad leída en la imagen (Qwen2.5-VL): {l['qty']} x {l['unit']} = {l['amount']} «{l['desc'][:40]}»")
+                lines = merged
+                target = items_subtotal or f"{lines_sum(lines):.2f}"
+                log(f"  con esas cantidades, cantidad x precio literal = {target}: cuadra exactamente con lo impreso")
+            elif kept and literal_price and vl_sum is not None and abs(vl_sum - vl_goal) < 0.01:
                 if len(kept) == len(lines):
                     for v, o in zip(kept, lines):
                         v["extra"] = o.get("extra", {})
