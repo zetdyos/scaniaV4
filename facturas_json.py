@@ -965,14 +965,22 @@ def build_shipment_invoice(inv_id, res, inv, block, k, n, order_fields, order_to
                       "extra": {"vendedor": it["vendedor"], "condicion": it["condicion"], "estado_envio": block["estado"], "determinista": True}})
     s = lines_sum(lines)
     total, total_printed = block["total"], bool(block["total"])
-    if not total:
-        issues.append("shipment block without a printed total; total computed as the sum of lines")
-        total = f"{s:.2f}" if s is not None else ""
-    ok = total_printed and s is not None and abs(s - float(total)) < 0.01
     # El total del envío puede traer envío, impuestos y un cupón: cuadra si artículos + envío + impuestos − descuento
     # (todos impresos en el propio bloque) = total del envío.
     extra = sum(float(block[k] or 0) for k in ("envio", "impuestos")) - float(block.get("descuento") or 0)
-    if total_printed and s is not None and not ok and extra and abs(s + extra - float(total)) < 0.01:
+    derived = block.get("total_derived")  # Grand Total impreso - los demás envíos impresos (ver build_all)
+    if not total and derived:
+        total = derived
+        if s is None or abs(s + extra - float(derived)) >= 0.01:
+            issues.append(f"shipment block without a printed total; order Grand Total {block['order_total']} - other shipments "
+                          f"{block['others_total']} = {derived} for this block, but its lines add "
+                          + ("?" if s is None else f"{s:.2f}" + (f" + charges {extra:.2f}" if extra else "")
+                             + f" (difference {s + extra - float(derived):+.2f}; items possibly listed in another shipment)"))
+    elif not total:
+        issues.append("shipment block without a printed total; total computed as the sum of lines")
+        total = f"{s:.2f}" if s is not None else ""
+    ok = (total_printed or bool(derived)) and s is not None and abs(s - float(total)) < 0.01
+    if (total_printed or derived) and s is not None and not ok and extra and abs(s + extra - float(total)) < 0.01:
         ok = True
     if total_printed and s is not None and not ok:
         issues.append(f"sum of lines {s:.2f} vs shipment total {total}")
@@ -1450,11 +1458,21 @@ def build_all(res, use_llm=True, llm_server=QWEN27_SERVER, vl_server=VL_SERVER, 
             m = ORDER_TOTAL_RE.search(md)
             order_total = money(m.group(1)) if m else ""
             log(f"  -- pedido {inv['ref'] or 'sin referencia'}: {len(blocks)} bloque(s) de envío -> {len(blocks)} factura(s)")
+            # El Grand Total impreso del pedido: un único bloque sin "Total for This Shipment" toma Grand Total − los demás
+            # envíos impresos (todo literal); y si todos traen total, deben sumar el Grand Total.
+            missing = [b for b in blocks if not b["total"]]
+            others = sum(float(b["total"]) for b in blocks if b["total"])
+            if order_total and len(missing) == 1 and float(order_total) - others >= 0:
+                missing[0].update(total_derived=f"{float(order_total) - others:.2f}", order_total=order_total,
+                                  others_total=f"{others:.2f}")
             for k, b in enumerate(blocks):
                 docs.append(build_shipment_invoice(len(out) + len(docs), res, inv, b, k, len(blocks), order_fields, order_total, pages, full_texts, currency_of(md)))
                 d = docs[-1]
                 log(f"     factura {d['id']} [{b['estado']}]: {len(d['lineas'])} línea(s), total {d['total'] or '?'}"
                     f"{'' if d['total_is_printed'] else ' (calculado)'}, revisión: {d['motivo_revision'] or 'no'}" + (f" ({d['mismatch']})" if d["mismatch"] else ""))
+            if order_total and not missing and abs(others - float(order_total)) >= 0.01:
+                for d in docs:
+                    mark_review(d, f"shipments add up to {others:.2f} but the order Grand Total is {order_total}")
         else:
             log(f"  -- factura {len(out)} ({inv['ref'] or 'sin referencia'})")
             # Primero sin VL: si cuadra, es lo mismo que con VL (el rescate solo actúa cuando no cuadra).
