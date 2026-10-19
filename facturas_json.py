@@ -1144,6 +1144,12 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
                 if n != l["qty"] and qty_matches(n, unit, amt, l.get("unit_exact")):
                     log(f"  cantidad = importe / precio (literales): {l['qty']} -> {n} «{l['desc'][:40]}»")
                     l["qty"] = n
+            elif l["qty"] > 1 and amt in ocr_amounts and not literal(unit):
+                # cantidad > 1 sin respaldo (ni impresa como cantidad ni con precio unitario impreso): p. ej. el "(4)" de
+                # un pack en el nombre. El importe impreso es la línea entera: cantidad 1 y precio = importe. Si fuera
+                # otra cosa, el cuadre con lo impreso lo delata y la factura va a revisión.
+                log(f"  cantidad {l['qty']} sin respaldo (precio {unit or '-'} no impreso): 1 x {amt} «{l['desc'][:40]}»")
+                l["qty"], l["unit"], l["unit_exact"] = 1, amt, None
         if len(lines) == 1 and items_subtotal and items_subtotal in ocr_amounts:
             l = lines[0]
             # con cantidad 1, el importe de la línea es el precio unitario (el 27B a veces deja vacío el precio)
@@ -1256,6 +1262,38 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
                          - sum(float(d["importe"] or 0) for d in fields["descuentos"]))
                 if abs(s + extra - float(total)) < 0.01:
                     target = f"{s:.2f}"
+        # Línea de artículo que el 27B devolvió más veces de las que aparece en el texto de página completa del OCR
+        # (31755: rellenó a un vendedor sin artículo al pie de la página repitiendo el anterior). Se quita la copia
+        # sobrante solo si así cuadra EXACTAMENTE con lo impreso y con ella no.
+        if s is not None and not fits(s):
+            full_sq = p1.squash(" ".join(p1.page_markdown(i + 1, res["full_text"].get(i) or "", regs)[0].split("### Tablas detectadas")[0]
+                                          for i, regs in zip(pages, regions)))
+            groups = {}
+            for idx, l in enumerate(lines):
+                groups.setdefault((desc_key(l["desc"])[:40], l.get("amount")), []).append(idx)
+            extra_copies = []
+            for (key, amt), idxs in groups.items():
+                seen_in_ocr = full_sq.count(p1.squash(lines[idxs[0]]["desc"])[:30])
+                if amt and len(idxs) > 1 and 0 < seen_in_ocr < len(idxs):
+                    extra_copies += idxs[seen_in_ocr:]
+            if extra_copies:
+                s2 = s - sum(float(lines[i]["amount"]) for i in extra_copies)
+                if fits(s2):
+                    for i in sorted(extra_copies, reverse=True):
+                        dup = lines.pop(i)
+                        log(f"  línea repetida por el 27B (en el OCR aparece menos veces), quitada: {dup['amount']} «{dup['desc'][:40]}»")
+                    s = lines_sum(lines)
+                    if not items_subtotal:
+                        pick = choose_header(s, float(total), cands, full_d, full_o)
+                        if pick:
+                            fields["envio"], fields["impuestos"], fields["descuentos"], fields["other_charges"] = pick
+                        extra = (float(fields["envio"] or 0) + float(fields["impuestos"] or 0)
+                                 + sum(float(c["importe"] or 0) for c in fields["other_charges"])
+                                 - sum(float(d["importe"] or 0) for d in fields["descuentos"]))
+                    if items_subtotal and abs(s - float(items_subtotal)) < 0.01:
+                        target = items_subtotal
+                    elif not items_subtotal and abs(s + extra - float(total)) < 0.01:
+                        target = f"{s:.2f}"
         # Artículos que el 27B omitió (p. ej. dos filas casi idénticas que el texto de página completa perdió):
         # si la suma no cuadra, se buscan en las tablas del OCR filas completas y literales (descripción,
         # cantidad, precio, importe, con cantidad x precio = importe) que completen EXACTAMENTE la diferencia.
