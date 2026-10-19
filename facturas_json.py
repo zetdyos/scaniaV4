@@ -663,6 +663,30 @@ def qty_from_table(l, rows):
     return None
 
 
+def summary_line_as_goods(lines, fits):
+    """Índice de la línea de "artículo" que en realidad es el resumen de los demás (eBay "1 item $X" /
+    "1 object $X", fila "MERCHANT/SAMPLE" o por partida arancelaria con el total), o None.
+    Solo si TODO se cumple: hay >= 2 artículos con importe; su importe es exactamente la suma de los demás;
+    con ella la factura NO cuadra con lo impreso y sin ella SÍ (fits(suma) lo decide: subtotal impreso o
+    cuenta de cabecera). Con varias candidatas (dos líneas iguales: un solo producto real), se quita la de
+    descripción claramente más corta; si no hay una claramente más corta, None (lo decide una persona)."""
+    if len(lines) < 2 or any(not l.get("amount") for l in lines):
+        return None
+    total = sum(float(l["amount"]) for l in lines)
+    if fits(total):
+        return None
+    cands = [i for i, l in enumerate(lines)
+             if abs(float(l["amount"]) - (total - float(l["amount"]))) < 0.005 and fits(total - float(l["amount"]))]
+    if len(cands) == 1:
+        return cands[0]
+    if len(cands) == 2:
+        a, b = sorted(cands, key=lambda i: len(desc_key(lines[i].get("desc"))))
+        la, lb = len(desc_key(lines[a].get("desc"))), len(desc_key(lines[b].get("desc")))
+        if la * 2 <= lb and lb >= 12:  # p. ej. "1object" (7) frente al nombre del producto
+            return a
+    return None
+
+
 def choose_header(base, total, cands, descuentos, otros, max_items=6):
     """Primera combinación (envío, impuestos, descuentos, otros cargos) con la que
     base + envío + impuestos + otros − descuentos = total. Preferencia: candidatos en su orden (etiqueta,
@@ -1007,6 +1031,31 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
         if not items_subtotal and total and s is not None:
             if abs(s + extra - float(total)) < 0.01:
                 target = f"{s:.2f}"
+        # Una "línea de artículo" que es el resumen de los demás (eBay "1 item $X", fila con el total): solo se
+        # aparta si el propio documento lo demuestra (ver summary_line_as_goods). Queda en `lineas` como
+        # subtotal_or_total, visible para la revisión.
+        full_d, full_o = list(fields["descuentos"]), list(fields["other_charges"])
+
+        def fits(x):
+            if items_subtotal:
+                return abs(x - float(items_subtotal)) < 0.01
+            return bool(total) and choose_header(x, float(total), cands, full_d, full_o) is not None
+        k = summary_line_as_goods(lines, fits) if s is not None else None
+        if k is not None:
+            dup = lines.pop(k)
+            log(f"  línea de resumen tomada como artículo, apartada: {dup['amount']} «{dup['desc'][:40]}» "
+                f"(= suma de los demás artículos; sin ella cuadra con lo impreso)")
+            others.append(dict(dup, kind="subtotal_or_total"))
+            s = lines_sum(lines)
+            if not items_subtotal:
+                pick = choose_header(s, float(total), cands, full_d, full_o)
+                if pick:
+                    fields["envio"], fields["impuestos"], fields["descuentos"], fields["other_charges"] = pick
+                extra = (float(fields["envio"] or 0) + float(fields["impuestos"] or 0)
+                         + sum(float(c["importe"] or 0) for c in fields["other_charges"])
+                         - sum(float(d["importe"] or 0) for d in fields["descuentos"]))
+                if abs(s + extra - float(total)) < 0.01:
+                    target = f"{s:.2f}"
         # Artículos que el 27B omitió (p. ej. dos filas casi idénticas que el texto de página completa perdió):
         # si la suma no cuadra, se buscan en las tablas del OCR filas completas y literales (descripción,
         # cantidad, precio, importe, con cantidad x precio = importe) que completen EXACTAMENTE la diferencia.
