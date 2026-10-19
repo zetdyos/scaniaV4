@@ -929,10 +929,14 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
     items_subtotal = money(subs[-1]) if subs else ""
 
     shipments, unverified, grand = p1.check_shipments(regions)
-    total = f"{grand:.2f}" if grand is not None else ""
-    if not total:
-        m = ORDER_TOTAL_RE.search(md)
-        total = money(m.group(1)) if m else ""
+    # Totales impresos candidatos, en orden de preferencia: el "Grand Total" de las regiones (fase 1), el de la
+    # etiqueta en el texto y (más abajo) el del 27B con respaldo en el OCR. En la vía del 27B se queda el primero
+    # con el que cuadra el resumen: en una tabla con las etiquetas en una columna y los valores en otra, la fase 1
+    # empareja "Grand Total" con el primer importe de la columna (31814: 2.00 de handling en vez de 29,439.60).
+    m = ORDER_TOTAL_RE.search(md)
+    total_cands = list(dict.fromkeys(v for v in (f"{grand:.2f}" if grand is not None else "",
+                                                 money(m.group(1)) if m else "") if v))
+    total = total_cands[0] if total_cands else ""
     total_printed = bool(total)
     target = items_subtotal or total  # suma esperada de las líneas (sin envío ni impuestos)
     if 'title="recuperado con Qwen2.5-VL"' in md:
@@ -975,6 +979,8 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
         backed_totals = [d for d in model_totals if money(d.get("total")) in ocr_amounts]
         model_total = (backed_totals or model_totals or [None])[-1]
         t = money(model_total.get("total")) if model_total else ""
+        if t and t in ocr_amounts and t not in total_cands:
+            total_cands.append(t)
         if t and not total:
             if t in ocr_amounts:
                 total, total_printed = t, bool(model_total.get("total_is_printed", True))
@@ -1079,8 +1085,14 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
         # quitan de la cabecera; un "cargo" que no entra (base exenta, puntos) también. Si nada cuadra, se deja
         # lo de siempre (etiqueta primero, todo incluido) y la factura va a revisión por el descuadre.
         base = float(items_subtotal) if items_subtotal else s
-        pick = choose_header(base, float(total), cands, fields["descuentos"], fields["other_charges"]) \
-            if total and base is not None else None
+        pick = None
+        for tc in (total_cands if base is not None else []):
+            pick = choose_header(base, float(tc), cands, fields["descuentos"], fields["other_charges"])
+            if pick:
+                if tc != total:
+                    log(f"  total impreso que cuadra el resumen: {tc} (en vez de {total})")
+                total = tc
+                break
         if pick:
             fields["envio"], fields["impuestos"], fields["descuentos"], fields["other_charges"] = pick
         else:
