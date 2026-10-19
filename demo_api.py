@@ -201,7 +201,7 @@ load_jobs()
 
 
 def set_step(job, pct, step):
-    job["progress"] = max(job.get("progress", 0), int(pct))
+    job["progress"] = min(99, max(job.get("progress", 0), int(pct)))  # 100 solo al terminar (el corte por pedidos puede dar más facturas que las detectadas)
     job["step"] = step
 
 
