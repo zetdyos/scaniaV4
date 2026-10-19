@@ -234,6 +234,28 @@ def goods_line(seq, l, divisa, ocr):
     }
 
 
+def parse_qty(txt):
+    """Cantidad como entero, con separador de miles ("1,000 pcs" -> 1000; antes se leía 1). None si no hay número."""
+    t = str(txt or "")
+    m = re.search(r"\d{1,3}(?:,\d{3})+(?:\.\d+)?(?![\d,])", t)  # 1,000 | 10,500.00
+    if m:
+        return int(float(m.group(0).replace(",", "")))
+    m = re.search(r"\d{1,3}(?:\.\d{3})+(?![\d.,])", t)  # 1.000 (punto de miles)
+    if m:
+        return int(m.group(0).replace(".", ""))
+    m = re.search(r"\d+", t)
+    return int(m.group(0)) if m else None
+
+
+def decimal_qty(txt, text):
+    """Cantidad decimal impresa ("0.50" de un tubo, "2.5" kg): tal cual, si aparece literal en el texto. Solo cuenta como
+    impresa si además cantidad x precio = importe exacto (ver build_invoice); si no, la línea va a revisión."""
+    t = str(txt or "").strip()
+    if re.fullmatch(r"\d+\.\d{1,3}", t) and float(t) % 1 and re.search(r"(?<![\d.])" + re.escape(t) + r"(?![\d])", text or ""):
+        return float(t)
+    return None
+
+
 def printed_negative(amt, text):
     """El importe ('48.15') aparece impreso con signo menos en el texto ("-$48.15", "- USD 1,234.56")."""
     v = float(amt)
@@ -414,8 +436,7 @@ def lines_with_vl(pdf, pages, server, timeout, log):
             rj = post_json(f"{server}/v1/chat/completions", payload, timeout, log=log)
             data = json.loads(rj["choices"][0]["message"]["content"])
             for it in data.get("items", []):
-                q = re.search(r"\d+", str(it.get("quantity", "")))
-                qty = int(q.group(0)) if q else 1
+                qty = parse_qty(it.get("quantity")) or 1
                 unit = money(it.get("discounted_unit_price")) or money(it.get("unit_price"))
                 lines.append({"desc": str(it.get("description", "")).strip(), "qty": qty, "unit": unit,
                               "amount": f"{qty * float(unit):.2f}" if unit else "", "src": "qwen-vl",
@@ -657,13 +678,30 @@ def fine_amounts(text):
     return out
 
 
+def exact_cents(text):
+    """Importes impresos con 3 a 5 decimales que son céntimos exactos ("1975.0000", "12.500"): literales sin redondeo."""
+    return {f"{float(x):.2f}" for x in FINE_NUM_RE.findall(text or "") if set(x.split(".")[1][2:]) <= {"0"}}
+
+
+def exact_unit(raw, text):
+    """Precio unitario con 3 a 5 decimales tal como está impreso ("1.9750"), si aparece así en el texto: para
+    cantidad x precio sin truncarlo a céntimos (1000 x 1.9750 = 1975.00, no 1000 x 1.97)."""
+    from decimal import Decimal
+    m = FINE_NUM_RE.search(str(raw or ""))
+    return Decimal(m.group(0)) if m and m.group(0) in FINE_NUM_RE.findall(text or "") else None
+
+
 def qty_tolerance(qty, unit):
     """Margen de cantidad x precio frente al importe cuando el precio impreso está redondeado a céntimos
     (o tiene más decimales): qty x 0,005, pero siempre menor que medio precio para que la cantidad sea única."""
     return max(0.0099, min(qty * 0.005 + 0.005, float(unit) / 2 - 0.001))
 
 
-def qty_matches(qty, unit, amt):
+def qty_matches(qty, unit, amt, exact=None):
+    """cantidad x precio = importe. Con el precio impreso completo (exact, 3-5 decimales) la cuenta es exacta al
+    céntimo; con el precio en céntimos, con el margen de redondeo (qty_tolerance)."""
+    if exact is not None and amt and qty >= 1:
+        return abs(qty * float(exact) - float(amt)) < 0.006
     return bool(unit and amt) and qty >= 1 and abs(qty * float(unit) - float(amt)) <= qty_tolerance(qty, unit)
 
 
@@ -684,9 +722,11 @@ def qty_from_table(l, rows):
     for cells in rows:
         if key not in desc_key(" ".join(cells)):
             continue
-        ints = sorted({int(c) for c in cells if re.fullmatch(r"\d{1,5}", c)})
+        # la cantidad sola en su celda, o con la unidad de medida ("144 EA", "2 ROL")
+        ints = sorted({int(m.group(1).replace(",", "")) for c in cells
+                       for m in [re.fullmatch(r"(\d{1,3}(?:,\d{3})+|\d{1,5})(?:\s+[A-Za-z]{1,4})?", c)] if m})
         unit, amt = l.get("unit") or "", l.get("amount") or ""
-        fit = [q for q in ints if qty_matches(q, unit, amt)]
+        fit = [q for q in ints if qty_matches(q, unit, amt, l.get("unit_exact"))]
         if len(fit) == 1:
             return fit[0]
         if l["qty"] in ints:  # p. ej. eBay: "Item price" es el total de la línea; la cantidad es su propia celda
@@ -798,7 +838,7 @@ def qty_backed_by_line(l, ev):
     precio unitario e importe literales en el OCR y cantidad x precio = importe (con el margen de
     redondeo del precio impreso)."""
     unit, amt = l.get("unit") or "", l.get("amount") or ""
-    return ev.get("precio_unitario") == ev.get("importe_linea") == "leido" and qty_matches(l["qty"], unit, amt)
+    return ev.get("precio_unitario") == ev.get("importe_linea") == "leido" and qty_matches(l["qty"], unit, amt, l.get("unit_exact"))
 
 
 def evidence_issues(lines):
@@ -974,8 +1014,10 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
     regions = [res["region_pages"][i] if i < len(res["region_pages"]) else [] for i in pages]
     full_texts = [res["full_text"].get(i) or "" for i in pages]
     md = "\n\n---\n\n".join(p1.page_markdown(i + 1, res["full_text"].get(i) or "", regs)[0] for i, regs in zip(pages, regions))
-    ocr_amounts = doc_amounts(md)
-    sq_text = p1.squash(md)
+    ocr_amounts = doc_amounts(md) | exact_cents(md)  # "1975.0000" también es literal
+    # también sin etiquetas HTML ni entidades: en las tablas del OCR la descripción viene partida con <br> ("4130158083<br>4130
+    # Chromoly...") o con &quot;, y no se encontraría literal aunque esté leída
+    sq_text = p1.squash(md) + "|" + p1.squash(html.unescape(re.sub(r"<[^>]+>", " ", md)))
     divisa = currency_of(md)
     issues = []
     # Con qué deben cuadrar las líneas: el "Item(s) Subtotal" del pedido. El formato de escritorio
@@ -1017,9 +1059,9 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
                 # Solo los artículos: un importe de resumen sin respaldo no se usa (ver "backed"), no es incidencia.
                 if amt and amt not in ocr_amounts and l.get("line_kind", "goods") == "goods":
                     issues.append(f'amount {amt} not found in the OCR text ("{l.get("descripcion", "")[:40]}")')
-                q = re.search(r"\d+", str(l.get("cantidad", "")))
-                lines.append({"desc": l.get("descripcion", "").strip(), "qty": int(q.group(0)) if q else 1,
+                lines.append({"desc": l.get("descripcion", "").strip(), "qty": decimal_qty(l.get("cantidad"), md) or parse_qty(l.get("cantidad")) or 1,
                               "amount": amt, "unit": money(l.get("precio_unitario")), "src": "qwen27b", "page_rel": k + 1,
+                              "unit_exact": exact_unit(l.get("precio_unitario"), md),
                               "neg": bool(amt) and str(l.get("importe_linea", "")).strip().startswith("-") and printed_negative(amt, md),
                               "kind": l.get("line_kind") if l.get("line_kind") in LINE_KINDS else "goods",
                               "order": len(lines),
@@ -1066,11 +1108,19 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
         # 27B estuviera mal, la factura no cuadra y va a revisión).
         for l in lines:
             if not l.get("amount") and literal(l.get("unit")) and l["qty"] >= 1:
-                l["amount"], l["amount_calc"] = f"{l['qty'] * float(l['unit']):.2f}", True
+                from decimal import ROUND_HALF_UP, Decimal
+                u = l.get("unit_exact") or Decimal(l["unit"])
+                l["amount"] = str((Decimal(str(l["qty"])) * u).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+                l["amount_calc"] = True
                 log(f"  importe = cantidad x precio literal: {l['qty']} x {l['unit']} = {l['amount']} «{l['desc'][:40]}»")
         for l in lines:
+            if l["qty"] % 1:  # cantidad decimal impresa (decimal_qty): vale solo si cantidad x precio literal = importe exacto
+                u = float(l.get("unit_exact") or l.get("unit") or 0)
+                if literal(l.get("unit")) and l.get("amount") in ocr_amounts and abs(l["qty"] * u - float(l["amount"])) < 0.006:
+                    l["qty_printed"] = True
+                continue
             q = qty_from_table(l, rows)
-            if q:
+            if q is not None:
                 if q != l["qty"]:
                     log(f"  cantidad de la fila de tabla del OCR: {l['qty']} -> {q} «{l['desc'][:40]}»")
                 l["qty"], l["qty_printed"] = q, True
@@ -1082,8 +1132,8 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
                 continue
             unit, amt = l.get("unit") or "", l.get("amount") or ""
             if literal(unit) and amt in ocr_amounts and float(unit) > 0:
-                n = round(float(amt) / float(unit))
-                if n != l["qty"] and qty_matches(n, unit, amt):
+                n = round(float(amt) / float(l.get("unit_exact") or unit))
+                if n != l["qty"] and qty_matches(n, unit, amt, l.get("unit_exact")):
                     log(f"  cantidad = importe / precio (literales): {l['qty']} -> {n} «{l['desc'][:40]}»")
                     l["qty"] = n
         if len(lines) == 1 and items_subtotal and items_subtotal in ocr_amounts:
@@ -1273,6 +1323,13 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
             issues.append(f"vision model (Qwen2.5-VL) not responding at {vl_server}; no visual check")
 
     issues += description_issues(lines)
+    # Artículo con importe 0.00 pero precio unitario impreso: no se envió (pendiente, "B/O") o la cantidad no es la
+    # enviada. WTCP declararía mercancía que no viene: siempre a revisión (decisión del usuario, 2026-10-19).
+    zero = [l for l in lines if l.get("amount") and float(l["amount"]) == 0 and l.get("unit")
+            and float(l["unit"]) > 0 and (l["unit"] in ocr_amounts or l["unit"] in ocr_units)]
+    if zero:
+        issues.append(f"{len(zero)} item line(s) with amount 0.00 but a printed unit price (not shipped or back-ordered?): "
+                      + ", ".join(f'"{l["desc"][:40]}"' for l in zero[:3]))
     if not total and lines_sum(lines) is not None:
         total, total_printed = f"{lines_sum(lines):.2f}", False
         target = total
