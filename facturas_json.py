@@ -558,7 +558,7 @@ def line_evidence(l, sq_text, ocr_amounts, arithmetic_ok, ocr_units=frozenset())
     unit, amt = l.get("unit") or "", l.get("amount") or ""
     ev["precio_unitario"] = ("leido" if unit in ocr_amounts or unit in ocr_units
                              else "aritmetica" if arithmetic_ok else "modelo") if unit else ""
-    if src == "qwen-vl":
+    if src == "qwen-vl" or l.get("amount_calc"):
         ev["importe_linea"] = "calculado" if amt else ""
     else:
         ev["importe_linea"] = ("leido" if amt in ocr_amounts else "aritmetica" if arithmetic_ok else "modelo") if amt else ""
@@ -694,6 +694,31 @@ def summary_line_as_goods(lines, fits):
         if la * 2 <= lb and lb >= 12:  # p. ej. "1object" (7) frente al nombre del producto
             return a
     return None
+
+
+def single_missing_amount(known, items_subtotal, total, cands, descuentos, otros, literal, charges=frozenset(), max_items=6):
+    """Importe del único artículo sin importe: el que hace cuadrar el resumen impreso (subtotal de artículos, o
+    total con alguna combinación de cargos/descuentos leídos), SOLO si es un único valor, está literal en el
+    OCR (`literal`) y no es un importe que el documento ya identifica como envío, impuesto, descuento, cargo o
+    pago (`charges`): un cargo no se convierte en artículo. Ambiguo o no impreso: None."""
+    ok = lambda v: v in literal and v not in charges
+    if items_subtotal:
+        d = round(float(items_subtotal) - known, 2)
+        return f"{d:.2f}" if d > 0 and ok(f"{d:.2f}") else None
+    if not total:
+        return None
+    descuentos, otros = descuentos[:max_items], otros[:max_items]
+    val = lambda xs: sum(float(x["importe"] or 0) for x in xs)
+    subsets = lambda xs: (list(c) for k in range(len(xs) + 1) for c in itertools.combinations(xs, len(xs) - k))
+    found = set()
+    for e in cands["envio"]:
+        for t in cands["impuestos"]:
+            for o in subsets(otros):
+                for dd in subsets(descuentos):
+                    d = round(float(total) - known - float(e or 0) - float(t or 0) - val(o) + val(dd), 2)
+                    if d > 0 and ok(f"{d:.2f}"):
+                        found.add(f"{d:.2f}")
+    return found.pop() if len(found) == 1 else None
 
 
 def choose_header(base, total, cands, descuentos, otros, max_items=6):
@@ -965,6 +990,12 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
         #    entero (la cantidad de las capturas de Amazon va sobre la foto y el OCR no la lee).
         rows = table_rows(md)
         literal = lambda v: bool(v) and (v in ocr_amounts or v in ocr_units)
+        # Importe vacío con precio unitario literal: importe = cantidad x precio ("calculado"; si la cantidad del
+        # 27B estuviera mal, la factura no cuadra y va a revisión).
+        for l in lines:
+            if not l.get("amount") and literal(l.get("unit")) and l["qty"] >= 1:
+                l["amount"], l["amount_calc"] = f"{l['qty'] * float(l['unit']):.2f}", True
+                log(f"  importe = cantidad x precio literal: {l['qty']} x {l['unit']} = {l['amount']} «{l['desc'][:40]}»")
         for l in lines:
             q = qty_from_table(l, rows)
             if q:
@@ -1018,6 +1049,18 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
                                 "importe": k[1]} for k in seen]
         if not fields["subtotal_articulos"]:
             fields["subtotal_articulos"] = items_subtotal
+        # Un único artículo sin importe: el importe que cuadra el resumen impreso, si es único y está literal en el OCR.
+        missing = [l for l in lines if not l.get("amount")]
+        if len(missing) == 1 and len(lines) >= 1:
+            known = sum(float(l["amount"]) for l in lines if l.get("amount"))
+            charges = {o["amount"] for o in others if o.get("amount") and o["kind"] in
+                       ("shipping", "tax", "discount", "other_charges", "payment")}
+            charges |= {v for v in (fields["envio"], fields["impuestos"]) if v}
+            v = single_missing_amount(known, items_subtotal, total, cands, fields["descuentos"], fields["other_charges"],
+                                      ocr_amounts, charges)
+            if v:
+                missing[0]["amount"] = v
+                log(f"  único artículo sin importe: {v} (cuadra el resumen impreso y está literal en el OCR) «{missing[0]['desc'][:40]}»")
         s = lines_sum(lines)
         # Cabecera que cuadra el resumen impreso: (subtotal de artículos o suma de artículos) + envío + impuestos
         # + otros cargos − descuentos = total. Entre etiqueta y 27B, y entre los descuentos/cargos leídos, se
