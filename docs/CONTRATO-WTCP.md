@@ -203,4 +203,6 @@ Factura real de `31143.pdf`. Los valores de `codigo`, `estado` y confianza son i
 Notas de SCANIA:
 - Un archivo dañado, vacío, de otro tipo, con nombre no ASCII o de más de 50 MB se rechaza en `POST /api/jobs` con `400`/`413` y `detail` en inglés, sin crear trabajo.
 - Un documento sin número de pedido reconocible y sin líneas de artículos sale como factura con `motivo_revision: "ESTRUCTURA"`; SCANIA no devuelve `[]` por inferencia (un `[]` equivocado haría saltar una factura real sin que nadie la vea). `[]` solo si el archivo no tiene páginas.
+- Un PDF con varios pedidos seguidos (facturas Shein, eBay o de proveedor, una por página o por grupo de páginas) sale como **varias facturas** cuando cada grupo de páginas cuadra con su propio total impreso; si alguno no cuadra, sale entero, como antes, y va a revisión.
+- El mismo pedido dos veces (mismo total, mismos artículos y un número de pedido/seguimiento impreso en común), dentro del PDF o en **otro documento ya enviado** con otro nombre de archivo, va a `LECTURA` con `mismatch` «same order as invoice N of this file / of document X.pdf (… possible duplicate declaration)». Reenviar el mismo archivo (mismo nombre) no cuenta.
 - `ocr.proveedor` hoy es el formato reconocido (`amazon`, `temu`) o `""`, no el nombre de la tienda.

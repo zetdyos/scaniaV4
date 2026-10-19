@@ -205,6 +205,43 @@ def set_step(job, pct, step):
     job["step"] = step
 
 
+def fingerprints_of(job_id):
+    """Huellas de pedido de un trabajo terminado (f2.order_fingerprints), guardadas en huellas.json la primera vez."""
+    d = JOBS_DIR / job_id
+    h = d / "huellas.json"
+    if h.exists():
+        return json.loads(h.read_text(encoding="utf-8"))
+    if not ((d / "result.json").exists() and (d / "ocr.md").exists()):
+        return []
+    fps = f2.order_fingerprints(json.loads((d / "result.json").read_text(encoding="utf-8")),
+                                (d / "ocr.md").read_text(encoding="utf-8"))
+    h.write_text(json.dumps(fps, ensure_ascii=False), encoding="utf-8")
+    return fps
+
+
+def mark_cross_document_duplicates(job, out, markdown, log):
+    """El mismo pedido en OTRO documento ya procesado (mismo total, mismos artículos y un identificador impreso
+    en común): se declararía dos veces. Va a revisión, con el documento anterior en el motivo. El reenvío del
+    mismo archivo (mismo nombre) no cuenta. Se compara con el último trabajo terminado de cada documento."""
+    mine = f2.order_fingerprints(out, markdown)
+    latest = {}
+    for j in list(jobs.values()):
+        if j["id"] != job["id"] and j.get("state") == "done" and j.get("pdf") != job["pdf"]:
+            latest[j["pdf"]] = j["id"]
+    for pdf, jid in latest.items():
+        try:
+            theirs = fingerprints_of(jid)
+        except (OSError, ValueError, KeyError):
+            continue
+        for a, doc in zip(mine, out):
+            b = next((b for b in theirs if f2.same_order(a, b)), None)
+            if b is not None:
+                log(f"  factura {doc['id']}: el mismo pedido ya vino en {pdf} (factura {b['id']})")
+                f2.mark_review(doc, f"same order as invoice {b['id']} of document {pdf} (identical items and total; "
+                                    "possible duplicate declaration)")
+    return mine
+
+
 def process(job_id):
     job = jobs[job_id]
     d = JOBS_DIR / job_id
@@ -232,6 +269,8 @@ def process(job_id):
         with f2.modelos_lock(log, on_wait=lambda: set_step(job, 2, "Esperando a los modelos (otro proceso los está usando)")):
             res = p1.run(str(d / job["pdf"]), log=log)
             out = f2.build_all(res, log=log)
+        fps = mark_cross_document_duplicates(job, out, res["markdown"], log)
+        (d / "huellas.json").write_text(json.dumps(fps, ensure_ascii=False), encoding="utf-8")
         (d / "result.json").write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
         (d / "ocr.md").write_text(res["markdown"], encoding="utf-8")
         (d / "ocr.html").write_text(mdlib.markdown(res["markdown"], extensions=["tables"]), encoding="utf-8")

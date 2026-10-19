@@ -345,10 +345,20 @@ def count_tokens(server, text):
     return len(requests.post(f"{server}/tokenize", json={"content": text}, timeout=30).json().get("tokens", []))
 
 
+_LLM_CACHE = {}  # (servidor, Markdown de la página) -> respuesta; se vacía por documento en build_all
+
+
 def lines_with_llm(markdown, server, timeout, log):
     """Una llamada al 27B con el Markdown de UNA página. Devuelve (datos, motivo_de_fallo).
     max_tokens = n_ctx - prompt (antes 4096 fijo: una factura de 54 artículos se cortaba siempre). Si la
-    respuesta se corta o no es JSON devuelve (None, motivo) en vez de lanzar: la factura va a revisión."""
+    respuesta se corta o no es JSON devuelve (None, motivo) en vez de lanzar: la factura va a revisión.
+    Temperatura 0 y top_k 1: la misma página da la misma respuesta, así que se reutiliza (corte por pedidos)."""
+    if (server, markdown) not in _LLM_CACHE:
+        _LLM_CACHE[(server, markdown)] = _lines_with_llm(markdown, server, timeout, log)
+    return _LLM_CACHE[(server, markdown)]
+
+
+def _lines_with_llm(markdown, server, timeout, log):
     user = USER_PROMPT.format(doc=markdown)
     budget = server_n_ctx(server) - count_tokens(server, SYSTEM_PROMPT + "\n" + user) - PROMPT_MARGIN_TOKENS
     if budget < 512:
@@ -904,7 +914,7 @@ def build_shipment_invoice(inv_id, res, inv, block, k, n, order_fields, order_to
 
 # ----------------------------------------------------------------------------- factura
 
-def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log):
+def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log, vl=True):
     pages = inv["pages"]
     regions = [res["region_pages"][i] if i < len(res["region_pages"]) else [] for i in pages]
     full_texts = [res["full_text"].get(i) or "" for i in pages]
@@ -1132,7 +1142,7 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
     vl_goal = None
     if source == "llm" and target:
         vl_goal = float(items_subtotal) if items_subtotal else float(total) - extra if total else None
-    if source == "llm" and lines and total_printed and vl_goal is not None and (lines_sum(lines) is None or abs(lines_sum(lines) - float(target)) >= 0.01):
+    if vl and source == "llm" and lines and total_printed and vl_goal is not None and (lines_sum(lines) is None or abs(lines_sum(lines) - float(target)) >= 0.01):
         if p1.server_ok(vl_server):
             log("  la suma no cuadra con el total impreso: lectura visual con Qwen2.5-VL")
             try:
@@ -1215,12 +1225,69 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
                    for i, l in enumerate(lines)],
         "referencia": inv["ref"],
         "ocr": fields,
+        # interno (build_all lo retira): las líneas cuadran con un total o subtotal IMPRESO
+        "_cuadra": all_ok and total_printed,
     }, source
+
+
+def split_by_orders(g0, res, inv, llm_server, vl_server, timeout):
+    """Un PDF con varios pedidos sin marcador conocido (facturas Shein, eBay o de proveedor una tras otra): se
+    corta en grupos de páginas consecutivas que cuadran CADA UNO con su propio total o subtotal impreso. Solo si
+    todos los grupos cuadran (si no, el documento queda entero, como antes, y va a revisión). Sin VL: un grupo
+    que solo cuadrara con la lectura visual no prueba el corte. Devuelve las facturas o None."""
+    pages, groups, start = inv["pages"], [], 0
+    quiet = lambda m: None
+    for end in range(len(pages)):
+        sub = dict(inv, pages=pages[start:end + 1])
+        doc, source = build_invoice(g0 + len(groups), res, sub, True, llm_server, vl_server, timeout, quiet, vl=False)
+        if source == "llm" and doc["_cuadra"]:
+            groups.append(doc)
+            start = end + 1
+    return groups if start == len(pages) and len(groups) > 1 else None
+
+
+# Identificador impreso (número de pedido, de artículo, de seguimiento): 12+ caracteres alfanuméricos (guiones
+# aparte) con 4+ cifras. Deja fuera lo que comparten todos los documentos del mismo cliente: código postal ZIP+4
+# (33186-6700), teléfono (10–11 cifras), nombre de usuario.
+ORDER_ID_RE = re.compile(r"(?<![A-Za-z0-9-])(?=(?:[A-Za-z-]*\d){4})(?=(?:-*[A-Za-z0-9]){12})[A-Za-z0-9][A-Za-z0-9-]*[A-Za-z0-9](?![A-Za-z0-9-])")
+
+
+def page_texts(markdown):
+    """Markdown de la fase 1 ("## Página N" ...) -> {N: texto de la página}."""
+    pos = [(int(m.group(1)), m.start()) for m in re.finditer(r"^## Página (\d+)", markdown or "", re.M)]
+    return {n: markdown[p:(pos[k + 1][1] if k + 1 < len(pos) else len(markdown))] for k, (n, p) in enumerate(pos)}
+
+
+def order_fingerprints(docs, markdown):
+    """Huella de cada factura para detectar el mismo pedido dos veces: total + artículos (importe y descripción) +
+    los identificadores impresos en sus páginas. Dos facturas son el mismo pedido si coinciden total y artículos
+    Y comparten un identificador (dos compras iguales de la misma camiseta tienen números de pedido distintos)."""
+    texts = page_texts(markdown)
+    out = []
+    for d in docs:
+        goods = sorted([l["importe_linea"], desc_key(l["descripcion"])[:20]] for l in d["lineas"] if l["line_kind"] == "goods")
+        a, b = d["ocr"]["paginas"]
+        ids = sorted({x.upper() for n in range(a, b + 1) for x in ORDER_ID_RE.findall(texts.get(n, ""))})
+        out.append({"id": d["id"], "total": d["total"], "goods": goods, "ids": ids,
+                    "envios": d["ocr"].get("origen_lineas") == "envios"})
+    return out
+
+
+def same_order(a, b):
+    return bool(a["goods"]) and a["total"] == b["total"] and a["goods"] == b["goods"] and bool(set(a["ids"]) & set(b["ids"]))
+
+
+def mark_review(doc, note):
+    doc["mismatch"] = "; ".join(filter(None, [doc["mismatch"], note]))
+    if doc["motivo_revision"] != "ESTRUCTURA":
+        doc["motivo_revision"] = "LECTURA"
+    doc["ocr"]["incidencias"].append(note)
 
 
 def build_all(res, use_llm=True, llm_server=QWEN27_SERVER, vl_server=VL_SERVER, timeout=600, log=None):
     """Divide el resultado de la fase 1 en facturas y construye el JSON de todas (array)."""
     log = log or (lambda m: print(m, file=sys.stderr))
+    _LLM_CACHE.clear()
     invoices = split_invoices(res)
     log(f"  {len(invoices)} factura(s) detectada(s): " + ", ".join(
         f"{inv['tipo'] or '?'} {inv['ref'] or 'sin ref'} p{inv['pages'][0] + 1}-{inv['pages'][-1] + 1}" for inv in invoices))
@@ -1245,18 +1312,37 @@ def build_all(res, use_llm=True, llm_server=QWEN27_SERVER, vl_server=VL_SERVER, 
                     f"{'' if d['total_is_printed'] else ' (calculado)'}, revisión: {d['motivo_revision'] or 'no'}" + (f" ({d['mismatch']})" if d["mismatch"] else ""))
         else:
             log(f"  -- factura {len(out)} ({inv['ref'] or 'sin referencia'})")
-            doc, source = build_invoice(len(out), res, inv, use_llm, llm_server, vl_server, timeout, log)
-            log(f"     {len(doc['lineas'])} línea(s) (origen: {source}), total {doc['total'] or '?'}, revisión: {doc['motivo_revision'] or 'no'}"
-                + (f" ({doc['mismatch']})" if doc["mismatch"] else ""))
-            docs.append(doc)
-        if dups:
-            note = "order reference repeated in the file (the same order appears more than once)"
+            # Primero sin VL: si cuadra, es lo mismo que con VL (el rescate solo actúa cuando no cuadra).
+            doc, source = build_invoice(len(out), res, inv, use_llm, llm_server, vl_server, timeout, log, vl=False)
+            parts = None
+            if source == "llm" and not doc["_cuadra"] and len(pages) > 1:
+                parts = split_by_orders(len(out), res, inv, llm_server, vl_server, timeout)
+            if parts:
+                log(f"     no cuadra entero; {len(parts)} pedido(s) que cuadran cada uno con su total impreso: páginas "
+                    + ", ".join(f"{p['ocr']['paginas'][0]}-{p['ocr']['paginas'][1]}" for p in parts))
+                docs.extend(parts)
+            else:
+                if source == "llm" and not doc["_cuadra"]:  # el 27B está en caché: solo se añade la lectura visual
+                    doc, source = build_invoice(len(out), res, inv, use_llm, llm_server, vl_server, timeout, log)
+                docs.append(doc)
             for doc in docs:
-                doc["mismatch"] = "; ".join(filter(None, [doc["mismatch"], note]))
-                if doc["motivo_revision"] != "ESTRUCTURA":
-                    doc["motivo_revision"] = "LECTURA"
-                doc["ocr"]["incidencias"].append(note)
+                log(f"     {len(doc['lineas'])} línea(s) (origen: {doc['ocr']['origen_lineas']}), total {doc['total'] or '?'}, "
+                    f"revisión: {doc['motivo_revision'] or 'no'}" + (f" ({doc['mismatch']})" if doc["mismatch"] else ""))
+        if dups:
+            for doc in docs:
+                mark_review(doc, "order reference repeated in the file (the same order appears more than once)")
         out.extend(docs)
+    for doc in out:
+        doc.pop("_cuadra", None)
+    # El mismo pedido dos veces en el PDF sin referencia conocida (p. ej. la misma factura Shein escaneada dos
+    # veces): ver same_order. Los bloques de envío de un mismo pedido de Amazon son envíos distintos: no cuentan.
+    fps = order_fingerprints(out, res.get("markdown", ""))
+    for i, a in enumerate(fps):
+        for j, b in enumerate(fps):
+            if i != j and not (a["envios"] and b["envios"]) and same_order(a, b):
+                mark_review(out[i], f"same order as invoice {b['id']} of this file (identical items and total; "
+                                    "possible duplicate declaration)")
+                break
     return out
 
 

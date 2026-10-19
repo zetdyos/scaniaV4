@@ -31,6 +31,8 @@ Todo en español. Sin GPU local: los modelos corren en llama-server remotos.
 
 - Amazon formato de escritorio ("Details for Order #…"): **cada bloque de envío** ("Not Yet Shipped", "Shipped on …", con su "Total for This Shipment") es una factura. Los datos del pedido (referencia, fecha, pago, dirección, total del pedido) se repiten en cada una bajo `ocr`.
 - Amazon app móvil (un pedido por página, "Order # …", precios con coma decimal) y Temu ("Order ID: PO-…"): una factura por pedido.
+- Varios pedidos seguidos sin marcador conocido (Shein, eBay, proveedores): si el documento entero no cuadra, se corta en grupos de páginas consecutivas que cuadran **cada uno** con su total/subtotal impreso (`split_by_orders`, sin VL; si algún grupo no cuadra, queda entero). Las respuestas del 27B por página se reutilizan (`_LLM_CACHE`, temperatura 0). Medido: 17 PDF cortados, 15 controles iguales.
+- Mismo pedido dos veces → `LECTURA`: mismo total + mismos artículos + un identificador impreso en común (`ORDER_ID_RE`: 12+ alfanuméricos, 4+ cifras; deja fuera ZIP+4 y teléfono del cliente). Dentro del PDF en `build_all` (los bloques de envío de Amazon no cuentan); entre documentos en `demo_api.mark_cross_document_duplicates` contra el último trabajo de cada otro nombre de archivo (`huellas.json` por trabajo).
 - `id` es secuencial dentro del PDF; `referencia` es el número de pedido impreso (campo extra respecto al esquema original, aceptado por el usuario).
 
 ## Esquema de salida
