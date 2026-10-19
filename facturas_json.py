@@ -69,6 +69,9 @@ Uso:
 import argparse
 import base64
 import contextlib
+import difflib
+import html
+import itertools
 import json
 import os
 import re
@@ -526,6 +529,8 @@ def line_evidence(l, sq_text, ocr_amounts, arithmetic_ok):
     if src in ("glm", "qwen"):  # fase 1: filas "N of:" leídas de la tabla; 'qwen' = precio rescatado del recorte
         return {"descripcion": "leido", "cantidad": "leido",
                 "precio_unitario": "leido" if src == "glm" else "aritmetica", "importe_linea": "calculado"}
+    if src == "tabla":  # fila de tabla del OCR que el 27B omitió: los cuatro valores son literales de esa fila
+        return {"descripcion": "leido", "cantidad": "leido", "precio_unitario": "leido", "importe_linea": "leido"}
     ev = {}
     key = p1.squash(l.get("desc", ""))[:20]
     ev["descripcion"] = "leido" if key and key in sq_text else "modelo"
@@ -544,6 +549,55 @@ def line_evidence(l, sq_text, ocr_amounts, arithmetic_ok):
     else:
         ev["cantidad"] = "modelo"
     return ev
+
+
+MONEY_CELL_RE = re.compile(r"^\$?\s*(\d{1,3}(?:,\d{3})*|\d+)\.\d{2}$")
+
+
+def table_item_rows(page_mds):
+    """Filas de las tablas HTML del OCR (regiones) que son un artículo completo y literal: una celda de
+    descripción, una cantidad entera, un precio unitario y un importe tales que cantidad x precio = importe."""
+    rows = []
+    for k, pmd in enumerate(page_mds):
+        for tr in re.findall(r"<tr>(.*?)</tr>", pmd, re.S):
+            cells = [re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", c))).strip()
+                     for c in re.findall(r"<t[dh][^>]*>(.*?)</t[dh]>", tr, re.S)]
+            money_i = [i for i, c in enumerate(cells) if MONEY_CELL_RE.match(c)]
+            texts = [c for c in cells if re.search(r"[A-Za-z]{3}", c)]
+            if len(money_i) < 2 or not texts:
+                continue
+            amt, unit = money(cells[money_i[-1]]), money(cells[money_i[-2]])
+            qtys = {int(c) for c in cells if re.fullmatch(r"\d{1,5}", c)}
+            q = next((q for q in sorted(qtys) if q and abs(q * float(unit) - float(amt)) < 0.01), None)
+            if q and float(amt) > 0:
+                rows.append({"desc": max(texts, key=len), "qty": q, "unit": unit, "amount": amt, "page_rel": k + 1})
+    return rows
+
+
+def desc_key(text):
+    return re.sub(r"[^a-z0-9]", "", html.unescape(text or "").lower())
+
+
+def missing_table_rows(page_mds, lines, diff):
+    """Filas de tabla del OCR que el 27B no devolvió y que completan EXACTAMENTE la diferencia de la suma.
+    Cada línea del 27B consume una fila (mismo importe y descripción parecida); de las sobrantes se busca un
+    subconjunto (hasta 3 filas) que sume la diferencia. Solo si hay una única solución; si no, nada."""
+    rows = table_item_rows(page_mds)
+    free = list(range(len(rows)))
+    for l in lines:
+        cands = [i for i in free if rows[i]["amount"] == l.get("amount")]
+        if cands:
+            best = max(cands, key=lambda i: difflib.SequenceMatcher(None, desc_key(rows[i]["desc"]), desc_key(l.get("desc"))).ratio())
+            if difflib.SequenceMatcher(None, desc_key(rows[best]["desc"]), desc_key(l.get("desc"))).ratio() >= 0.8:
+                free.remove(best)
+    free = free[:40]
+    for size in (1, 2, 3):
+        sols = [c for c in itertools.combinations(free, size) if abs(sum(float(rows[i]["amount"]) for i in c) - diff) < 0.01]
+        if len(sols) == 1:
+            return [rows[i] for i in sols[0]]
+        if sols:
+            return []  # varias formas de completar la diferencia: ambiguo, lo decide una persona
+    return []
 
 
 def qty_backed_by_line(l, ev):
@@ -806,12 +860,28 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
         # Sin subtotal de artículos impreso, la cuenta completa de la cabecera también cuadra la factura:
         # artículos + envío + impuestos + otros cargos − descuentos = total (todos los importes leídos del OCR).
         s = lines_sum(lines)
+        extra = (float(fields["envio"] or 0) + float(fields["impuestos"] or 0)
+                 + sum(float(c["importe"] or 0) for c in fields["other_charges"])
+                 - sum(float(d["importe"] or 0) for d in fields["descuentos"]))
         if not items_subtotal and total and s is not None:
-            extra = (float(fields["envio"] or 0) + float(fields["impuestos"] or 0)
-                     + sum(float(c["importe"] or 0) for c in fields["other_charges"])
-                     - sum(float(d["importe"] or 0) for d in fields["descuentos"]))
             if abs(s + extra - float(total)) < 0.01:
                 target = f"{s:.2f}"
+        # Artículos que el 27B omitió (p. ej. dos filas casi idénticas que el texto de página completa perdió):
+        # si la suma no cuadra, se buscan en las tablas del OCR filas completas y literales (descripción,
+        # cantidad, precio, importe, con cantidad x precio = importe) que completen EXACTAMENTE la diferencia.
+        if s is not None and (items_subtotal or total) and abs(s - float(target)) >= 0.01:
+            diff = round((float(items_subtotal) if items_subtotal else float(total) - extra) - s, 2)
+            if diff > 0:
+                page_mds = [p1.page_markdown(i + 1, res["full_text"].get(i) or "", regs)[0] for i, regs in zip(pages, regions)]
+                for r in missing_table_rows(page_mds, lines, diff):
+                    lines.append(dict(r, src="tabla", kind="goods", qty_printed=True, order=10 ** 6 + len(lines),
+                                      extra={"vendedor": "", "seguimiento": "", "estado_envio": ""}))
+                    log(f"  fila de tabla que el 27B omitió, añadida (literal del OCR): {r['qty']} x {r['unit']} = {r['amount']} «{r['desc'][:50]}»")
+                s = lines_sum(lines)
+                if items_subtotal and abs(s - float(items_subtotal)) < 0.01:
+                    target = items_subtotal
+                elif not items_subtotal and abs(s + extra - float(total)) < 0.01:
+                    target = f"{s:.2f}"
 
     # Rescate visual: solo en la vía del 27B, cuando la suma no reproduce el total impreso.
     if source == "llm" and total_printed and target and (lines_sum(lines) is None or abs(lines_sum(lines) - float(target)) >= 0.01):
