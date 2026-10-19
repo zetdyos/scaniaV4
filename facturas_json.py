@@ -97,7 +97,8 @@ INVOICE_START = [
 AMOUNT_TXT = r"-?\s*\d[\d.,]*(?:[.,]\d{2}|,-)"
 ORDER_TOTAL_RE = re.compile(r"(?:Order|Grand)\s*Total:?\s*(?:USD|\$)?\s*(" + AMOUNT_TXT + ")", re.I)
 ITEMS_SUBTOTAL_RE = re.compile(r"Item\(?s?\)?\s*Subtotal:?\s*(?:USD|\$)?\s*(" + AMOUNT_TXT + ")", re.I)
-AMOUNT_RE = re.compile(r"(?:USD|\$)\s*(" + AMOUNT_TXT + r")|(?<![\d.,])(\d{1,3}(?:[.,]\d{3})*[.,]\d{2})(?![\d.,])")
+# Sin marca de moneda: con separador de miles (2,821.92) o sin él (2821.92).
+AMOUNT_RE = re.compile(r"(?:USD|\$)\s*(" + AMOUNT_TXT + r")|(?<![\d.,])(\d{1,3}(?:[.,]\d{3})*[.,]\d{2}|\d{4,}[.,]\d{2})(?![\d.,])")
 
 # Clase de cada línea que devuelve el 27B: el modelo de datos del proyecto, no una lista de palabras. Solo "goods"
 # es mercadería (lo que WTCP declara); "other_charges" recoge cualquier cargo que no encaje en las demás;
@@ -748,7 +749,8 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
                 continue
             for l in data.get("lineas", []):
                 amt = money(l.get("importe_linea"))
-                if amt and amt not in ocr_amounts:
+                # Solo los artículos: un importe de resumen sin respaldo no se usa (ver "backed"), no es incidencia.
+                if amt and amt not in ocr_amounts and l.get("line_kind", "goods") == "goods":
                     issues.append(f'amount {amt} not found in the OCR text ("{l.get("descripcion", "")[:40]}")')
                 q = re.search(r"\d+", str(l.get("cantidad", "")))
                 lines.append({"desc": l.get("descripcion", "").strip(), "qty": int(q.group(0)) if q else 1,
