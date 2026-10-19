@@ -517,14 +517,26 @@ def qty_printed(qty, sq_text, desc_key=""):
     m = re.search(r"(\d+)of:$", before)
     if m and int(m.group(1)) == qty:
         return True
-    return bool(re.search(rf"(?<!\d)(?:qty:?{qty}|[x×]{qty}|{qty}[x×])(?!\d)", after))
+    # el "sin dígito delante" solo vale para "Nx" (que "12x" no cuente como "2x"); "qty:N" puede ir pegado al precio
+    return bool(re.search(rf"(?:(?:qty|quantity):?{qty}|[x×]{qty}|(?<!\d){qty}[x×])(?!\d)", after))
+
+
+def qty_leads_desc(qty, md, desc):
+    """La cantidad impresa al inicio del renglón, justo antes de la descripción ("2 NILFISK - Filter Bags...",
+    columna "Quantity | Item name" que el OCR leyó como texto)."""
+    words = re.findall(r"\w+", desc or "")[:3]
+    if qty < 1 or len(words) < 2:
+        return False
+    pat = r"\W+".join(re.escape(w) for w in words)
+    return bool(re.search(rf"(?mi)^\W*{qty}\s+{pat}", md or ""))
 
 
 QTY_SRC = {"glm": "leido", "qwen": "leido"}
 
 
-def line_evidence(l, sq_text, ocr_amounts, arithmetic_ok):
-    """Origen de cada valor de la línea (ver docstring del módulo)."""
+def line_evidence(l, sq_text, ocr_amounts, arithmetic_ok, ocr_units=frozenset()):
+    """Origen de cada valor de la línea (ver docstring del módulo). ocr_units: precios impresos con más de
+    dos decimales, redondeados (cuentan como precio unitario literal)."""
     src = l.get("src", "")
     if src in ("glm", "qwen"):  # fase 1: filas "N of:" leídas de la tabla; 'qwen' = precio rescatado del recorte
         return {"descripcion": "leido", "cantidad": "leido",
@@ -535,7 +547,8 @@ def line_evidence(l, sq_text, ocr_amounts, arithmetic_ok):
     key = p1.squash(l.get("desc", ""))[:20]
     ev["descripcion"] = "leido" if key and key in sq_text else "modelo"
     unit, amt = l.get("unit") or "", l.get("amount") or ""
-    ev["precio_unitario"] = ("leido" if unit in ocr_amounts else "aritmetica" if arithmetic_ok else "modelo") if unit else ""
+    ev["precio_unitario"] = ("leido" if unit in ocr_amounts or unit in ocr_units
+                             else "aritmetica" if arithmetic_ok else "modelo") if unit else ""
     if src == "qwen-vl":
         ev["importe_linea"] = "calculado" if amt else ""
     else:
@@ -600,12 +613,83 @@ def missing_table_rows(page_mds, lines, diff):
     return []
 
 
+FINE_NUM_RE = re.compile(r"(?<![\d.,])\d+\.\d{3,5}(?![\d])")
+
+
+def fine_amounts(text):
+    """Precios impresos con 3 a 5 decimales (421.965, 4.6200, 3.13317): su redondeo y su truncado a céntimos (el 27B
+    y money() pueden devolver cualquiera de los dos)."""
+    from decimal import ROUND_DOWN, ROUND_HALF_UP, Decimal
+    out = set()
+    for x in FINE_NUM_RE.findall(text or ""):
+        out |= {str(Decimal(x).quantize(Decimal("0.01"), rounding=r)) for r in (ROUND_HALF_UP, ROUND_DOWN)}
+    return out
+
+
+def qty_tolerance(qty, unit):
+    """Margen de cantidad x precio frente al importe cuando el precio impreso está redondeado a céntimos
+    (o tiene más decimales): qty x 0,005, pero siempre menor que medio precio para que la cantidad sea única."""
+    return max(0.0099, min(qty * 0.005 + 0.005, float(unit) / 2 - 0.001))
+
+
+def qty_matches(qty, unit, amt):
+    return bool(unit and amt) and qty >= 1 and abs(qty * float(unit) - float(amt)) <= qty_tolerance(qty, unit)
+
+
+def table_rows(md):
+    """Celdas de cada fila de las tablas HTML del OCR (regiones)."""
+    return [[re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", c))).strip()
+             for c in re.findall(r"<t[dh][^>]*>(.*?)</t[dh]>", tr, re.S)]
+            for tr in re.findall(r"<tr>(.*?)</tr>", md or "", re.S)]
+
+
+def qty_from_table(l, rows):
+    """Cantidad impresa en la misma fila de tabla que la descripción (columna "Quantity", "Qty Ship"...).
+    Devuelve la cantidad de esa fila que cumple cantidad x precio = importe; si no hay precio con que
+    comprobarla, la cantidad del 27B solo si aparece tal cual en la fila. None si la fila no lo respalda."""
+    key = desc_key(l.get("desc"))[:20]
+    if len(key) < 8:
+        return None
+    for cells in rows:
+        if key not in desc_key(" ".join(cells)):
+            continue
+        ints = sorted({int(c) for c in cells if re.fullmatch(r"\d{1,5}", c)})
+        unit, amt = l.get("unit") or "", l.get("amount") or ""
+        fit = [q for q in ints if qty_matches(q, unit, amt)]
+        if len(fit) == 1:
+            return fit[0]
+        if l["qty"] in ints:  # p. ej. eBay: "Item price" es el total de la línea; la cantidad es su propia celda
+            return l["qty"]
+    return None
+
+
+def choose_header(base, total, cands, descuentos, otros, max_items=6):
+    """Primera combinación (envío, impuestos, descuentos, otros cargos) con la que
+    base + envío + impuestos + otros − descuentos = total. Preferencia: candidatos en su orden (etiqueta,
+    27B, sin cargo) y quitar el menor número de descuentos/cargos. None si ninguna cuadra."""
+    descuentos, otros = descuentos[:max_items], otros[:max_items]
+    val = lambda xs: sum(float(x["importe"] or 0) for x in xs)
+
+    def subsets(xs):  # de más completo a menos: quitar 0, 1, 2... elementos
+        for k in range(len(xs) + 1):
+            for drop in itertools.combinations(range(len(xs)), k):
+                yield [x for i, x in enumerate(xs) if i not in drop]
+    for e in cands["envio"]:
+        for t in cands["impuestos"]:
+            fixed = base + float(e or 0) + float(t or 0)
+            for o in subsets(otros):
+                for d in subsets(descuentos):
+                    if abs(fixed + val(o) - val(d) - total) < 0.01:
+                        return e, t, d, o
+    return None
+
+
 def qty_backed_by_line(l, ev):
     """Cantidad no impresa con un formato reconocible ("3 EA 3"), pero sostenida por la propia línea:
-    precio unitario e importe literales en el OCR y cantidad x precio = importe."""
+    precio unitario e importe literales en el OCR y cantidad x precio = importe (con el margen de
+    redondeo del precio impreso)."""
     unit, amt = l.get("unit") or "", l.get("amount") or ""
-    return (bool(unit and amt) and ev.get("precio_unitario") == ev.get("importe_linea") == "leido"
-            and abs(l["qty"] * float(unit) - float(amt)) < 0.01)
+    return ev.get("precio_unitario") == ev.get("importe_linea") == "leido" and qty_matches(l["qty"], unit, amt)
 
 
 def evidence_issues(lines):
@@ -794,7 +878,7 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
     elif use_llm:
         # Página por página: la salida de cada llamada está acotada por su página, no por el documento.
         log(f"  sin bloques de envío: extracción de líneas con Qwen3.6-27B, página por página ({len(pages)})")
-        lines, model_total = [], None
+        lines, model_totals = [], []
         for k, (i, regs) in enumerate(zip(pages, regions)):
             data, fail = lines_with_llm(p1.page_markdown(i + 1, res["full_text"].get(i) or "", regs)[0], llm_server, timeout, log)
             if data is None:
@@ -817,7 +901,11 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
                 if ISO_CURRENCY_RE.match(d):
                     divisa = d
             if money(data.get("total")):
-                model_total = data  # el total del documento suele estar en la última página que lo trae
+                model_totals.append(data)
+        # El total del documento: el de la última página que lo trae CON respaldo en el OCR (una página
+        # puede devolver un importe que no está impreso); si ninguno lo tiene, el último (va a incidencia).
+        backed_totals = [d for d in model_totals if money(d.get("total")) in ocr_amounts]
+        model_total = (backed_totals or model_totals or [None])[-1]
         t = money(model_total.get("total")) if model_total else ""
         if t and not total:
             if t in ocr_amounts:
@@ -833,6 +921,44 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
     # Se devuelven al final con su line_kind (WTCP solo declara las goods).
     others = [l for l in lines if l.get("kind", "goods") != "goods"]
     lines = [l for l in lines if l.get("kind", "goods") == "goods"]
+    ocr_units = fine_amounts(md)
+    if source == "llm":
+        # Cantidades con respaldo literal, en este orden (todas generales, ninguna inventa un número):
+        # a) la cantidad impresa en la misma fila de tabla que la descripción (columna "Quantity"; si hay
+        #    pedida y enviada, la que cumple cantidad x precio = importe);
+        # b) sin cantidad impresa: importe / precio unitario, ambos literales, si da un entero (el 27B a veces
+        #    toma tallas o el "10pcs" del nombre como cantidad);
+        # c) un único artículo y el "Item(s) Subtotal" impreso: subtotal / precio unitario literal, si da un
+        #    entero (la cantidad de las capturas de Amazon va sobre la foto y el OCR no la lee).
+        rows = table_rows(md)
+        literal = lambda v: bool(v) and (v in ocr_amounts or v in ocr_units)
+        for l in lines:
+            q = qty_from_table(l, rows)
+            if q:
+                if q != l["qty"]:
+                    log(f"  cantidad de la fila de tabla del OCR: {l['qty']} -> {q} «{l['desc'][:40]}»")
+                l["qty"], l["qty_printed"] = q, True
+                continue
+            if qty_printed(l["qty"], sq_text, p1.squash(l.get("desc", ""))[:20]):
+                continue
+            if qty_leads_desc(l["qty"], md, l.get("desc")):
+                l["qty_printed"] = True
+                continue
+            unit, amt = l.get("unit") or "", l.get("amount") or ""
+            if literal(unit) and amt in ocr_amounts and float(unit) > 0:
+                n = round(float(amt) / float(unit))
+                if n != l["qty"] and qty_matches(n, unit, amt):
+                    log(f"  cantidad = importe / precio (literales): {l['qty']} -> {n} «{l['desc'][:40]}»")
+                    l["qty"] = n
+        if len(lines) == 1 and items_subtotal and items_subtotal in ocr_amounts:
+            l = lines[0]
+            # con cantidad 1, el importe de la línea es el precio unitario (el 27B a veces deja vacío el precio)
+            unit = l.get("unit") or (l.get("amount") if l["qty"] == 1 and l.get("amount") in ocr_amounts else "")
+            if literal(unit) and float(unit) > 0 and l.get("amount") != items_subtotal and not l.get("qty_printed"):
+                n = round(float(items_subtotal) / float(unit))
+                if n >= 1 and qty_matches(n, unit, items_subtotal):
+                    log(f"  único artículo: cantidad = subtotal / precio (literales) = {n} «{l['desc'][:40]}»")
+                    l["qty"], l["amount"], l["unit"] = n, items_subtotal, unit
     # Contra qué cuadran las líneas, recalculado con lo que trajo el 27B (antes quedaba vacío si el total
     # solo lo encontraba el modelo). Sin "Item(s) Subtotal" con esa etiqueta: vale una línea que el 27B
     # clasificó subtotal_or_total, cuyo importe está literal en el OCR e iguala la suma de los artículos.
@@ -846,10 +972,12 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
         # Un mismo resumen impreso en varias páginas no se suma dos veces: importes idénticos cuentan una vez
         # (si eran cargos distintos, la cuenta de cabecera no cierra y la factura va a revisión).
         backed = [l for l in others if l.get("amount") and l["amount"] in ocr_amounts]
+        cands = {}
         for key, kind in (("envio", "shipping"), ("impuestos", "tax")):
             amts = list(dict.fromkeys(l["amount"] for l in backed if l["kind"] == kind))
-            if not fields[key] and amts:
-                fields[key] = f"{sum(float(a) for a in amts):.2f}"
+            from_llm = f"{sum(float(a) for a in amts):.2f}" if amts else ""
+            # candidatos: el de la etiqueta, el del 27B y "sin cargo"; se queda el que cuadre el resumen
+            cands[key] = list(dict.fromkeys([v for v in (fields[key], from_llm) if v] + [""]))
         for key, kind in (("descuentos", "discount"), ("other_charges", "other_charges")):
             if not fields[key]:
                 seen = dict.fromkeys((p1.squash(l["desc"]), l["amount"]) for l in backed if l["kind"] == kind)
@@ -857,9 +985,22 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
                                 "importe": k[1]} for k in seen]
         if not fields["subtotal_articulos"]:
             fields["subtotal_articulos"] = items_subtotal
+        s = lines_sum(lines)
+        # Cabecera que cuadra el resumen impreso: (subtotal de artículos o suma de artículos) + envío + impuestos
+        # + otros cargos − descuentos = total. Entre etiqueta y 27B, y entre los descuentos/cargos leídos, se
+        # elige la primera combinación que cuadra (preferencia: etiqueta, luego 27B; quitar lo mínimo). Los
+        # descuentos que no entran son informativos ("Price includes $560 off", "You saved", monedas) y se
+        # quitan de la cabecera; un "cargo" que no entra (base exenta, puntos) también. Si nada cuadra, se deja
+        # lo de siempre (etiqueta primero, todo incluido) y la factura va a revisión por el descuadre.
+        base = float(items_subtotal) if items_subtotal else s
+        pick = choose_header(base, float(total), cands, fields["descuentos"], fields["other_charges"]) \
+            if total and base is not None else None
+        if pick:
+            fields["envio"], fields["impuestos"], fields["descuentos"], fields["other_charges"] = pick
+        else:
+            fields["envio"], fields["impuestos"] = cands["envio"][0], cands["impuestos"][0]
         # Sin subtotal de artículos impreso, la cuenta completa de la cabecera también cuadra la factura:
         # artículos + envío + impuestos + otros cargos − descuentos = total (todos los importes leídos del OCR).
-        s = lines_sum(lines)
         extra = (float(fields["envio"] or 0) + float(fields["impuestos"] or 0)
                  + sum(float(c["importe"] or 0) for c in fields["other_charges"])
                  - sum(float(d["importe"] or 0) for d in fields["descuentos"]))
@@ -883,8 +1024,14 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
                 elif not items_subtotal and abs(s + extra - float(total)) < 0.01:
                     target = f"{s:.2f}"
 
-    # Rescate visual: solo en la vía del 27B, cuando la suma no reproduce el total impreso.
-    if source == "llm" and total_printed and target and (lines_sum(lines) is None or abs(lines_sum(lines) - float(target)) >= 0.01):
+    # Rescate visual: solo en la vía del 27B, cuando la suma no reproduce el total impreso, y solo si el 27B
+    # encontró artículos (el VL corrige artículos; no los crea: sin ninguno, el documento va a revisión tal cual).
+    # Lo que el VL devuelva debe cuadrar con lo que suman los ARTÍCULOS (subtotal impreso, o total − cargos de
+    # la cabecera), no con el total con impuestos: si no, un cargo puede "completar" la suma como si fuera artículo.
+    vl_goal = None
+    if source == "llm" and target:
+        vl_goal = float(items_subtotal) if items_subtotal else float(total) - extra if total else None
+    if source == "llm" and lines and total_printed and vl_goal is not None and (lines_sum(lines) is None or abs(lines_sum(lines) - float(target)) >= 0.01):
         if p1.server_ok(vl_server):
             log("  la suma no cuadra con el total impreso: lectura visual con Qwen2.5-VL")
             try:
@@ -897,13 +1044,23 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
             if len(kept) < len(vl_lines):
                 issues.append(f"vision model (Qwen2.5-VL) returned {len(vl_lines) - len(kept)} item(s) whose description "
                               "is not in the OCR text; discarded")
-            literal_price = bool(kept) and all(v.get("unit") and v["unit"] in ocr_amounts for v in kept)
+            # Lo que el 27B ya clasificó como no-artículo (subtotal, envío, impuesto, pago...) no puede volver como
+            # artículo desde la imagen.
+            not_goods = {desc_key(o["desc"]) for o in others if len(desc_key(o["desc"])) >= 4}
+            n0 = len(kept)
+            kept = [v for v in kept if not any(difflib.SequenceMatcher(None, desc_key(v["desc"]), k).ratio() >= 0.85
+                                               for k in not_goods)]
+            if len(kept) < n0:
+                issues.append(f"vision model (Qwen2.5-VL) returned {n0 - len(kept)} summary line(s) (shipping, subtotal...) "
+                              "as items; discarded")
+            literal_price = bool(kept) and all(v.get("unit") and (v["unit"] in ocr_amounts or v["unit"] in ocr_units) for v in kept)
             vl_sum = lines_sum(kept)
-            if kept and literal_price and vl_sum is not None and abs(vl_sum - float(target)) < 0.01:
+            if kept and literal_price and vl_sum is not None and abs(vl_sum - vl_goal) < 0.01:
                 if len(kept) == len(lines):
                     for v, o in zip(kept, lines):
                         v["extra"] = o.get("extra", {})
                 lines, source = kept, "qwen-vl"
+                target = items_subtotal or f"{vl_sum:.2f}"
                 issues = [i for i in issues if not i.startswith("amount ")]
                 issues.append("lines read from the image by the vision model (Qwen2.5-VL), unit prices found literally in "
                               "the OCR text; quantity x price matches the printed "
@@ -912,7 +1069,7 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
                 issues.append("vision model (Qwen2.5-VL) rejected: unit price(s) not found literally in the OCR text")
             else:
                 issues.append("vision model (Qwen2.5-VL) does not add up either (sum " + ("?" if vl_sum is None else f"{vl_sum:.2f}")
-                              + f" vs {target})")
+                              + f" vs {vl_goal:.2f})")
         else:
             issues.append(f"vision model (Qwen2.5-VL) not responding at {vl_server}; no visual check")
 
@@ -927,14 +1084,16 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
     estructura = not inv["tipo"] and not lines and not read_failed
     if estructura:
         issues.append("the document does not look like a goods invoice: no order marker and no item lines")
+    elif not lines:  # con marcador de pedido pero sin ningún artículo: nunca sale sin revisión
+        issues.append("no item lines found in the document; review against the paper")
 
     all_ok = bool(target) and lines_sum(lines) is not None and abs(lines_sum(lines) - float(target)) < 0.01
     for l in lines:
-        l["evidence"] = line_evidence(l, sq_text, ocr_amounts, all_ok)
+        l["evidence"] = line_evidence(l, sq_text, ocr_amounts, all_ok, ocr_units)
         l["verified"] = l.get("verified", all_ok) and "modelo" not in l["evidence"].values()
     issues += evidence_issues(lines)
     for l in others:  # no-mercadería: evidencia de sus valores, nunca "verificada" como artículo
-        l["evidence"], l["verified"] = line_evidence(l, sq_text, ocr_amounts, False), False
+        l["evidence"], l["verified"] = line_evidence(l, sq_text, ocr_amounts, False, ocr_units), False
     if others:  # mismo orden en que el 27B las devolvió; las goods del rescate visual no traen orden y van primero
         lines = sorted(lines + others, key=lambda l: l.get("order", -1))
     fields["origen_lineas"] = source

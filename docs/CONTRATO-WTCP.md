@@ -86,7 +86,7 @@ Un array de facturas, como hoy.
 | `ocr.subtotal_articulos` | importe o `""` | Subtotal. Se muestra. |
 | `ocr.envio` | importe o `""` | Envío. Se muestra. |
 | `ocr.impuestos` | importe o `""` | Impuestos. Se muestran. |
-| `ocr.descuentos` | lista de `{"concepto": texto, "importe": importe}` **(forma nueva)** | WTCP suma los `importe` y lo muestra como descuento. Cada `importe` va en positivo. |
+| `ocr.descuentos` | lista de `{"concepto": texto, "importe": importe}` **(forma nueva)** | WTCP suma los `importe` y lo muestra como descuento. Cada `importe` va en positivo. Solo descuentos **aplicados** (los que cuadran subtotal + cargos − descuentos = total); los ahorros informativos ya incluidos en el precio («You saved», «Price includes $X off», monedas) no se incluyen **(desde 2026-10-19)**. |
 | `ocr.other_charges` | lista de `{"concepto": texto, "importe": importe}` **(añadido por SCANIA, 2026-10-18)** | Cargos que no son artículos, envío, impuestos ni descuentos. Se muestran; no son mercadería. Se rellena con las líneas `other_charges` cuyo importe está literal en el OCR. |
 | `lineas` | lista | Ver 5.2. |
 
