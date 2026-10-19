@@ -241,9 +241,18 @@ def lines_sum(ls):
 ID_LIKE_RE = re.compile(r"^[A-Z]{0,4}[\d-]{9,}$")
 
 
+COUNT_ONLY_RE = re.compile(r"^\s*\d+\s+\w+\s*$")  # "1 item", "2 items", "1 object": un recuento, no un producto
+
+
 def description_issues(lines):
-    bad = [l["desc"] for l in lines if ID_LIKE_RE.match(re.sub(r"\s", "", l["desc"] or "")) or not (l["desc"] or "").strip()]
-    return [f"{len(bad)} line(s) with an empty description or one that looks like an identifier: " + ", ".join(f'"{b}"' for b in bad[:4])] if bad else []
+    bad = [l["desc"] for l in lines if ID_LIKE_RE.match(re.sub(r"\s", "", l["desc"] or "")) or not (l["desc"] or "").strip()
+           or COUNT_ONLY_RE.match(l["desc"] or "")]
+    out = [f"{len(bad)} line(s) with an empty description or one that looks like an identifier: " + ", ".join(f'"{b}"' for b in bad[:4])] if bad else []
+    # Una línea sin importe deja la suma sin calcular y el cuadre sin comprobar: nunca sale sin revisión.
+    no_amt = [l["desc"] for l in lines if not l.get("amount")]
+    if no_amt:
+        out.append(f"{len(no_amt)} item line(s) without an amount: " + ", ".join(f'"{d[:40]}"' for d in no_amt[:3]))
+    return out
 
 
 # ----------------------------------------------------------------------------- división en facturas
