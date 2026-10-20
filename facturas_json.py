@@ -638,11 +638,20 @@ def table_item_rows(page_mds):
             texts = [c for c in cells if re.search(r"[A-Za-z]{3}", c)]
             if len(money_i) < 2 or not texts:
                 continue
-            amt, unit = money(cells[money_i[-1]]), money(cells[money_i[-2]])
+            amt = money(cells[money_i[-1]])
             qtys = {int(c) for c in cells if re.fullmatch(r"\d{1,5}", c)}
-            q = next((q for q in sorted(qtys) if q and abs(q * float(unit) - float(amt)) < 0.01), None)
+            # el precio unitario es la celda de importe con la que cantidad x precio = importe (no siempre la penúltima:
+            # una columna «Tax Amount» $0.00 entre precio y total hacía descartar todas las filas, 31661)
+            q = unit = None
+            for ui in reversed(money_i[:-1]):
+                u = money(cells[ui])
+                q = next((q for q in sorted(qtys) if q and u and float(u) > 0 and abs(q * float(u) - float(amt)) < 0.01), None)
+                if q:
+                    unit = u
+                    break
             if q and float(amt) > 0:
-                rows.append({"desc": max(texts, key=len), "qty": q, "unit": unit, "amount": amt, "page_rel": k + 1})
+                # descripción = todas las celdas de texto de la fila (nombre + talla/SKU), todas literales
+                rows.append({"desc": " ".join(texts), "texts": texts, "qty": q, "unit": unit, "amount": amt, "page_rel": k + 1})
     return rows
 
 
@@ -656,11 +665,13 @@ def missing_table_rows(page_mds, lines, diff):
     subconjunto (hasta 3 filas) que sume la diferencia. Solo si hay una única solución; si no, nada."""
     rows = table_item_rows(page_mds)
     free = list(range(len(rows)))
+    # parecido con CUALQUIER celda de texto de la fila (la más larga puede ser la talla/SKU y no el nombre, 31661)
+    sim = lambda r, d: max(difflib.SequenceMatcher(None, desc_key(t), desc_key(d)).ratio() for t in r.get("texts") or [r["desc"]])
     for l in lines:
         cands = [i for i in free if rows[i]["amount"] == l.get("amount")]
         if cands:
-            best = max(cands, key=lambda i: difflib.SequenceMatcher(None, desc_key(rows[i]["desc"]), desc_key(l.get("desc"))).ratio())
-            if difflib.SequenceMatcher(None, desc_key(rows[best]["desc"]), desc_key(l.get("desc"))).ratio() >= 0.8:
+            best = max(cands, key=lambda i: sim(rows[i], l.get("desc")))
+            if sim(rows[best], l.get("desc")) >= 0.8:
                 free.remove(best)
     free = free[:40]
     for size in (1, 2, 3):
@@ -838,6 +849,85 @@ def vl_quantities(lines, vl_lines, literal, sq_text, goal):
             out.append(l)
     s = lines_sum(out)
     return out if changed and s is not None and abs(s - goal) < 0.01 else None
+
+
+# Cantidad sobre la FOTO del artículo (Amazon pinta «2», «10» en la foto; ningún OCR la lee). Calibrado el 2026-10-20 con
+# 53 fotos de 28 documentos (verdad fijada a mano contra la imagen; 14 con cantidad, varias con cifras impresas en el
+# envase): Qwen2.5-VL-7B con la PÁGINA ENTERA leía los números manuscritos del margen como precios (31732: «31835» ->
+# $318.35) y fundía artículos repetidos (11/19); con el RECORTE de la foto + pregunta cerrada (JSON entero) a >= 1024
+# fichas de imagen (aviso de llama.cpp clip.cpp para Qwen-VL, issue 16842), 53/53. repeat_penalty y gramática: sin efecto.
+# La foto se localiza con PP-OCRv6: bloque «Sold by» alineado a la izquierda con el precio suelto debajo.
+PHOTO_PRICE_RE = re.compile(r"^\$\d{1,3}(?:,\d{3})*\.\d{2}$")
+PHOTO_QTY_PROMPT = ("This is the photo of one purchased item from an order page. If a small number badge printed on the "
+                    "photo shows how many units were bought, return that number as quantity. If there is no such badge, "
+                    "return 1.")
+PHOTO_QTY_SCHEMA = {"type": "object", "properties": {"quantity": {"type": "integer"}}, "required": ["quantity"]}
+
+
+def item_photos(pdf, page_idx):
+    """Fotos de artículo de una página (diseño de Amazon): [(precio, rect en puntos PDF)] en orden de lectura.
+    Artículo = precio suelto («$19.99») con un «Sold by» alineado encima; la foto está a su izquierda, de la altura
+    del bloque (descripción, vendedor, precio)."""
+    toks, _, height = ppocr_tokens(pdf, page_idx)
+    sold = [t for t in toks if t[4].lower().startswith("sold by")]
+    out = []
+    for x0, y0, x1, y1, t in sorted(toks, key=lambda t: (t[1], t[0])):
+        if not PHOTO_PRICE_RE.match(t):
+            continue
+        s = [u for u in sold if abs(u[0] - x0) <= 20 and 0 < y0 - u[1] < 260]
+        if not s:
+            continue
+        top = max(s, key=lambda u: u[1])[1]
+        for _ in range(4):  # descripción en varias líneas encima, sin pasar al artículo anterior
+            up = [u for u in toks if abs(u[0] - x0) <= 20 and 0 < top - u[3] < 30]
+            if not up or any(PHOTO_PRICE_RE.match(u[4]) or u[4].lower().startswith(("sold by", "return", "buy it")) for u in up):
+                break
+            top = min(u[1] for u in up)
+        h = (y1 + 45) - (top - 15)
+        box = (max(0, x0 - 1.15 * h), max(0, top - 15), x0 - 8, min(height, y1 + 45))
+        if box[2] - box[0] > 20:
+            out.append((money(t), fitz.Rect(*(v * 72 / PPOCR_DPI for v in box))))
+    return out
+
+
+def photo_quantity(pdf, page_idx, rect, server, timeout):
+    """Cantidad pintada en la foto según Qwen2.5-VL (1 si no hay). Recorte renderizado desde el PDF a >= 1024 fichas."""
+    area = (rect.width / 72) * (rect.height / 72)
+    dpi = int(min(max(200, (1024 * 28 * 28 / area) ** 0.5), (4096 * 28 * 28 / area) ** 0.5))
+    with fitz.open(pdf) as doc:
+        img = base64.b64encode(doc[page_idx].get_pixmap(dpi=dpi, clip=rect, alpha=False).tobytes("png")).decode("ascii")
+    rj = post_json(f"{server}/v1/chat/completions", {
+        "messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img}"}},
+                                                 {"type": "text", "text": PHOTO_QTY_PROMPT}]}],
+        "temperature": 0, "top_k": 1, "repeat_penalty": 1.05, "max_tokens": 20,
+        "response_format": {"type": "json_schema", "json_schema": {"name": "q", "schema": PHOTO_QTY_SCHEMA}}}, timeout)
+    q = json.loads(rj["choices"][0]["message"]["content"]).get("quantity")
+    return q if isinstance(q, int) and 1 <= q <= 999 else 1
+
+
+def photo_quantities(pdf, pages, lines, literal, server, timeout, log):
+    """Lecturas de cantidad sobre las fotos, en la forma que usa vl_quantities ([{desc, unit, qty}]): cada foto se
+    empareja con la línea del 27B de la MISMA página y el MISMO precio literal, en orden de aparición. Vacío si la
+    página no tiene fotos de artículo localizables (otros diseños)."""
+    out = []
+    for k, page_idx in enumerate(pages):
+        on_page = [l for l in lines if l.get("page_rel") == k + 1]
+        try:
+            photos = item_photos(pdf, page_idx) if on_page else []
+        except Exception as e:  # noqa: BLE001  sin geometría, sin lectura de fotos (sigue el rescate de siempre)
+            log(f"  PP-OCRv6 no disponible ({type(e).__name__}): sin lectura de cantidades en las fotos")
+            return []
+        used = set()
+        for price, rect in photos:
+            l = next((l for l in on_page if id(l) not in used and price and
+                      price == (l.get("unit") if literal(l.get("unit")) else l.get("amount") if l["qty"] == 1 else "")), None)
+            if l is None:
+                continue
+            used.add(id(l))
+            q = photo_quantity(pdf, page_idx, rect, server, timeout)
+            log(f"  foto p{page_idx + 1} ${price}: cantidad {q} según Qwen2.5-VL «{l['desc'][:40]}»")
+            out.append({"desc": l["desc"], "unit": price, "qty": q})
+    return out
 
 
 def qty_backed_by_line(l, ev):
@@ -1045,16 +1135,26 @@ GEO_MONEY_RE = re.compile(r"(?<![\d.,])(?:\$\s?(?:\d{1,3}(?:,\d{3})+|\d+)\.\d{2,
 _PPOCR_CACHE = {}  # (pdf, página) -> renglones; se vacía por documento en build_all
 
 
-def ppocr_rows(pdf, page_idx, timeout=120):
-    """Renglones de una página según PP-OCRv6: [{c (centro y), toks [(x0, x1, texto)], text, money, span, alpha_x}]."""
-    key = (str(pdf), page_idx)
+def ppocr_tokens(pdf, page_idx, timeout=120):
+    """Cajas de PP-OCRv6 de una página a PPOCR_DPI: ([(x0, y0, x1, y1, texto)], ancho, alto) en píxeles."""
+    key = (str(pdf), page_idx, "tokens")
     if key not in _PPOCR_CACHE:
         with fitz.open(pdf) as doc:
             pix = doc[page_idx].get_pixmap(dpi=PPOCR_DPI, alpha=False)
         r = requests.post(f"{PPOCR_SERVER}/ocr", data=pix.tobytes("png"), timeout=timeout)
         r.raise_for_status()
         j = r.json()
-        toks = sorted((b[1], b[0], b[2], b[3], t.strip()) for t, b in zip(j["texts"], j["boxes"]) if t.strip())
+        _PPOCR_CACHE[key] = ([(b[0], b[1], b[2], b[3], t.strip()) for t, b in zip(j["texts"], j["boxes"]) if t.strip()],
+                             pix.width, pix.height)
+    return _PPOCR_CACHE[key]
+
+
+def ppocr_rows(pdf, page_idx, timeout=120):
+    """Renglones de una página según PP-OCRv6: [{c (centro y), toks [(x0, x1, texto)], text, money, span, alpha_x}]."""
+    key = (str(pdf), page_idx)
+    if key not in _PPOCR_CACHE:
+        raw, width, _ = ppocr_tokens(pdf, page_idx, timeout)
+        toks = sorted((y0, x0, x1, y1, t) for x0, y0, x1, y1, t in raw)
         rows = []
         for y0, x0, x1, y1, t in toks:  # renglón = cajas con el centro vertical a <= 10 px
             c = (y0 + y1) / 2
@@ -1067,7 +1167,7 @@ def ppocr_rows(pdf, page_idx, timeout=120):
             rw["toks"].sort()
             rw["text"] = " ".join(t for _, _, t in rw["toks"])
             rw["money"] = sum(len(GEO_MONEY_RE.findall(t)) for _, _, t in rw["toks"])
-            rw["span"] = (rw["toks"][-1][1] - rw["toks"][0][0]) / pix.width
+            rw["span"] = (rw["toks"][-1][1] - rw["toks"][0][0]) / width
             rw["alpha_x"] = [x0 for x0, _, t in rw["toks"] if re.search(r"[A-Za-z]{3,}", t)]
         _PPOCR_CACHE[key] = rows
     return _PPOCR_CACHE[key]
@@ -1625,7 +1725,25 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
     if source == "llm" and target:
         vl_goal = float(items_subtotal) if items_subtotal else float(total) - extra if total else None
     if vl and source == "llm" and lines and total_printed and vl_goal is not None and (lines_sum(lines) is None or abs(lines_sum(lines) - float(target)) >= 0.01):
+        # Primero, solo las cantidades pintadas en las fotos (recorte de cada foto; ver item_photos): si con ellas
+        # cantidad x precio literal de todos los artículos da exactamente lo impreso, se aceptan y no hace falta leer la
+        # página entera con el VL.
+        photo_merged = None
         if p1.server_ok(vl_server):
+            try:
+                photo_lines = photo_quantities(res["pdf"], pages, lines, literal, vl_server, timeout, log)
+            except Exception as e:  # noqa: BLE001  fallo del VL en un recorte: sigue el rescate de siempre
+                log(f"  lectura de cantidades en las fotos falló ({type(e).__name__}); sigue el rescate de siempre")
+                photo_lines = []
+            photo_merged = vl_quantities(lines, photo_lines, literal, sq_text, vl_goal) if photo_lines else None
+        if photo_merged:
+            for l in photo_merged:
+                if l.get("qty_vl"):
+                    log(f"  cantidad leída en la foto (Qwen2.5-VL): {l['qty']} x {l['unit']} = {l['amount']} «{l['desc'][:40]}»")
+            lines = photo_merged
+            target = items_subtotal or f"{lines_sum(lines):.2f}"
+            log(f"  con esas cantidades, cantidad x precio literal = {target}: cuadra exactamente con lo impreso")
+        elif p1.server_ok(vl_server):
             log("  la suma no cuadra con el total impreso: lectura visual con Qwen2.5-VL")
             try:
                 vl_lines, _ = lines_with_vl(res["pdf"], pages, vl_server, timeout, log)
