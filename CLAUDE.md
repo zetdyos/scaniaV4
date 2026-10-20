@@ -11,7 +11,7 @@ Todo en español. Sin GPU local: los modelos corren en llama-server remotos.
 | `ocr.py` | Lectura de página completa con GLM-OCR ("Text Recognition:"). Define `MODELS_HOST`/`DEFAULT_SERVER`. |
 | `ocr_pipeline.py` | **Fase 1 (CONGELADA).** Página completa + regiones (SDK glmocr, layout PP-DocLayoutV3 en CPU) + verificación de importes y envíos + rescate de precios con Qwen2.5-VL. Expone `run(pdf, ...)`. |
 | `glmocr.yaml` | Configuración del SDK glmocr (copia del `config.yaml` del paquete con cambios mínimos; el cargador NO fusiona YAML parciales). |
-| `facturas_json.py` | **Fase 2.** Divide cada PDF en facturas, construye el JSON del esquema acordado, enriquece con `ocr` y aplica las reglas de evidencia. Expone `build_all(res)`. |
+| `facturas_json.py` | **Fase 2.** Usa PP-OCRv6 (servicio en el host de modelos, :8089) solo para la geometría de los saltos de página. Divide cada PDF en facturas, construye el JSON del esquema acordado, enriquece con `ocr` y aplica las reglas de evidencia. Expone `build_all(res)`. |
 | `demo_api.py` | API FastAPI (cliente: WTCP) + demo: UI en `/` (solo 127.0.0.1), Swagger `/docs`, ReDoc `/redoc`, WebSocket `/ws/jobs/{id}`. `/api/...` exige `X-API-Key` (tokens en `api_keys.json`, fuera de git). Acepta PDF, PNG, JPG/JPEG, BMP. Trabajos en `demo_jobs/`. |
 | `docs/CONTRATO-WTCP.md` | Contrato con WTCP: qué rutas y campos lee el cliente. **Cualquier cambio de esquema se contrasta con él.** |
 | `deploy/windows/` | Arranque de la API al iniciar sesión en Windows (`SCANIA-api.vbs` → `lanzar_api.ps1`). |
@@ -22,7 +22,7 @@ Todo en español. Sin GPU local: los modelos corren en llama-server remotos.
 ## Reglas que no se negocian (pedidas por el usuario)
 
 1. **La fase 1 está congelada.** No modificar `ocr_pipeline.py`, `ocr.py` ni `glmocr.yaml` salvo petición explícita. La fase 2 solo consume `ocr_pipeline.run()`. Cambios de host/config son la única excepción aceptada hasta ahora.
-2. **No arrancar servidores de modelos en esta máquina.** Los llama-server viven en el host de modelos (`192.168.1.194`, variable `OCR_MODELS_HOST`): GLM-OCR en 8086, Qwen3.6-27B en 8083 (cargado SIN visión), Qwen2.5-VL-7B en 8088. Antes de usarlos, comprobar `/health` y `/props`.
+2. **No arrancar servidores de modelos en esta máquina.** Los llama-server viven en el host de modelos (`192.168.1.194`, variable `OCR_MODELS_HOST`): GLM-OCR en 8086, Qwen3.6-27B en 8083 (cargado SIN visión), Qwen2.5-VL-7B en 8088. Además PP-OCRv6 (PaddleOCR det+rec, no generativo) en 8089 (`POST /ocr` con PNG → renglones con caja). Antes de usarlos, comprobar `/health` y `/props`. GPU0 = 27B; la única excepción, pedida por el usuario el 2026-10-20, es PP-OCRv6 (~2 GB, tope 2048 MB). Nada más en GPU0. Unidades systemd `scania-mdl-*` en `scania-models.target` (arrancan con el sistema; PP-OCRv6 espera al `/health` del 27B). Ver INSTALL.md §2.1.
 3. **No experimentar al azar con prompts ni resoluciones.** Cada decisión debe apoyarse en documentación (tarjeta del modelo, repo oficial, código de llama.cpp). Lo verificado está en "Hechos documentados".
 4. **No inventar valores.** Todo lo que venga de un modelo de lenguaje se contrasta con el texto OCR; lo que no tenga respaldo se marca (`evidencia: modelo`) y la línea no se da por verificada.
 5. **Los números manuscritos no interesan.**
@@ -47,8 +47,16 @@ Añadidos: `referencia`, los objetos `ocr` (factura y línea; ver docstring de `
 
 ## Extracción de líneas (fase 2): no depende del tamaño del documento
 
-Orden: bloques de envío de Amazon (`envios`) → Qwen3.6-27B **página por página** (`llm`) con `max_tokens = n_ctx (/props) − prompt (/tokenize)` → rescate con Qwen2.5-VL. Si una respuesta del 27B se corta (`finish_reason: length`) o no es JSON, esa página queda para revisión (`LECTURA`), nunca un error del trabajo.
+Orden: bloques de envío de Amazon (`envios`) → Qwen3.6-27B **página por página** (`llm`) con `max_tokens = n_ctx (/props) − prompt (/tokenize)` → saltos de página (`fix_page_breaks`, abajo) → rescate con Qwen2.5-VL. Si una respuesta del 27B se corta (`finish_reason: length`) o no es JSON, esa página queda para revisión (`LECTURA`), nunca un error del trabajo.
 Origen del problema que lo motivó: con `max_tokens` 4096 fijo, una factura Shein de 54 artículos se cortaba siempre (`JSONDecodeError`).
+
+### Artículo partido por un salto de página (GLM-OCR + PP-OCRv6)
+
+Problema (21750): GLM-OCR lee cada página como texto **sin posiciones**. En tablas que imprimen la descripción DEBAJO del código, la descripción del último artículo de la página N queda arriba de la N+1 y GLM empareja cada fila con el renglón de ENCIMA: toda la página N+1 sale corrida un artículo y el 27B lo copia (sin revisión y con descripciones cambiadas). Ningún método de solo texto lo resolvió (contexto de páginas vecinas, llamada extra al 27B, unión de celdas al estilo MinerU, OCRFlux, PaddleOCR-VL merge_tables, franja re-OCR: medidos y descartados el 2026-10-19/20; parche en scratchpad).
+Solución: **GLM-OCR sigue siendo el lector; PP-OCRv6 solo aporta geometría** en facturas de varias páginas de la vía del 27B.
+- Detección (`page_break_continuation`, solo geometría): artículo = renglón con ≥ 2 importes; candidatos = renglones con texto entre la última cabecera de tabla de N+1 y su primer artículo, en la columna de descripción de N, sin importe, ≤ 3. No hay continuación si: la tabla cerró en N (renglones de un solo importe tras el último artículo); el renglón ya está en la cabecera de N («ORDERED SHIPPED»); o los renglones de la misma forma en N **encabezan** su artículo (descripción encima del importe, cabecera de grupo). Importe: 3–4 decimales solo con «$»; nunca seguido de «.cifra» (teléfono, código HTS).
+- Arreglo (`fix_page_breaks`): el renglón huérfano se añade al último artículo de N (emparejado por importe exacto); un «artículo» sin importe del 27B que es ese texto se quita. Solo si hay **corrimiento** (el primer artículo de N+1 según el 27B lleva el texto huérfano) se rehacen las descripciones de N+1 por geometría (renglón del artículo + los de debajo en la columna, hasta otro artículo, importe o hueco > 2 interlineados; sin el marco de página repetido en 2+ páginas, «**** CONTINUED ****»), emparejadas por importe en orden. **El texto colocado es siempre el de GLM** (`glm_fragment`: igual sin espacios o similitud ≥ 0.85 en la misma página; fragmentos de < 2 letras/cifras se ignoran). Cantidades e importes no se tocan. Si algo no empareja o no tiene texto de GLM → incidencia «item description split by the page break…» → `LECTURA`. PP-OCRv6 caído → sin cambios (como antes).
+- Medido el 2026-10-20 en 178 PDF de varias páginas (405 saltos): 5 continuaciones (21750 ×2, 31053, 31593, 31734), las 5 correctas contra la imagen, 0 falsos positivos tras las reglas de arriba (la 1.ª versión dio 9 falsos de 14). No detecta: 31734 p2→3. Sin tabla con importes (Amazon con fotos) no aplica.
 
 ## Hechos documentados (no volver a investigar)
 
@@ -56,6 +64,7 @@ Origen del problema que lo motivó: con `max_tokens` 4096 fijo, una factura Shei
 - llama.cpp limita GLM-OCR y Qwen2.5-VL a 4096 fichas de imagen (28×28 px) y reescala bilineal por encima: una Letter a 200 dpi se degrada; `fit_dpi` calcula el dpi por página. Qwen-VL pierde precisión por debajo de 1024 fichas.
 - llama-server ignora `repetition_penalty` (solo `repeat_penalty`). Para JSON por gramática usar `response_format: {"type":"json_schema","json_schema":{"name":…,"schema":{…}}}` (el README muestra `schema` suelto y el servidor lo ignora en silencio).
 - Qwen3.6-27B piensa por defecto: para extracción `chat_template_kwargs: {"enable_thinking": false}`, temperatura 0, esquema JSON. Qwen2.5-VL: prompt de extracción clave-valor del cookbook oficial (`Extract the key-value information in the format:{…}`), `repeat_penalty` 1.05.
+- Qwen2.5-VL-7B (calibrado 2026-10-20, 53 fotos de Amazon con verdad a mano): con la **página entera** falla por los números manuscritos del margen (lee «31835» como $318.35) y por artículos repetidos; `repeat_penalty` y la gramática JSON no cambian nada (medido). Con el **recorte de la foto** + pregunta cerrada (JSON `quantity` entero) a ≥ 1024 fichas de imagen: 53/53 (página entera 11/19). Aún NO aplicado en producción (propuesta: localizar la foto con PP-OCRv6). El 3B se probó y se desinstaló.
 - Clasificación arancelaria: ningún LLM solo es fiable (ATLAS, HSGraphAgent, marco de consenso); cuando toque, será recuperación sobre el catálogo oficial + LLM como juez. El usuario la dejó para después.
 
 ## Cómo correr

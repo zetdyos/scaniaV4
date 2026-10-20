@@ -26,6 +26,10 @@ De dónde salen las líneas de cada factura:
     del prompt (/tokenize): la salida no crece con el número de páginas. Si una respuesta se corta
     (finish_reason "length") o no es JSON, esa página queda para revisión (LECTURA), nunca un error del
     trabajo. Cada importe devuelto se contrasta con los que leyó el OCR.
+  - Facturas de varias páginas (vía del 27B): en cada salto de página, la geometría de PP-OCRv6 (servicio :8089 del
+    host de modelos) dice si el último artículo de una página continúa al principio de la siguiente; ese texto se
+    coloca en su artículo y, si GLM corrió las descripciones de la página siguiente, se realinean (fix_page_breaks).
+    El texto es siempre el de GLM; si no se puede realinear con seguridad, revisión.
   - Si la suma de líneas no reproduce el total impreso, las páginas de la factura van como imagen
     a Qwen2.5-VL (puerto 8088) con el patrón de extracción clave-valor del cookbook de Qwen. Esas
     líneas solo se aceptan si cantidad x precio reproduce el total impreso.
@@ -595,7 +599,10 @@ def line_evidence(l, sq_text, ocr_amounts, arithmetic_ok, ocr_units=frozenset())
         return {"descripcion": "leido", "cantidad": "leido", "precio_unitario": "leido", "importe_linea": "leido"}
     ev = {}
     key = p1.squash(l.get("desc", ""))[:20]
-    ev["descripcion"] = "leido" if key and key in sq_text else "modelo"
+    # descripción recompuesta en un salto de página (fix_page_breaks): fragmentos de GLM de renglones distintos
+    # («B7177» + «LUBE SPIN-ON»); es literal si lo es cada fragmento
+    parts = l.get("desc_parts")
+    ev["descripcion"] = "leido" if (all(p1.squash(p) in sq_text for p in parts) if parts else key and key in sq_text) else "modelo"
     unit, amt = l.get("unit") or "", l.get("amount") or ""
     ev["precio_unitario"] = ("leido" if unit in ocr_amounts or unit in ocr_units
                              else "aritmetica" if arithmetic_ok else "modelo") if unit else ""
@@ -1017,6 +1024,301 @@ def build_shipment_invoice(inv_id, res, inv, block, k, n, order_fields, order_to
 
 # ----------------------------------------------------------------------------- factura
 
+# ----------------------------------------------------------------------------- artículo partido por un salto de página
+# GLM-OCR lee cada página como texto SIN posiciones. En las tablas que imprimen la descripción DEBAJO del código
+# (21750: «0003 B309 $59.87» y «HIGH PERFORM. GLASS F-FLU» ya en la página siguiente), la descripción del último
+# artículo de una página queda arriba de la siguiente y GLM empareja cada fila con el renglón de ENCIMA: toda la
+# página siguiente sale corrida un artículo (y el 27B lo copia). Ningún método de solo texto lo distingue.
+# PP-OCRv6 (detección + reconocimiento, PP-OCRv6_medium, no generativo) da cada renglón CON su caja: con la
+# geometría se ve qué renglones quedan entre la cabecera de la tabla y el primer artículo de la página siguiente.
+# Servicio en el host de modelos (scania-mdl-ppocr, GPU0, :8089; mismo resultado que en CPU, ~1 s/página).
+# Medido el 2026-10-20 en los 178 PDF de varias páginas (405 saltos): 5 continuaciones, las 5 correctas contra la
+# imagen, ningún falso positivo. GLM-OCR sigue siendo el lector: el texto que se coloca tiene que estar LITERAL en
+# su OCR; cantidades e importes no se tocan.
+PPOCR_SERVER = f"http://{p1.MODELS_HOST}:8089"
+PPOCR_DPI = 200
+# Importe en un renglón de PP-OCR: con «$» admite 3-4 decimales ($9.9776); sin «$», 2 decimales y sufijo de moneda
+# opcional (46.79 US$, «USS» mal leído). Parte entera con o sin separador de miles (1,635.12 / 1635.12). Nunca
+# seguido de otra cifra ni de «.cifra»: un teléfono «972.394.9422» o un código HTS «8421.23.0000» no son importes.
+GEO_MONEY_RE = re.compile(r"(?<![\d.,])(?:\$\s?(?:\d{1,3}(?:,\d{3})+|\d+)\.\d{2,4}|(?:\d{1,3}(?:[,.]\d{3})+|\d+)[.,]\d{2}"
+                          r"(?:\s?(?:US\$|USS|USD|\$))?)(?!\d|[.,]\d)")
+_PPOCR_CACHE = {}  # (pdf, página) -> renglones; se vacía por documento en build_all
+
+
+def ppocr_rows(pdf, page_idx, timeout=120):
+    """Renglones de una página según PP-OCRv6: [{c (centro y), toks [(x0, x1, texto)], text, money, span, alpha_x}]."""
+    key = (str(pdf), page_idx)
+    if key not in _PPOCR_CACHE:
+        with fitz.open(pdf) as doc:
+            pix = doc[page_idx].get_pixmap(dpi=PPOCR_DPI, alpha=False)
+        r = requests.post(f"{PPOCR_SERVER}/ocr", data=pix.tobytes("png"), timeout=timeout)
+        r.raise_for_status()
+        j = r.json()
+        toks = sorted((b[1], b[0], b[2], b[3], t.strip()) for t, b in zip(j["texts"], j["boxes"]) if t.strip())
+        rows = []
+        for y0, x0, x1, y1, t in toks:  # renglón = cajas con el centro vertical a <= 10 px
+            c = (y0 + y1) / 2
+            if rows and abs(rows[-1]["c"] - c) <= 10:
+                rows[-1]["toks"].append((x0, x1, t))
+                rows[-1]["c"] = (rows[-1]["c"] + c) / 2
+            else:
+                rows.append({"c": c, "toks": [(x0, x1, t)]})
+        for rw in rows:
+            rw["toks"].sort()
+            rw["text"] = " ".join(t for _, _, t in rw["toks"])
+            rw["money"] = sum(len(GEO_MONEY_RE.findall(t)) for _, _, t in rw["toks"])
+            rw["span"] = (rw["toks"][-1][1] - rw["toks"][0][0]) / pix.width
+            rw["alpha_x"] = [x0 for x0, _, t in rw["toks"] if re.search(r"[A-Za-z]{3,}", t)]
+        _PPOCR_CACHE[key] = rows
+    return _PPOCR_CACHE[key]
+
+
+def _geo_norm(t):
+    return re.sub(r"[^a-z0-9]", "", t.lower())
+
+
+def page_break_continuation(rows_a, rows_b):
+    """Renglones al principio de la página B que continúan el último artículo de la página A, solo por geometría.
+    Devuelve (renglón del último artículo de A, renglones huérfanos, (lo, hi) columna de descripción, motivo).
+    Artículo = renglón con >= 2 importes (precio e importe). Reglas, todas generales:
+      - la tabla cerró en A (tras su último artículo hay renglones de un solo importe: subtotal, impuestos, total) -> no;
+      - candidatos: entre la última cabecera de tabla de B (renglón ancho, sin cifras) y su primer artículo, sin importe,
+        con texto y alineados con la columna de descripción de A; todos los renglones con texto de esa franja, como mucho 3;
+      - un renglón que ya está en la cabecera de la tabla de A es una segunda línea de cabecera («ORDERED SHIPPED»);
+      - papel del renglón: en A, los renglones de texto entre dos artículos quedan más cerca del SIGUIENTE (lo encabezan:
+        descripción encima del importe, cabecera de grupo) o del ANTERIOR (continúan su descripción). Se mira a los de la
+        misma forma (mismas columnas) o, si no hay, a los de la columna de descripción: si encabezan, el huérfano es del
+        primer artículo de B y no hay continuación."""
+    anchors_a = [i for i, r in enumerate(rows_a) if r["money"] >= 2]
+    anchors_b = [i for i, r in enumerate(rows_b) if r["money"] >= 2]
+    if not anchors_a or not anchors_b:
+        return None, [], None, "sin artículos en una de las páginas"
+    last_a, first_b = anchors_a[-1], anchors_b[0]
+    if any(r["money"] == 1 for r in rows_a[last_a + 1:]):
+        return rows_a[last_a], [], None, "la tabla cerró en la página anterior"
+    heads = [i for i in range(first_b) if rows_b[i]["span"] > 0.45 and rows_b[i]["money"] == 0
+             and not re.search(r"\d", rows_b[i]["text"])]
+    if not heads:
+        return rows_a[last_a], [], None, "sin cabecera de tabla en la página siguiente"
+    cand = [rows_b[i] for i in range(heads[-1] + 1, first_b)]
+    desc_x = [x for r in rows_a[max(0, last_a - 6):last_a + 3] for x in r["alpha_x"]]
+    if not desc_x:
+        return rows_a[last_a], [], None, "sin columna de descripción"
+    col = (min(desc_x) - 60, max(desc_x) + 40)
+    head_a = {_geo_norm(r["text"]) for r in rows_a[:anchors_a[0]]} | \
+        {_geo_norm(t) for r in rows_a[:anchors_a[0]] for _, _, t in r["toks"]}
+    orph = [r for r in cand if r["money"] == 0 and r["alpha_x"] and col[0] <= min(r["alpha_x"]) <= col[1]
+            and _geo_norm(r["text"]) not in head_a and not all(_geo_norm(t) in head_a for _, _, t in r["toks"])]
+    if not orph or len(orph) > 3 or len(orph) != len([r for r in cand if r["alpha_x"]]):
+        return rows_a[last_a], [], col, "sin continuación"
+    gap = lambda r1, r2: abs(r2["c"] - r1["c"])
+    between = [(r, gap(r, rows_a[b]) < gap(rows_a[a], r))
+               for a, b in zip(anchors_a, anchors_a[1:]) for r in rows_a[a + 1:b] if r["alpha_x"] and r["money"] == 0]
+    same_shape = lambda r, o: abs(r["toks"][0][0] - o["toks"][0][0]) <= 20 and len(r["toks"]) == len(o["toks"]) and \
+        all(any(abs(x - y) <= 25 for y, _, _ in r["toks"]) for x, _, _ in o["toks"])
+    for o in orph:
+        pool = [up for r, up in between if same_shape(r, o)] or \
+               [up for r, up in between if col[0] <= min(r["alpha_x"]) <= col[1]]
+        if pool and sum(pool) > len(pool) - sum(pool):
+            return rows_a[last_a], [], col, "el renglón encabeza el primer artículo de su página"
+    return rows_a[last_a], orph, col, "continuación"
+
+
+def _row_amount(row):
+    """Importe de la línea en un renglón de artículo: el último importe (columna de importe extendido)."""
+    vals = [m for _, _, t in row["toks"] for m in GEO_MONEY_RE.findall(t)]
+    return money(vals[-1]) if vals else ""
+
+
+def text_column(rows, fallback):
+    """Columna de descripción para COMPONER el texto (la detección usa la suya). Se toma de los renglones de solo texto
+    (sin importe) entre artículos: el borde izquierdo más frecuente (grupo de bordes a <= 20 px con más renglones) y,
+    como borde derecho, el final de sus cajas con palabras. Las cabeceras de grupo empiezan en otra columna y los
+    renglones de artículo traen cantidad, unidad, importes: no cuentan."""
+    anchors = [i for i, r in enumerate(rows) if r["money"] >= 2][-12:]
+    text_rows = [r for a, b in zip(anchors, anchors[1:]) for r in rows[a + 1:b] if not r["money"] and r["alpha_x"]]
+    if not text_rows:
+        return fallback
+    left = sorted(r["toks"][0][0] for r in text_rows)
+    groups = []
+    for x in left:
+        if groups and x - groups[-1][-1] <= 20:
+            groups[-1].append(x)
+        else:
+            groups.append([x])
+    g = max(groups, key=len)
+    lo = g[0]
+    right = [x1 for r in text_rows if lo <= r["toks"][0][0] <= g[-1] for x0, x1, t in r["toks"] if re.search(r"[A-Za-z]{3,}", t)]
+    return (lo, max(right)) if right else fallback
+
+
+def _col_toks(rows, col):
+    """Fragmentos (cajas de PP-OCRv6) que tocan la columna de descripción, sin importes (fuera quedan cantidades,
+    unidad «EA», importes; dentro, el código impreso justo a la izquierda de la descripción, «B7177»)."""
+    return [t for r in rows for x0, x1, t in r["toks"] if x1 > col[0] and x0 < col[1] and not GEO_MONEY_RE.search(t)]
+
+
+def _col_text(rows, col):
+    return " ".join(_col_toks(rows, col)).strip()
+
+
+def page_furniture(pdf, pages):
+    """Texto de marco de página: renglones tras el último artículo que se repiten en 2+ páginas del documento
+    («**** CONTINUED ****», pies). No es texto de ningún artículo."""
+    seen = {}
+    for p in pages:
+        rows = ppocr_rows(pdf, p)
+        anchors = [i for i, r in enumerate(rows) if r["money"] >= 2]
+        for r in rows[anchors[-1] + 1:] if anchors else []:
+            seen.setdefault(_geo_norm(r["text"]), set()).add(p)
+    return {t for t, ps in seen.items() if t and len(ps) >= 2}
+
+
+def glm_fragment(frag, words):
+    """Texto de GLM-OCR que corresponde a un fragmento leído por PP-OCRv6 en la misma página: la geometría sale de
+    PP-OCRv6, pero lo que se coloca es SIEMPRE texto de GLM (el lector del sistema). Mismo texto sin espacios ->
+    se usa tal cual; si no, la ventana de palabras de GLM (mismo número ±1) más parecida, con similitud >= 0.85
+    (los dos OCR difieren en alguna letra: «Compresslon» / «Compression»). Sin coincidencia clara -> None."""
+    sq = p1.squash(frag)
+    if not sq:
+        return None
+    n = len(frag.split())
+    best, best_r = None, 0.0
+    for size in {max(1, n - 1), n, n + 1}:
+        for i in range(len(words) - size + 1):
+            cand = " ".join(words[i:i + size])
+            if p1.squash(cand) == sq:
+                return cand
+            r = difflib.SequenceMatcher(None, p1.squash(cand), sq).ratio()
+            if r > best_r:
+                best, best_r = cand, r
+    return best if best_r >= 0.85 else None
+
+
+def fix_page_breaks(lines, pdf, pages, page_texts, log):
+    """Artículos partidos por un salto de página (ver arriba). Para cada salto con continuación:
+      - el último artículo de la página A (mismo importe que el renglón de PP-OCRv6) recibe los renglones huérfanos;
+        un «artículo» sin importe del 27B al principio de B que es ese mismo texto se quita (era la continuación);
+      - solo si las descripciones de B quedaron CORRIDAS (el primer artículo de B, según el 27B, lleva el texto
+        huérfano), se rehacen por geometría: cada artículo (renglón con importes) se queda con el texto de la columna
+        de descripción de su renglón y de los renglones que le siguen hasta el próximo artículo (el papel que la
+        geometría comprobó: la descripción va DEBAJO). Cada línea del 27B se empareja por importe, en orden;
+        cantidades e importes no cambian.
+    El texto colocado es el de GLM-OCR (glm_fragment, por fragmento: una línea de PP-OCRv6 puede juntar celdas que GLM
+    leyó por separado). page_texts: {página: texto de GLM sin etiquetas}. Si algo no empareja o un fragmento no tiene
+    texto de GLM, no se cambia nada en ese salto y se devuelve la incidencia (la factura va a revisión)."""
+    issues = []
+
+    parts_of = {}  # texto compuesto -> fragmentos de GLM (para la evidencia: cada uno es literal)
+
+    def glm(toks, page):
+        """Fragmentos de PP-OCRv6 -> texto de GLM de esa página (None si alguno no tiene correspondencia)."""
+        words = page_texts.get(page, "").split()
+        # un fragmento con menos de 2 letras/cifras (una marca, un «4» suelto) no aporta descripción ni se puede cotejar
+        toks = [t for t in toks if len(re.sub(r"[^A-Za-z0-9]", "", t)) >= 2]
+        out = [glm_fragment(t, words) for t in toks]
+        if not toks or None in out:
+            return None
+        parts_of[" ".join(out)] = out
+        return " ".join(out)
+
+    for k in range(len(pages) - 1):
+        goods = [l for l in lines if l.get("kind", "goods") == "goods"]
+        if pages[k + 1] != pages[k] + 1:
+            continue
+        on_a = [l for l in goods if l.get("page_rel") == k + 1]
+        on_b = [l for l in goods if l.get("page_rel") == k + 2]
+        if not on_a or not on_b:
+            continue
+        try:
+            rows_a, rows_b = ppocr_rows(pdf, pages[k]), ppocr_rows(pdf, pages[k + 1])
+        except Exception as e:  # noqa: BLE001  sin geometría se queda como estaba (como antes de este paso)
+            log(f"  PP-OCRv6 no disponible ({type(e).__name__}): sin comprobación del salto p{pages[k] + 1}-{pages[k] + 2}")
+            continue
+        last, orph, col, why = page_break_continuation(rows_a, rows_b)
+        if not orph:
+            continue
+        where = f"page {pages[k] + 1}->{pages[k] + 2}"
+        col = text_column(rows_a, col)
+        furniture = page_furniture(pdf, pages)
+        orph_toks = _col_toks(orph, col)
+        orph_text = " ".join(orph_toks)
+        # El 27B a veces convierte el renglón huérfano en un «artículo» SIN importe al principio de B: es la
+        # continuación, no un artículo (se quita si su texto es el del huérfano).
+        phantom = [l for l in on_b[:1] if not l.get("amount") and p1.squash(l.get("desc"))
+                   and p1.squash(l["desc"]) in p1.squash(orph_text)]
+        on_b = [l for l in on_b if l not in phantom]
+        # artículos de B por geometría, en orden vertical: texto de su renglón + renglones siguientes hasta el próximo
+        def block(rows, i, end):
+            """Texto de un artículo: su renglón y los de texto que le siguen en la columna, hasta el próximo artículo,
+            un renglón con importe, otra columna o un hueco (> 2 interlineados); sin el marco de página."""
+            steps = sorted(b["c"] - a["c"] for a, b in zip(rows, rows[1:]))
+            step = steps[len(steps) // 2] if steps else 0
+            below, prev = [], rows[i]
+            for r in rows[i + 1:end]:
+                if r["money"] or not r["alpha_x"] or not _col_toks([r], col) or (step and r["c"] - prev["c"] > 2 * step):
+                    break
+                prev = r
+                if _geo_norm(r["text"]) not in furniture:
+                    below.append(r)
+            return _col_toks([rows[i]] + below, col)
+
+        orph_glm = glm(orph_toks, pages[k + 1])
+        # ¿Corrimiento? Firma: el primer artículo de B (según el 27B) lleva el texto huérfano (GLM lo pegó a la primera
+        # fila de B y todas las descripciones de B quedaron corridas un artículo, 21750). Solo entonces se rehacen las
+        # descripciones de B por geometría; si no, B se queda como la dio el 27B (otros diseños: la descripción va en
+        # la misma fila y el 27B la tiene bien; rehacerla arrastraría cabeceras de grupo y otras columnas, 31734).
+        shifted = orph_glm is not None and bool(on_b) and p1.squash(orph_glm) in p1.squash(on_b[0].get("desc"))
+        if shifted:
+            # último artículo de A: su texto en A (código, primeras líneas; el 27B lo mezcló con el marco de página)
+            # + el renglón huérfano, todo de GLM
+            anchors_a = [i for i, r in enumerate(rows_a) if r["money"] >= 2]
+            head_toks = block(rows_a, anchors_a[-1], len(rows_a))
+            head_text = glm(head_toks, pages[k]) if head_toks else ""
+            last_text = None if head_text is None else f"{head_text} {orph_glm}".strip()
+            last_parts = parts_of.get(head_text, []) + parts_of.get(orph_glm, [])
+        else:
+            last_text = None if orph_glm is None else f"{on_a[-1]['desc']} {orph_glm}".strip()
+            # la parte del 27B se juzga como siempre (sus primeros 20 caracteres, ver line_evidence)
+            last_parts = [p1.squash(on_a[-1]["desc"])[:20]] + parts_of.get(orph_glm, [])
+        anchors_b = [i for i, r in enumerate(rows_b) if r["money"] >= 2]
+        geo_b = [(_row_amount(rows_b[i]), block(rows_b, i, anchors_b[n + 1] if n + 1 < len(anchors_b) else len(rows_b)))
+                 for n, i in enumerate(anchors_b)] if shifted else []
+        # emparejar en orden por importe (los renglones de B con importes que no son artículos se saltan)
+        pairs, j = [], 0
+        for l in on_b if shifted else []:
+            while j < len(geo_b) and geo_b[j][0] != l.get("amount"):
+                j += 1
+            if j == len(geo_b):
+                break
+            pairs.append((l, glm(geo_b[j][1], pages[k + 1])))
+            j += 1
+        why_not = ("el último artículo de la página anterior no tiene el importe del renglón de PP-OCRv6 "
+                   f"({_row_amount(last)} / {on_a[-1].get('amount')})" if _row_amount(last) != on_a[-1].get("amount") else
+                   f"{len(on_b) - len(pairs)} artículo(s) de la página siguiente sin renglón con su importe"
+                   if shifted and len(pairs) != len(on_b) else
+                   "el renglón huérfano no tiene texto correspondiente en GLM-OCR" if last_text is None else
+                   next((f"descripción sin texto correspondiente en GLM-OCR («{l['desc'][:40]}», {l.get('amount')})"
+                         for l, d in pairs if d is None), ""))
+        if why_not:
+            issues.append(f"item description split by the page break ({where}): «{orph_text[:50]}» continues the last "
+                          "item of the previous page; descriptions of the next page could not be re-aligned, review them")
+            log(f"  salto {where}: continuación «{orph_text}» sin realinear: {why_not}")
+            continue
+        for l in phantom:
+            lines.remove(l)
+            log(f"  salto {where}: «{l['desc'][:40]}» sin importe era la continuación, no un artículo")
+        old_a = on_a[-1]["desc"]
+        on_a[-1]["desc"], on_a[-1]["desc_parts"] = last_text, last_parts
+        log(f"  salto {where}: «{orph_text}» continúa el último artículo de la página anterior: «{old_a[:45]}» -> "
+            f"«{on_a[-1]['desc'][:60]}» (geometría PP-OCRv6)")
+        for l, d in pairs:
+            if p1.squash(d) != p1.squash(l["desc"]):
+                log(f"    descripción realineada: «{l['desc'][:45]}» -> «{d[:45]}» ({l.get('amount')})")
+                l["desc"], l["desc_parts"] = d, parts_of.get(d, [d])
+    return issues
+
+
 def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log, vl=True):
     pages = inv["pages"]
     regions = [res["region_pages"][i] if i < len(res["region_pages"]) else [] for i in pages]
@@ -1093,6 +1395,10 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
             else:
                 issues.append(f"total {t} returned by the model not found in the OCR text")
         source = "llm"
+        if len(pages) > 1:
+            glm_pages = {i: html.unescape(re.sub(r"<[^>]+>", " ", p1.page_markdown(i + 1, res["full_text"].get(i) or "", regs)[0]))
+                         for i, regs in zip(pages, regions)}
+            issues += fix_page_breaks(lines, res["pdf"], pages, glm_pages, log)
     else:
         lines, source = [], "ninguna"
         issues.append("no shipment blocks and model extraction disabled")
@@ -1481,6 +1787,7 @@ def build_all(res, use_llm=True, llm_server=QWEN27_SERVER, vl_server=VL_SERVER, 
     """Divide el resultado de la fase 1 en facturas y construye el JSON de todas (array)."""
     log = log or (lambda m: print(m, file=sys.stderr))
     _LLM_CACHE.clear()
+    _PPOCR_CACHE.clear()
     invoices = split_invoices(res)
     log(f"  {len(invoices)} factura(s) detectada(s): " + ", ".join(
         f"{inv['tipo'] or '?'} {inv['ref'] or 'sin ref'} p{inv['pages'][0] + 1}-{inv['pages'][-1] + 1}" for inv in invoices))
