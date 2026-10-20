@@ -1509,13 +1509,9 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
     lines = [l for l in lines if l.get("kind", "goods") == "goods"]
     ocr_units = fine_amounts(md)
     if source == "llm":
-        # Cantidades con respaldo literal, en este orden (todas generales, ninguna inventa un número):
-        # a) la cantidad impresa en la misma fila de tabla que la descripción (columna "Quantity"; si hay
-        #    pedida y enviada, la que cumple cantidad x precio = importe);
-        # b) sin cantidad impresa: importe / precio unitario, ambos literales, si da un entero (el 27B a veces
-        #    toma tallas o el "10pcs" del nombre como cantidad);
-        # c) un único artículo y el "Item(s) Subtotal" impreso: subtotal / precio unitario literal, si da un
-        #    entero (la cantidad de las capturas de Amazon va sobre la foto y el OCR no la lee).
+        # Respaldo de la cantidad del 27B (solo comprobación, nunca sustitución): impresa en la misma fila de tabla,
+        # «xN»/«Qty N» junto a la descripción o al inicio del renglón; si no, la evidencia la juzga (cantidad x precio
+        # literal = importe -> «aritmetica»; si no, «modelo» -> revisión).
         rows = table_rows(md)
         literal = lambda v: bool(v) and (v in ocr_amounts or v in ocr_units)
         # Importe vacío con precio unitario literal: importe = cantidad x precio ("calculado"; si la cantidad del
@@ -1533,11 +1529,16 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
                 if literal(l.get("unit")) and l.get("amount") in ocr_amounts and abs(l["qty"] * u - float(l["amount"])) < 0.006:
                     l["qty_printed"] = True
                 continue
+            # La CANTIDAD la decide el 27B (lo que el OCR/VL leyeron, interpretado por el modelo). El código solo la
+            # COMPRUEBA contra lo impreso, nunca la sustituye (decisión del usuario 2026-10-20: «los modelos están ahí
+            # por una razón, no inventes tú»; 32226: «$39.29 x2», el 27B dio 2 y una regla del código lo pasó a 1).
+            # Si no se puede respaldar, la evidencia de la cantidad queda «modelo» y la factura va a revisión.
             q = qty_from_table(l, rows)
             if q is not None:
-                if q != l["qty"]:
-                    log(f"  cantidad de la fila de tabla del OCR: {l['qty']} -> {q} «{l['desc'][:40]}»")
-                l["qty"], l["qty_printed"] = q, True
+                if q == l["qty"]:
+                    l["qty_printed"] = True
+                else:
+                    log(f"  cantidad del 27B {l['qty']}; la fila de tabla del OCR muestra {q}: se deja la del 27B «{l['desc'][:40]}»")
                 continue
             if qty_printed(l["qty"], sq_text, p1.squash(l.get("desc", ""))[:20]):
                 continue
@@ -1548,23 +1549,7 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
             if literal(unit) and amt in ocr_amounts and float(unit) > 0:
                 n = round(float(amt) / float(l.get("unit_exact") or unit))
                 if n != l["qty"] and qty_matches(n, unit, amt, l.get("unit_exact")):
-                    log(f"  cantidad = importe / precio (literales): {l['qty']} -> {n} «{l['desc'][:40]}»")
-                    l["qty"] = n
-            elif l["qty"] > 1 and amt in ocr_amounts and not literal(unit):
-                # cantidad > 1 sin respaldo (ni impresa como cantidad ni con precio unitario impreso): p. ej. el "(4)" de
-                # un pack en el nombre. El importe impreso es la línea entera: cantidad 1 y precio = importe. Si fuera
-                # otra cosa, el cuadre con lo impreso lo delata y la factura va a revisión.
-                log(f"  cantidad {l['qty']} sin respaldo (precio {unit or '-'} no impreso): 1 x {amt} «{l['desc'][:40]}»")
-                l["qty"], l["unit"], l["unit_exact"] = 1, amt, None
-        if len(lines) == 1 and items_subtotal and items_subtotal in ocr_amounts:
-            l = lines[0]
-            # con cantidad 1, el importe de la línea es el precio unitario (el 27B a veces deja vacío el precio)
-            unit = l.get("unit") or (l.get("amount") if l["qty"] == 1 and l.get("amount") in ocr_amounts else "")
-            if literal(unit) and float(unit) > 0 and l.get("amount") != items_subtotal and not l.get("qty_printed"):
-                n = round(float(items_subtotal) / float(unit))
-                if n >= 1 and qty_matches(n, unit, items_subtotal):
-                    log(f"  único artículo: cantidad = subtotal / precio (literales) = {n} «{l['desc'][:40]}»")
-                    l["qty"], l["amount"], l["unit"] = n, items_subtotal, unit
+                    log(f"  cantidad del 27B {l['qty']}; importe / precio (literales) da {n}: se deja la del 27B «{l['desc'][:40]}»")
     # Contra qué cuadran las líneas, recalculado con lo que trajo el 27B (antes quedaba vacío si el total
     # solo lo encontraba el modelo). Sin "Item(s) Subtotal" con esa etiqueta: vale una línea que el 27B
     # clasificó subtotal_or_total, cuyo importe está literal en el OCR e iguala la suma de los artículos.
