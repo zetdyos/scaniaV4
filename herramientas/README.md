@@ -12,3 +12,7 @@ así que **solo se lanzan con WTCP parado** (si no, retrasan sus trabajos: 2026-
 | `badge_crops.py` / `calibra_badge.py` | Recortes de fotos de Amazon y calibración de Qwen2.5-VL para la cantidad sobre la foto (53/53). |
 
 Regla del usuario: medir solo en las facturas donde el cambio puede aplicar, no en las que no pueden cambiar.
+
+Límite de `regresion_head.py`: reconstruye la fase 1 solo desde `ocr.md` (sin regiones, `check_shipments` vacío), así
+que en Amazon de escritorio no salen los bloques de envío (31143 da 1 factura en vez de 6, en HEAD y en el árbol). Un
+«IGUAL» ahí no prueba la vía de envíos; esa vía se comprueba con el CLI completo o contra el `result.json` guardado.

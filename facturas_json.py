@@ -683,7 +683,12 @@ def missing_table_rows(page_mds, lines, diff):
     return []
 
 
-FINE_NUM_RE = re.compile(r"(?<![\d.,])\d+\.\d{3,5}(?![\d])")
+FINE_NUM_RE = re.compile(r"(?<![\d.,])(?:\d{1,3}(?:,\d{3})+|\d+)\.\d{3,5}(?![\d])")
+
+
+def fine_nums(text):
+    """Números con 3 a 5 decimales del texto, sin separador de miles ("2,141.040" -> "2141.040")."""
+    return [x.replace(",", "") for x in FINE_NUM_RE.findall(text or "")]
 
 
 def fine_amounts(text):
@@ -691,22 +696,23 @@ def fine_amounts(text):
     y money() pueden devolver cualquiera de los dos)."""
     from decimal import ROUND_DOWN, ROUND_HALF_UP, Decimal
     out = set()
-    for x in FINE_NUM_RE.findall(text or ""):
+    for x in fine_nums(text):
         out |= {str(Decimal(x).quantize(Decimal("0.01"), rounding=r)) for r in (ROUND_HALF_UP, ROUND_DOWN)}
     return out
 
 
 def exact_cents(text):
-    """Importes impresos con 3 a 5 decimales que son céntimos exactos ("1975.0000", "12.500"): literales sin redondeo."""
-    return {f"{float(x):.2f}" for x in FINE_NUM_RE.findall(text or "") if set(x.split(".")[1][2:]) <= {"0"}}
+    """Importes impresos con 3 a 5 decimales que son céntimos exactos ("1975.0000", "12.500", "2,141.040"): literales
+    sin redondeo."""
+    return {f"{float(x):.2f}" for x in fine_nums(text) if set(x.split(".")[1][2:]) <= {"0"}}
 
 
 def exact_unit(raw, text):
     """Precio unitario con 3 a 5 decimales tal como está impreso ("1.9750"), si aparece así en el texto: para
     cantidad x precio sin truncarlo a céntimos (1000 x 1.9750 = 1975.00, no 1000 x 1.97)."""
     from decimal import Decimal
-    m = FINE_NUM_RE.search(str(raw or ""))
-    return Decimal(m.group(0)) if m and m.group(0) in FINE_NUM_RE.findall(text or "") else None
+    m = fine_nums(str(raw or ""))
+    return Decimal(m[0]) if m and m[0] in fine_nums(text) else None
 
 
 def qty_tolerance(qty, unit):
