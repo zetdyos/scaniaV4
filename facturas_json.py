@@ -1419,7 +1419,14 @@ def fix_page_breaks(lines, pdf, pages, page_texts, log):
     return issues
 
 
-def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log, vl=True):
+def unit_price_candidates(lines):
+    """Líneas de artículo con cantidad > 1 y un solo precio impreso (sin precio unitario distinto del importe): en ellas
+    el importe impreso puede ser el total de la línea o el precio de UNA unidad («$9.49 x2»)."""
+    return [l for l in lines if l.get("kind", "goods") == "goods" and l["qty"] > 1 and l.get("amount")
+            and (not l.get("unit") or l["unit"] == l["amount"])]
+
+
+def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log, vl=True, unit_alt=False):
     pages = inv["pages"]
     regions = [res["region_pages"][i] if i < len(res["region_pages"]) else [] for i in pages]
     full_texts = [res["full_text"].get(i) or "" for i in pages]
@@ -1514,6 +1521,17 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
         # literal = importe -> «aritmetica»; si no, «modelo» -> revisión).
         rows = table_rows(md)
         literal = lambda v: bool(v) and (v in ocr_amounts or v in ocr_units)
+        # Alternativa «precio por unidad» (ver build_all): solo en la segunda pasada, y solo se acepta si la factura
+        # entera termina SIN revisión (todo lo impreso cuadra exacto). La cantidad sigue siendo la del 27B.
+        if unit_alt:
+            from decimal import ROUND_HALF_UP, Decimal
+            for l in unit_price_candidates(lines):
+                if literal(l["amount"]):
+                    l["unit"], l["unit_exact"] = l["amount"], exact_unit(l["amount"], md)
+                    u = l["unit_exact"] or Decimal(l["amount"])
+                    l["amount"] = str((Decimal(str(l["qty"])) * u).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+                    l["amount_calc"] = True
+                    log(f"  precio por unidad: {l['qty']} x {l['unit']} = {l['amount']} «{l['desc'][:40]}»")
         # Importe vacío con precio unitario literal: importe = cantidad x precio ("calculado"; si la cantidad del
         # 27B estuviera mal, la factura no cuadra y va a revisión).
         for l in lines:
@@ -1841,6 +1859,7 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
         "ocr": fields,
         # interno (build_all lo retira): las líneas cuadran con un total o subtotal IMPRESO
         "_cuadra": all_ok and total_printed,
+        "_unit_candidates": bool(unit_price_candidates(lines)) and not unit_alt,  # ver opción D en build_all
     }, source
 
 
@@ -1939,6 +1958,19 @@ def build_all(res, use_llm=True, llm_server=QWEN27_SERVER, vl_server=VL_SERVER, 
             log(f"  -- factura {len(out)} ({inv['ref'] or 'sin referencia'})")
             # Primero sin VL: si cuadra, es lo mismo que con VL (el rescate solo actúa cuando no cuadra).
             doc, source = build_invoice(len(out), res, inv, use_llm, llm_server, vl_server, timeout, log, vl=False)
+            # Opción D (decisión del usuario 2026-10-20): si no cuadra y hay líneas «cantidad > 1 con un solo precio
+            # impreso», se prueba UNA alternativa -- ese precio es por unidad (importe = cantidad x precio) -- y solo se
+            # acepta si con ella la factura entera termina sin revisión. El documento lo confirma, no una regla.
+            if source == "llm" and not doc["_cuadra"] and doc.get("_unit_candidates"):
+                alt_log = []
+                alt, alt_source = build_invoice(len(out), res, inv, use_llm, llm_server, vl_server, timeout, alt_log.append,
+                                                vl=False, unit_alt=True)
+                if alt["_cuadra"] and not alt["motivo_revision"]:
+                    for m in alt_log:
+                        if "precio por unidad" in m:
+                            log(m)
+                    log("     con el precio impreso por unidad, todo lo impreso cuadra exactamente")
+                    doc, source = alt, alt_source
             parts = None
             if source == "llm" and not doc["_cuadra"] and len(pages) > 1:
                 parts = split_by_orders(len(out), res, inv, llm_server, vl_server, timeout)
@@ -1959,6 +1991,7 @@ def build_all(res, use_llm=True, llm_server=QWEN27_SERVER, vl_server=VL_SERVER, 
         out.extend(docs)
     for doc in out:
         doc.pop("_cuadra", None)
+        doc.pop("_unit_candidates", None)
     # El mismo pedido dos veces en el PDF sin referencia conocida (p. ej. la misma factura Shein escaneada dos
     # veces): ver same_order. Los bloques de envío de un mismo pedido de Amazon son envíos distintos: no cuentan.
     fps = order_fingerprints(out, res.get("markdown", ""))
