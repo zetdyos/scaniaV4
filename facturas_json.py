@@ -1584,18 +1584,27 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
             from_llm = f"{sum(float(a) for a in amts):.2f}" if amts else ""
             # candidatos: el de la etiqueta, el del 27B y "sin cargo"; se queda el que cuadre el resumen
             cands[key] = list(dict.fromkeys([v for v in (fields[key], from_llm) if v] + [""]))
+        # Descuentos y otros cargos: el mismo mecanismo que envío e impuestos. Candidatos en orden: la lista de las
+        # etiquetas y la de las líneas del 27B con importe literal en el OCR; se queda la primera con la que cuadra el
+        # resumen (ver choose_header más abajo). Antes, si las etiquetas encontraban algo («FG Coupon Discount -$0.00»),
+        # los descuentos del 27B no se miraban (29907, 32104: «Redeemed Rewards -$1.63» quedaba fuera).
+        llm_lists = {}
         for key, kind in (("descuentos", "discount"), ("other_charges", "other_charges")):
+            src = [l for l in backed if l["kind"] == kind and not (kind == "other_charges" and l.get("neg"))]
+            seen = dict.fromkeys((p1.squash(l["desc"]), l["amount"]) for l in src)
+            llm_lists[key] = [{"concepto": next(l["desc"] for l in src if (p1.squash(l["desc"]), l["amount"]) == k),
+                               "importe": k[1]} for k in seen]
             if not fields[key]:
-                src = [l for l in backed if l["kind"] == kind and not (kind == "other_charges" and l.get("neg"))]
-                seen = dict.fromkeys((p1.squash(l["desc"]), l["amount"]) for l in src)
-                fields[key] = [{"concepto": next(l["desc"] for l in src if (p1.squash(l["desc"]), l["amount"]) == k),
-                                "importe": k[1]} for k in seen]
+                fields[key] = list(llm_lists[key])
         # Créditos: un "cargo" o "pago" impreso en NEGATIVO ("Refund -$48.15", "Gift Card Amount -$14.99") resta del
         # total; el signo es el del documento. Van con los descuentos (importe en positivo), como candidatos del cuadre.
         for l in backed:
-            if l.get("neg") and l["kind"] in ("other_charges", "payment") and \
-                    not any(d["importe"] == l["amount"] for d in fields["descuentos"]):
-                fields["descuentos"].append({"concepto": l["desc"], "importe": l["amount"]})
+            if l.get("neg") and l["kind"] in ("other_charges", "payment"):
+                for lst in (fields["descuentos"], llm_lists["descuentos"]):
+                    if not any(d["importe"] == l["amount"] for d in lst):
+                        lst.append({"concepto": l["desc"], "importe": l["amount"]})
+        options = {key: [fields[key]] + ([llm_lists[key]] if llm_lists[key] and llm_lists[key] != fields[key] else [])
+                   for key in ("descuentos", "other_charges")}
         if not fields["subtotal_articulos"]:
             fields["subtotal_articulos"] = items_subtotal
         # Un único artículo sin importe: el importe que cuadra el resumen impreso, si es único y está literal en el OCR.
@@ -1620,7 +1629,10 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
         base = float(items_subtotal) if items_subtotal else s
         pick = None
         for tc in (total_cands if base is not None else []):
-            pick = choose_header(base, float(tc), cands, fields["descuentos"], fields["other_charges"])
+            for d_opt, o_opt in itertools.product(options["descuentos"], options["other_charges"]):  # etiqueta, luego 27B
+                pick = choose_header(base, float(tc), cands, d_opt, o_opt)
+                if pick:
+                    break
             if pick:
                 if tc != total:
                     log(f"  total impreso que cuadra el resumen: {tc} (en vez de {total})")
