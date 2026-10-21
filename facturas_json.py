@@ -1260,6 +1260,12 @@ def build_shipment_invoice(inv_id, res, inv, block, k, n, order_fields, order_to
         ok = True
     if total_printed and s is not None and not ok:
         issues.append(f"sum of lines {s:.2f} vs shipment total {total}")
+    # La cabecera del bloque también va a WTCP: si las líneas cuadran solas con el total pero envío + impuestos −
+    # cupón no es 0, esa cabecera no cierra (32188: etiquetas y valores en celdas separadas; «Sales Tax» se emparejó
+    # con 149.95, el «Total before tax»). Nunca sin revisión.
+    if ok and total and s is not None and abs(extra) >= 0.01 and abs(s - float(total)) < 0.01:
+        issues.append(f"shipment summary does not add up: items {s:.2f} + shipping {block['envio'] or 0} + tax "
+                      f"{block['impuestos'] or 0} - coupon {block.get('descuento') or 0} does not match shipment total {total}")
     if any(it["src"] == "qwen" for it in block["items"]):
         issues.append("unit price(s) recovered from the image by the vision model (Qwen2.5-VL)")
     for l in lines:
