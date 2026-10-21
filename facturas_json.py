@@ -2210,18 +2210,49 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
 
 def split_by_orders(g0, res, inv, llm_server, vl_server, timeout):
     """Un PDF con varios pedidos sin marcador conocido (facturas Shein, eBay o de proveedor una tras otra): se
-    corta en grupos de páginas consecutivas que cuadran CADA UNO con su propio total o subtotal impreso. Solo si
-    todos los grupos cuadran (si no, el documento queda entero, como antes, y va a revisión). Sin VL: un grupo
-    que solo cuadrara con la lectura visual no prueba el corte. Devuelve las facturas o None."""
-    pages, groups, start = inv["pages"], [], 0
+    corta en grupos de páginas consecutivas que cuadran CADA UNO con su propio total o subtotal impreso. Sin VL: un
+    grupo que solo cuadrara con la lectura visual no prueba el corte. Desde cada página se busca el grupo más corto que
+    cuadra; una página desde la que ninguno cuadra queda pendiente y las pendientes seguidas forman UNA factura que va
+    a revisión como siempre (antes era todo o nada: una página mal leída dejaba el documento entero en revisión,
+    30276, 31620, 32413). Devuelve las facturas, o None si no hay al menos un grupo que cuadre y otra factura."""
+    pages, out, i, pending = inv["pages"], [], 0, []
     quiet = lambda m: None
-    for end in range(len(pages)):
-        sub = dict(inv, pages=pages[start:end + 1])
-        doc, source = build_invoice(g0 + len(groups), res, sub, True, llm_server, vl_server, timeout, quiet, vl=False)
-        if source == "llm" and doc["_cuadra"]:
-            groups.append(doc)
-            start = end + 1
-    return groups if start == len(pages) and len(groups) > 1 else None
+    abort = []
+
+    def flush():
+        if pending:  # páginas que no cuadran con nada: una factura, con la lectura visual de siempre
+            doc, _ = build_invoice(g0 + len(out), res, dict(inv, pages=list(pending)), True, llm_server, vl_server,
+                                   timeout, quiet)
+            # Sin total impreso propio, esas páginas pueden ser el principio del pedido siguiente («Continued on next
+            # page», 31272: la última página sola «cuadraba» con su resumen tomado como artículo): no se corta nada.
+            if not doc["total_is_printed"]:
+                abort.append(True)
+            out.append(doc)
+            pending.clear()
+    n_ok = 0
+    while i < len(pages):
+        for end in range(i, len(pages)):
+            doc, source = build_invoice(g0 + len(out) + (1 if pending else 0), res, dict(inv, pages=pages[i:end + 1]),
+                                        True, llm_server, vl_server, timeout, quiet, vl=False)
+            if source == "llm" and doc["_cuadra"]:
+                flush()
+                doc["id"] = g0 + len(out)
+                out.append(doc)
+                n_ok += 1
+                i = end + 1
+                break
+        else:
+            pending.append(pages[i])
+            i += 1
+    flush()
+    # El mismo total impreso en dos grupos: un pedido que repite su resumen en cada página (30852: «Grand Total
+    # $1,008.06» en las 11 páginas; una página sola «cuadraba»). No se corta.
+    # Solo en el corte parcial (con páginas pendientes); si todos los grupos cuadran es el corte de siempre (27897: el
+    # mismo pedido dos veces, que luego marca same_order).
+    totals = [d["total"] for d in out if d["total"]]
+    if n_ok < len(out) and len(set(totals)) < len(totals):
+        abort.append(True)
+    return out if n_ok and len(out) > 1 and not abort else None
 
 
 # Identificador impreso (número de pedido, de artículo, de seguimiento): 12+ caracteres alfanuméricos (guiones
