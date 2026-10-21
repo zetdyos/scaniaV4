@@ -9,7 +9,7 @@ last_busy_report = 0
 
 
 JOBS = str(__import__("pathlib").Path(__file__).resolve().parents[1] / "demo_jobs")
-DEPLOY = "20261021-0843"  # despliegue de b186568 (cabecera sin desechar impuestos; total del pedido, no lo pagado): los trabajos anteriores son la referencia
+DEPLOY = "20261021-1045"  # despliegue de c7403f4 (saltos en bloques, corte parcial, pedidos en la misma página, arreglos pequeños, cabecera de bloques de envío): los trabajos anteriores son la referencia
 
 
 def summary(job_id):
