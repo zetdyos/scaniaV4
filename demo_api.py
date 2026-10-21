@@ -1,6 +1,6 @@
 """
 API de OCR de facturas (FastAPI) y demo para evaluarlo visualmente. Contrato con el cliente WTCP:
-docs/CONTRATO-WTCP.md.
+C:/Share/CONTRATO-WTCP.md (carpeta compartida con WTCP).
 
 - GET  /                      interfaz (solo desde 127.0.0.1): subir archivo, barra de progreso,
                               tarjetas de facturas a la izquierda y el PDF a la derecha.
@@ -112,7 +112,7 @@ app = FastAPI(
     title="PDF Reder · OCR de facturas",
     version="1.0.0",
     description=(
-        "API de OCR de facturas. Contrato con WTCP en `docs/CONTRATO-WTCP.md` del repositorio.\n\n"
+        "API de OCR de facturas. Contrato con WTCP: `CONTRATO-WTCP.md` de la carpeta compartida.\n\n"
         "**Acceso:** todas las rutas `/api/...` y el WebSocket exigen el API-Token en la cabecera `X-API-Key` "
         "(botón *Authorize*); sin token o con uno inválido responden `401`.\n\n"
         "**Flujo:** `POST /api/jobs` sube un PDF o una imagen (PNG, JPG/JPEG, BMP) y devuelve un `id`; el progreso llega por WebSocket en "

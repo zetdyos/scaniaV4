@@ -13,7 +13,7 @@ Todo en español. Sin GPU local: los modelos corren en llama-server remotos.
 | `glmocr.yaml` | Configuración del SDK glmocr (copia del `config.yaml` del paquete con cambios mínimos; el cargador NO fusiona YAML parciales). |
 | `facturas_json.py` | **Fase 2.** Usa PP-OCRv6 (servicio en el host de modelos, :8089) solo para la geometría de los saltos de página. Divide cada PDF en facturas, construye el JSON del esquema acordado, enriquece con `ocr` y aplica las reglas de evidencia. Expone `build_all(res)`. |
 | `demo_api.py` | API FastAPI (cliente: WTCP) + demo: UI en `/` (solo 127.0.0.1), Swagger `/docs`, ReDoc `/redoc`, WebSocket `/ws/jobs/{id}`. `/api/...` exige `X-API-Key` (tokens en `api_keys.json`, fuera de git). Acepta PDF, PNG, JPG/JPEG, BMP. Trabajos en `demo_jobs/`. |
-| `docs/CONTRATO-WTCP.md` | Contrato con WTCP: qué rutas y campos lee el cliente. **Cualquier cambio de esquema se contrasta con él.** |
+| `C:\Share\CONTRATO-WTCP.md` (fuera del repo, carpeta compartida que WTCP lee y actualiza; junto a `WTCP-campos-cabecera.md`) | Contrato con WTCP: qué rutas y campos lee el cliente. **Cualquier cambio de esquema se contrasta con él.** |
 | `deploy/windows/` | Arranque de la API al iniciar sesión en Windows (`SCANIA-api.vbs` → `lanzar_api.ps1`). |
 | `salida/`, `salida_md/` | Salidas del CLI (JSON por PDF y Markdown de la fase 1). |
 | `old/`, `*.pdf` | PDF de prueba del usuario. `Enigdocu.mdb` ya no está en el repo. |

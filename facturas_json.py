@@ -1,6 +1,6 @@
 """
 Fase 2: estandariza la salida del OCR (fase 1, ocr_pipeline.run) en JSON con el esquema acordado
-(contrato con WTCP: docs/CONTRATO-WTCP.md). No clasifica: los campos arancelarios quedan con su forma
+(contrato con WTCP: C:/Share/CONTRATO-WTCP.md). No clasifica: los campos arancelarios quedan con su forma
 y sin valor para la fase de clasificación posterior: codigo, hs6, estado de la línea y
 confianza_modelo = "", candidatos = [], confianza / canal / calibrado = null, version_catalogo = "".
 

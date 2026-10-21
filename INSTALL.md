@@ -79,7 +79,7 @@ Genera `salida/<nombre>.json` (array de facturas) y, opcionalmente, el Markdown 
 
 ## 6. API y demo web
 
-**Acceso (contrato WTCP, `docs/CONTRATO-WTCP.md` §7):** todas las rutas `/api/...` y el WebSocket exigen un
+**Acceso (contrato WTCP, `C:\Share\CONTRATO-WTCP.md` §7):** todas las rutas `/api/...` y el WebSocket exigen un
 API-Token en la cabecera `X-API-Key`; sin él responden `401`. La página demo `/` solo se abre desde `127.0.0.1`
 (y desde ahí no se pide token). `/docs`, `/redoc` y `/openapi.json` son públicos (solo esquemas).
 
