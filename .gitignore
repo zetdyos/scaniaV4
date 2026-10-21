@@ -20,3 +20,7 @@ __pycache__/
 
 # bloqueo entre procesos de los modelos (facturas_json.modelos_lock)
 /.modelos.lock
+
+# verdad fijada a mano contra la imagen (datos de clientes)
+/verdad/
+/herramientas/facturas_json_head.py

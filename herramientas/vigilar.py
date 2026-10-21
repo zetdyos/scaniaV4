@@ -9,7 +9,7 @@ last_busy_report = 0
 
 
 JOBS = str(__import__("pathlib").Path(__file__).resolve().parents[1] / "demo_jobs")
-DEPLOY = "20261020-1515"  # despliegue de e896f49 (la cantidad la decide el 27B): los trabajos anteriores son la referencia
+DEPLOY = "20261020-2147"  # despliegue de ef86fa1 (el código nunca sustituye ni desecha cifras de los modelos): los trabajos anteriores son la referencia
 
 
 def summary(job_id):
