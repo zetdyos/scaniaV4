@@ -365,10 +365,26 @@ def page_text(res, i):
 
 
 def split_invoices(res):
-    """Agrupa las páginas del PDF en facturas según los marcadores de inicio."""
+    """Agrupa las páginas del PDF en facturas según los marcadores de inicio. Una página con DOS O MÁS pedidos distintos
+    (21551: dos «Order Summary» de Amazon, cada uno con su Order # y su Grand Total) se corta en trozos de su texto de
+    página completa, uno por pedido, desde cada marcador (inv["slices"]: {página: (inicio, fin)}; ver sliced_res)."""
     invoices = []
     for i in range(res["n_pages"]):
         text = page_text(res, i)
+        full = res["full_text"].get(i) or ""
+        found = sorted({(m.start(), tipo, m.group(1)) for tipo, rx in INVOICE_START for m in rx.finditer(full)})
+        refs = list(dict.fromkeys(r for _, _, r in found))
+        if len(refs) >= 2:
+            starts = [next((pos, tipo, r) for pos, tipo, r in found if r == ref) for ref in refs]
+            for k, (pos, tipo, ref) in enumerate(starts):
+                a = 0 if k == 0 else full.rfind("\n", 0, pos) + 1  # desde el renglón del marcador
+                b = len(full) if k + 1 == len(starts) else full.rfind("\n", 0, starts[k + 1][0]) + 1
+                if k == 0 and invoices and invoices[-1]["ref"] == ref:
+                    invoices[-1]["pages"].append(i)
+                    invoices[-1].setdefault("slices", {})[i] = (a, b)
+                else:
+                    invoices.append({"tipo": tipo, "ref": ref, "pages": [i], "slices": {i: (a, b)}})
+            continue
         hit = next(((tipo, m.group(1)) for tipo, rx in INVOICE_START for m in [rx.search(text)] if m), None)
         if hit and (not invoices or hit[1] != invoices[-1]["ref"]):
             invoices.append({"tipo": hit[0], "ref": hit[1], "pages": [i]})
@@ -377,6 +393,19 @@ def split_invoices(res):
         else:
             invoices.append({"tipo": "", "ref": "", "pages": [i]})
     return invoices
+
+
+def sliced_res(res, inv):
+    """El resultado de la fase 1 visto por una factura con trozos de página (split_invoices): en esas páginas, solo su
+    trozo del texto de página completa y sin regiones (las regiones mezclan los dos pedidos)."""
+    if not inv.get("slices"):
+        return res
+    ft, rp = dict(res["full_text"]), list(res["region_pages"])
+    for i, (a, b) in inv["slices"].items():
+        ft[i] = (res["full_text"].get(i) or "")[a:b]
+        if i < len(rp):
+            rp[i] = []
+    return dict(res, full_text=ft, region_pages=rp)
 
 
 # ----------------------------------------------------------------------------- líneas desde envíos
@@ -2305,15 +2334,16 @@ def build_all(res, use_llm=True, llm_server=QWEN27_SERVER, vl_server=VL_SERVER, 
         f"{inv['tipo'] or '?'} {inv['ref'] or 'sin ref'} p{inv['pages'][0] + 1}-{inv['pages'][-1] + 1}" for inv in invoices))
     out = []
     for g, inv in enumerate(invoices):
+        rs = sliced_res(res, inv)
         pages = inv["pages"]
-        regions = [res["region_pages"][i] if i < len(res["region_pages"]) else [] for i in pages]
+        regions = [rs["region_pages"][i] if i < len(rs["region_pages"]) else [] for i in pages]
         blocks = parse_blocks(regions)
         dups = [j for j, o in enumerate(invoices) if j != g and o["ref"] and o["ref"] == inv["ref"]]
         docs = []
         if blocks:
-            full_texts = [res["full_text"].get(i) or "" for i in pages]
-            md = "\n\n---\n\n".join(p1.page_markdown(i + 1, res["full_text"].get(i) or "", regs)[0] for i, regs in zip(pages, regions))
-            order_fields = invoice_fields(md, full_texts, inv, res["pdf"])
+            full_texts = [rs["full_text"].get(i) or "" for i in pages]
+            md = "\n\n---\n\n".join(p1.page_markdown(i + 1, rs["full_text"].get(i) or "", regs)[0] for i, regs in zip(pages, regions))
+            order_fields = invoice_fields(md, full_texts, inv, rs["pdf"])
             m = ORDER_TOTAL_RE.search(md)
             order_total = money(m.group(1)) if m else ""
             log(f"  -- pedido {inv['ref'] or 'sin referencia'}: {len(blocks)} bloque(s) de envío -> {len(blocks)} factura(s)")
@@ -2325,7 +2355,7 @@ def build_all(res, use_llm=True, llm_server=QWEN27_SERVER, vl_server=VL_SERVER, 
                 missing[0].update(total_derived=f"{float(order_total) - others:.2f}", order_total=order_total,
                                   others_total=f"{others:.2f}")
             for k, b in enumerate(blocks):
-                docs.append(build_shipment_invoice(len(out) + len(docs), res, inv, b, k, len(blocks), order_fields, order_total, pages, full_texts, currency_of(md)))
+                docs.append(build_shipment_invoice(len(out) + len(docs), rs, inv, b, k, len(blocks), order_fields, order_total, pages, full_texts, currency_of(md)))
                 d = docs[-1]
                 log(f"     factura {d['id']} [{b['estado']}]: {len(d['lineas'])} línea(s), total {d['total'] or '?'}"
                     f"{'' if d['total_is_printed'] else ' (calculado)'}, revisión: {d['motivo_revision'] or 'no'}" + (f" ({d['mismatch']})" if d["mismatch"] else ""))
@@ -2335,13 +2365,13 @@ def build_all(res, use_llm=True, llm_server=QWEN27_SERVER, vl_server=VL_SERVER, 
         else:
             log(f"  -- factura {len(out)} ({inv['ref'] or 'sin referencia'})")
             # Primero sin VL: si cuadra, es lo mismo que con VL (el rescate solo actúa cuando no cuadra).
-            doc, source = build_invoice(len(out), res, inv, use_llm, llm_server, vl_server, timeout, log, vl=False)
+            doc, source = build_invoice(len(out), rs, inv, use_llm, llm_server, vl_server, timeout, log, vl=False)
             # Opción D (decisión del usuario 2026-10-20): si no cuadra y hay líneas «cantidad > 1 con un solo precio
             # impreso», se prueba UNA alternativa -- ese precio es por unidad (importe = cantidad x precio) -- y solo se
             # acepta si con ella la factura entera termina sin revisión. El documento lo confirma, no una regla.
             if source == "llm" and not doc["_cuadra"] and doc.get("_unit_candidates"):
                 alt_log = []
-                alt, alt_source = build_invoice(len(out), res, inv, use_llm, llm_server, vl_server, timeout, alt_log.append,
+                alt, alt_source = build_invoice(len(out), rs, inv, use_llm, llm_server, vl_server, timeout, alt_log.append,
                                                 vl=False, unit_alt=True)
                 if alt["_cuadra"] and not alt["motivo_revision"]:
                     for m in alt_log:
@@ -2351,14 +2381,14 @@ def build_all(res, use_llm=True, llm_server=QWEN27_SERVER, vl_server=VL_SERVER, 
                     doc, source = alt, alt_source
             parts = None
             if source == "llm" and not doc["_cuadra"] and len(pages) > 1:
-                parts = split_by_orders(len(out), res, inv, llm_server, vl_server, timeout)
+                parts = split_by_orders(len(out), rs, inv, llm_server, vl_server, timeout)
             if parts:
                 log(f"     no cuadra entero; {len(parts)} pedido(s) que cuadran cada uno con su total impreso: páginas "
                     + ", ".join(f"{p['ocr']['paginas'][0]}-{p['ocr']['paginas'][1]}" for p in parts))
                 docs.extend(parts)
             else:
                 if source == "llm" and not doc["_cuadra"]:  # el 27B está en caché: solo se añade la lectura visual
-                    doc, source = build_invoice(len(out), res, inv, use_llm, llm_server, vl_server, timeout, log)
+                    doc, source = build_invoice(len(out), rs, inv, use_llm, llm_server, vl_server, timeout, log)
                 docs.append(doc)
             for doc in docs:
                 log(f"     {len(doc['lineas'])} línea(s) (origen: {doc['ocr']['origen_lineas']}), total {doc['total'] or '?'}, "
