@@ -98,6 +98,7 @@ VL_SERVER = p1.QWEN_SERVER  # Qwen2.5-VL-7B, puerto 8088
 
 # Marcadores de inicio de factura: (tipo, regex con grupo 1 = referencia). Tolerantes a espacios
 # perdidos por el OCR.
+EBAY_ORDER_RE = re.compile(r"Order\s*number:?\s*(\d{2}-\d{5}-\d{5})(?!\d)", re.I)
 INVOICE_START = [
     ("amazon", re.compile(r"Details\s*for\s*Order\s*#?\s*(\d{3}-\d{7}-\d{7})", re.I)),
     ("amazon", re.compile(r"Amazon\.com\s*order\s*number:?\s*(\d{3}-\d{7}-\d{7})", re.I)),
@@ -335,7 +336,17 @@ def printed_negative(amt, text):
 
 
 def lines_sum(ls):
-    return sum(float(l["amount"]) for l in ls) if ls and all(l["amount"] for l in ls) else None
+    """Suma de los importes de las líneas. Un importe impreso con 3 a 5 decimales (Extended «$71.208») cuenta EXACTO
+    (amount_exact, el valor del 27B) y la suma se trunca a céntimos como el total impreso («$4,005.154» -> 4005.15):
+    sumar los importes ya truncados se queda corto (32569: 4005.11). Solo si amount_exact sigue siendo ese importe."""
+    if not ls or not all(l["amount"] for l in ls):
+        return None
+    from decimal import Decimal
+    if not any(l.get("amount_exact") is not None and cents(l["amount_exact"]) == l["amount"] for l in ls):
+        return sum(float(l["amount"]) for l in ls)
+    tot = sum((l["amount_exact"] if l.get("amount_exact") is not None and cents(l["amount_exact"]) == l["amount"]
+               else Decimal(l["amount"])) for l in ls)
+    return float(cents(tot))
 
 
 # Descripción que es solo un identificador (código de seguimiento "TBA335177403481", número de
@@ -879,10 +890,17 @@ def qty_matches(qty, unit, amt, exact=None):
 
 
 def table_rows(md):
-    """Celdas de cada fila de las tablas HTML del OCR (regiones)."""
-    return [[re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", c))).strip()
+    """Celdas de cada fila de las tablas del OCR: las HTML (regiones) y las de Markdown con barras del texto de página
+    completa («| 9 | 1000275 | Dr. C. Tuna … | $150.00 |»; 32833: la región leyó otra palabra en la descripción y la
+    fila no se encontraba)."""
+    rows = [[re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", c))).strip()
              for c in re.findall(r"<t[dh][^>]*>(.*?)</t[dh]>", tr, re.S)]
             for tr in re.findall(r"<tr>(.*?)</tr>", md or "", re.S)]
+    for line in (md or "").splitlines():
+        t = line.strip()
+        if t.startswith("|") and t.endswith("|") and t.count("|") >= 3 and not re.fullmatch(r"[|\s:-]+", t):
+            rows.append([c.strip() for c in t[1:-1].split("|")])
+    return rows
 
 
 def qty_from_table(l, rows):
@@ -1783,7 +1801,8 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
                 # como impreso y, si no, lo anota (revisión). Nunca se sustituye por una parte del texto, por 1 ni sin signo.
                 kind = l.get("line_kind") if l.get("line_kind") in LINE_KINDS else "goods"
                 what = f'{"item" if kind == "goods" else kind} «{str(l.get("descripcion", ""))[:40]}»'
-                amt = cents(model_number(l.get("importe_linea"), l.get("importe_valor"), f"amount of {what}", issues))
+                amt_v = model_number(l.get("importe_linea"), l.get("importe_valor"), f"amount of {what}", issues)
+                amt = cents(amt_v)
                 unit_v = model_number(l.get("precio_unitario"), l.get("precio_unitario_valor"), f"unit price of {what}", issues)
                 qty = model_number(l.get("cantidad"), l.get("cantidad_valor"), f"quantity of {what}", issues)
                 if kind == "goods":
@@ -1798,7 +1817,7 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
                 if amt and amt not in ocr_amounts and kind == "goods":
                     issues.append(f'amount {amt} not found in the OCR text ("{l.get("descripcion", "")[:40]}")')
                 lines.append({"desc": l.get("descripcion", "").strip(), "qty": qty,
-                              "amount": amt, "unit": cents(unit_v), "src": "qwen27b", "page_rel": k + 1,
+                              "amount": amt, "amount_exact": amt_v if amt_v is not None and amt_v != amt_v.quantize(amt_v.__class__("0.01")) else None, "unit": cents(unit_v), "src": "qwen27b", "page_rel": k + 1,
                               "unit_exact": exact_unit(l.get("precio_unitario"), md),
                               "neg": bool(amt) and str(l.get("importe_linea", "")).strip().startswith("-") and printed_negative(amt, md),
                               "kind": kind,
@@ -2229,7 +2248,9 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
         "lineas": [goods_line(i, l, divisa, line_ocr(l, pagina=pages[min(l.get("page_rel", 1), len(pages)) - 1] + 1,
                                                     verificado=l["verified"], sq_text=sq_text, extra=l.get("extra")))
                    for i, l in enumerate(lines)],
-        "referencia": inv["ref"],
+        # Sin marcador conocido: el número de pedido de eBay impreso («Order number: 13-15047-54805»; si hay varios, uno
+        # por grupo de artículos del mismo pedido, el primero). No corta facturas: solo la referencia.
+        "referencia": inv["ref"] or next(iter(EBAY_ORDER_RE.findall(md)), ""),
         "ocr": fields,
         # interno (build_all lo retira): las líneas cuadran con un total o subtotal IMPRESO
         "_cuadra": all_ok and total_printed,
@@ -2246,11 +2267,15 @@ def split_by_orders(g0, res, inv, llm_server, vl_server, timeout):
     30276, 31620, 32413). Devuelve las facturas, o None si no hay al menos un grupo que cuadre y otra factura."""
     pages, out, i, pending = inv["pages"], [], 0, []
     quiet = lambda m: None
+
+    def own(pg):  # cada grupo con el número de pedido impreso en SUS páginas (32901: Tire Rack heredaba el de Amazon)
+        ref = next((m.group(1) for k in pg for _, rx in INVOICE_START for m in [rx.search(page_text(res, k))] if m), "")
+        return dict(inv, pages=list(pg), ref=ref, tipo=inv["tipo"] if ref else "")
     abort = []
 
     def flush():
         if pending:  # páginas que no cuadran con nada: una factura, con la lectura visual de siempre
-            doc, _ = build_invoice(g0 + len(out), res, dict(inv, pages=list(pending)), True, llm_server, vl_server,
+            doc, _ = build_invoice(g0 + len(out), res, own(pending), True, llm_server, vl_server,
                                    timeout, quiet)
             # Sin total impreso propio, esas páginas pueden ser el principio del pedido siguiente («Continued on next
             # page», 31272: la última página sola «cuadraba» con su resumen tomado como artículo): no se corta nada.
@@ -2261,7 +2286,7 @@ def split_by_orders(g0, res, inv, llm_server, vl_server, timeout):
     n_ok = 0
     while i < len(pages):
         for end in range(i, len(pages)):
-            doc, source = build_invoice(g0 + len(out) + (1 if pending else 0), res, dict(inv, pages=pages[i:end + 1]),
+            doc, source = build_invoice(g0 + len(out) + (1 if pending else 0), res, own(pages[i:end + 1]),
                                         True, llm_server, vl_server, timeout, quiet, vl=False)
             if source == "llm" and doc["_cuadra"]:
                 flush()

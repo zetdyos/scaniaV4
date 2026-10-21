@@ -30,7 +30,8 @@ def num(s):
 
 
 def fake_llm(markdown, server, timeout, log):
-    page = next((n for n, t in page_md.items() if t == markdown), None)
+    cut = lambda x: x.split("\n### Verificación de importes")[0].rstrip()  # el texto que llega al 27B, con o sin la nota
+    page = next((n for n, t in page_md.items() if cut(t) == cut(markdown)), None)
     t = totals.get(page, "")
     return ({"lineas": replies.get(page, []), "total": t, "total_valor": num(t), "total_is_printed": bool(t)}, "")
 
@@ -105,7 +106,7 @@ for pdf in docs:
         n_inv += 1; ok_old += o["motivo_revision"] == ""; ok_new += w["motivo_revision"] == ""
         if (o["motivo_revision"], o["mismatch"]) != (w["motivo_revision"], w["mismatch"]):
             diffs.append(f"   #{w['id']}: {o['motivo_revision'] or 'ok'} -> {w['motivo_revision'] or 'ok'} | {w['mismatch'][:200]}")
-        h = lambda i: (i["total"], i["ocr"].get("envio"), i["ocr"].get("impuestos"), i["ocr"].get("descuentos"))
+        h = lambda i: (i["total"], i["ocr"].get("envio"), i["ocr"].get("impuestos"), i["ocr"].get("descuentos"), i.get("referencia"))
         if h(o) != h(w):
             diffs.append(f"   #{w['id']} cabecera: {h(o)} -> {h(w)}")
     if len(a) != len(b):
