@@ -1736,8 +1736,17 @@ def fix_block_breaks(lines, pdf, pages, page_texts, log):
             for l, a in zip(on_b, amounts[1:]):
                 log(f"    importe realineado: «{l['desc'][:40]}» {l.get('amount')} -> {a}")
                 l["amount"] = a
-            on_b[-1]["amount"] = ""  # su precio no vino en la respuesta del 27B: sin importe -> revisión
-            log(f"    «{on_b[-1]['desc'][:40]}» queda sin importe (el 27B no devolvió su precio)")
+            last = on_b[-1]
+            key = p1.squash(last["desc"])[:30]
+            same = [l for l in on_b if p1.squash(l["desc"])[:30] == key]
+            if len(same) > 1 and p1.squash(page_texts.get(pages[k + 1], "")).count(key) < len(same):
+                # el 27B repitió esa descripción más veces de las que GLM la leyó en la página: la copia sobrante era la
+                # que llevaba el precio de la cola (30637: «T Shirt Yarn» dos veces); se quita
+                lines.remove(last)
+                log(f"    «{last['desc'][:40]}» repetida por el 27B (en el OCR aparece menos veces), quitada")
+            else:
+                last["amount"] = ""  # su precio no vino en la respuesta del 27B: sin importe -> revisión
+                log(f"    «{last['desc'][:40]}» queda sin importe (el 27B no devolvió su precio)")
             cut["amount"] = p
         else:
             lines.remove(carrier)

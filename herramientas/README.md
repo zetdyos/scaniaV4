@@ -10,6 +10,7 @@ así que **solo se lanzan con WTCP parado** (si no, retrasan sus trabajos: 2026-
 | `regresion_guardado.py DESDE [pdf,pdf]` | Fase 2 del árbol de trabajo frente al `result.json` guardado de los trabajos desde `DESDE` (yyyymmdd-hhmm): válido solo si esos trabajos los procesó el código de HEAD. |
 | `regresion_replay.py [pdf,pdf] [v]` | Fase 2 del commit frente al árbol **sin modelos**: la respuesta del 27B se reconstruye desde result.json (aproximada: sin signo negativo, sin líneas descartadas; VL y PP-OCRv6 apagados). Solo cuenta los documentos donde la versión del commit reproduce lo guardado. |
 | `medir_saltos_final.py lista.txt` | Detección de continuaciones en saltos de página (PP-OCRv6, sin 27B) en una lista de PDF. |
+| `repetir_trabajo.py JOB [JOB…]` | Repite la fase 2 de un trabajo con las respuestas guardadas en `modelos.json` (27B, VL, PP-OCRv6, regiones): **exacto y sin GPU**. Solo trabajos desde el 2026-10-21 08:43. |
 | `cache_ppocr.py lista.txt` | Guarda las cajas de PP-OCRv6 de cada página en `ppocr.json` del trabajo (una vez, ~1 s/página; solo PP-OCRv6). `regresion_replay.py` y `medir_saltos_bloques.py` las leen de ahí. |
 | `medir_saltos_bloques.py lista.txt` | Saltos de página en diseños de bloques (Amazon con fotos): continuaciones detectadas con la geometría guardada, sin modelos. |
 | `badge_crops.py` / `calibra_badge.py` | Recortes de fotos de Amazon y calibración de Qwen2.5-VL para la cantidad sobre la foto (53/53). |
