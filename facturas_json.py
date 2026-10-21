@@ -1612,6 +1612,42 @@ def fix_page_breaks(lines, pdf, pages, page_texts, log):
 BLOCK_PRICE_RE = re.compile(r"^\$\d{1,3}(?:,\d{3})*\.\d{2}$")
 
 
+def row_break(rows_a, rows_b, furn=frozenset()):
+    """Salto en una tabla con la descripción ENCIMA de su fila de importes (FashionGo, 32836), solo geometría: la página
+    A termina con texto en la columna de descripción tras su última fila de importes (descripción abierta) y sin cerrar
+    la tabla (ningún renglón con un importe en la columna de importes: subtotal, total); en B la primera fila de importes
+    llega antes que cualquier texto de esa columna (tras la cabecera); y en A los renglones de texto entre filas quedan
+    más cerca de la fila SIGUIENTE (la encabezan). Sin el marco de página (furn: «Page 1 of 10», «about:blank 1/3»).
+    Entonces esa primera fila de B es del artículo abierto de A. Devuelve ({abierto, fila, importe}, motivo)."""
+    rows_a = [r for r in rows_a if _geo_norm(r["text"]) not in furn]
+    rows_b = [r for r in rows_b if _geo_norm(r["text"]) not in furn]
+    anchors_a = [i for i, r in enumerate(rows_a) if r["money"] >= 2]
+    anchors_b = [i for i, r in enumerate(rows_b) if r["money"] >= 2]
+    if len(anchors_a) < 2 or not anchors_b:
+        return None, "sin filas"
+    amt_x = statistics.median([x0 for x0, _, t in rows_a[i]["toks"] if GEO_MONEY_RE.search(t)][-1] for i in anchors_a)
+    between = [r for a, b in zip(anchors_a, anchors_a[1:]) for r in rows_a[a + 1:b] if r["alpha_x"] and not r["money"]]
+    if not between:
+        return None, "sin descripciones entre filas"
+    col = statistics.median(r["alpha_x"][0] for r in between)
+    in_col = lambda r: bool(r["alpha_x"]) and abs(r["alpha_x"][-1 if r["alpha_x"][0] < col - 40 else 0] - col) <= 40
+    tail = rows_a[anchors_a[-1] + 1:]
+    if any(abs(x0 - amt_x) <= 60 for r in tail for x0, _, t in r["toks"] if GEO_MONEY_RE.search(t)):
+        return None, "la tabla cerró en A"
+    open_txt = [r for r in tail if in_col(r)]
+    if not open_txt:
+        return None, "sin descripción abierta en A"
+    if any(in_col(r) for r in rows_b[:anchors_b[0]] if not r["money"]):
+        return None, "texto antes de la primera fila de B"
+    gap = lambda r1, r2: abs(r2["c"] - r1["c"])
+    ups = [gap(r, rows_a[b]) < gap(rows_a[a], r) for a, b in zip(anchors_a, anchors_a[1:])
+           for r in rows_a[a + 1:b] if r["alpha_x"] and not r["money"]]
+    if sum(ups) <= len(ups) - sum(ups):
+        return None, "las descripciones no encabezan su fila"
+    return {"abierto": " ".join(r["text"] for r in open_txt), "fila": rows_b[anchors_b[0]]["text"],
+            "importe": _row_amount(rows_b[anchors_b[0]])}, "continuación"
+
+
 def block_rows(pdf, page_idx):
     """Renglones de PP-OCRv6 para el diseño de bloques: {c, text, x (borde izquierdo del texto), price (solo un precio
     suelto; lo demás, marcas sin letras de la foto: «*4», «1», «口»)}."""
@@ -1695,6 +1731,7 @@ def fix_block_breaks(lines, pdf, pages, page_texts, log):
     issues = []
     try:
         furn = block_furniture(pdf, pages)
+        furn_rows = page_furniture(pdf, pages)
     except Exception as e:  # noqa: BLE001  sin geometría se queda como estaba
         log(f"  PP-OCRv6 no disponible ({type(e).__name__}): sin comprobación de saltos en bloques")
         return issues
@@ -1705,6 +1742,9 @@ def fix_block_breaks(lines, pdf, pages, page_texts, log):
         on_a = [l for l in goods if l.get("page_rel") == k + 1]
         on_b = [l for l in goods if l.get("page_rel") == k + 2]
         brk = block_break(block_rows(pdf, pages[k]), block_rows(pdf, pages[k + 1]), furn)
+        if not brk:  # tabla con la descripción encima de su fila de importes (row_break, 32836)
+            rb, _ = row_break(ppocr_rows(pdf, pages[k]), ppocr_rows(pdf, pages[k + 1]), furn_rows)
+            brk = {"precio": rb["importe"], "titulo_b": "", "filas": True} if rb and rb["importe"] else None
         if not brk or not on_a:
             continue
         p, where, cut = brk["precio"], f"page {pages[k] + 1}->{pages[k] + 2}", on_a[-1]
@@ -1726,17 +1766,41 @@ def fix_block_breaks(lines, pdf, pages, page_texts, log):
                           f"«{cut['desc'][:40]}»; review the items around the page break")
             continue
         title = brk["titulo_b"]
-        shifted = bool(title) and difflib.SequenceMatcher(
-            None, p1.squash(carrier["desc"])[:25], p1.squash(title)[:25]).ratio() >= 0.8
+        if brk.get("filas"):  # cada descripción encabeza su fila: la primera línea de B con ese importe es la siguiente
+            shifted = p1.squash(carrier["desc"])[:25] != p1.squash(cut["desc"])[:25]
+        else:
+            shifted = bool(title) and difflib.SequenceMatcher(
+                None, p1.squash(carrier["desc"])[:25], p1.squash(title)[:25]).ratio() >= 0.8
         if shifted:  # cada descripción de B toma el importe de la siguiente línea del 27B (su orden se conserva)
             amounts = [l.get("amount") for l in on_b]
             if len(on_b) < 2:
                 issues.append(f"item split by the page break ({where}): prices of the next page shifted by one item; review them")
                 continue
-            for l, a in zip(on_b, amounts[1:]):
-                log(f"    importe realineado: «{l['desc'][:40]}» {l.get('amount')} -> {a}")
-                l["amount"] = a
+            last_amt = on_b[-1].get("amount")
+            # En la tabla de filas (descripción encima de su fila) la cantidad y el precio unitario son de la FILA y se
+            # mueven con el importe; el 27B pegó a cada descripción el texto de la fila de encima («Order 5/11 … $13.20
+            # LRJRH…»): ese principio, hasta el importe de su fila anterior, se quita. En bloques solo se mueve el importe.
+            row_keys = ("amount", "amount_exact", "qty", "unit", "unit_exact", "qty_printed") if brk.get("filas") else ("amount",)
+            vals = [{key: l.get(key) for key in row_keys} for l in on_b]
+            for l, v in zip(on_b, vals[1:]):
+                log(f"    importe realineado: «{l['desc'][:40]}» {l.get('amount')} -> {v['amount']}")
+                if brk.get("filas"):
+                    m = re.search(r"\$?\s?" + re.escape(l.get("amount") or "x") + r"(?![\d])", l["desc"])
+                    if m:
+                        l["desc"] = l["desc"][m.end():].strip() or l["desc"]
+                l.update(v)
+            if brk.get("filas"):
+                cut.update({key: vals[0][key] for key in ("qty", "unit", "unit_exact", "qty_printed") if key in vals[0]})
             last = on_b[-1]
+            if last_amt and printed_count(last_amt, [last["desc"]]):
+                # su «descripción» era la propia fila de importes (no traía descripción debajo, 32836 «Order 11/11 …
+                # $33.00»): el 27B la convirtió en artículo; su importe ya lo lleva la descripción de encima
+                lines.remove(last)
+                log(f"    «{last['desc'][:40]}» era la fila de importes, no un artículo: quitada")
+                cut["amount"] = p
+                if not cut.get("unit"):
+                    cut["unit"] = p if cut.get("qty", 1) == 1 else ""
+                continue
             key = p1.squash(last["desc"])[:30]
             same = [l for l in on_b if p1.squash(l["desc"])[:30] == key]
             if len(same) > 1 and p1.squash(page_texts.get(pages[k + 1], "")).count(key) < len(same):
@@ -1995,6 +2059,17 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
                    for key in ("descuentos", "other_charges")}
         if not fields["subtotal_articulos"]:
             fields["subtotal_articulos"] = items_subtotal
+        # Recuento de eBay en el resumen («1 item $76.00») que el 27B dio como artículo mientras el artículo real (en la
+        # página siguiente, sin precio impreso) quedó sin importe (32697, 32738): si su número coincide con los demás
+        # artículos y ninguno de ellos tiene importe, es el resumen, no un artículo; se aparta (subtotal_or_total) y
+        # el importe del artículo lo decide la regla siguiente (único valor literal que cuadra lo impreso).
+        counts = [l for l in lines if COUNT_ONLY_RE.match(l.get("desc") or "") and l.get("amount")]
+        rest = [l for l in lines if l not in counts]
+        if len(counts) == 1 and rest and not any(l.get("amount") for l in rest) \
+                and int(counts[0]["desc"].split()[0]) == len(rest):
+            lines.remove(counts[0])
+            others.append(dict(counts[0], kind="subtotal_or_total"))
+            log(f"  «{counts[0]['desc']}» {counts[0]['amount']} es el recuento del resumen, no un artículo")
         # Un único artículo sin importe: el importe que cuadra el resumen impreso, si es único y está literal en el OCR.
         missing = [l for l in lines if not l.get("amount")]
         if len(missing) == 1 and len(lines) >= 1:
