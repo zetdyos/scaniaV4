@@ -272,6 +272,9 @@ def process(job_id):
         fps = mark_cross_document_duplicates(job, out, res["markdown"], log)
         (d / "huellas.json").write_text(json.dumps(fps, ensure_ascii=False), encoding="utf-8")
         (d / "result.json").write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
+        # Respuestas crudas de los modelos y regiones de la fase 1: para medir cambios y calibrar sin volver a llamarlos.
+        (d / "modelos.json").write_text(json.dumps(dict(f2.MODEL_RAW, fase1_regiones=res.get("region_pages")),
+                                                   ensure_ascii=False, default=str), encoding="utf-8")
         (d / "ocr.md").write_text(res["markdown"], encoding="utf-8")
         (d / "ocr.html").write_text(mdlib.markdown(res["markdown"], extensions=["tables"]), encoding="utf-8")
         job.update(state="done", progress=100, step="Listo", n_pages=res["n_pages"], n_invoices=len(out),

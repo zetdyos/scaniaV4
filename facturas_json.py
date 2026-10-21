@@ -446,6 +446,14 @@ def count_tokens(server, text):
 
 
 _LLM_CACHE = {}  # (servidor, Markdown de la página) -> respuesta; se vacía por documento en build_all
+# Respuestas crudas de los modelos del último documento (build_all las vacía al empezar): la API las guarda en
+# modelos.json de cada trabajo para medir cambios del código y calibrar los modelos sin volver a llamarlos.
+MODEL_RAW = {"27b": {}, "vl_pagina": {}, "vl_foto": {}, "ppocr": {}}
+
+
+def md_key(markdown):
+    import hashlib
+    return hashlib.sha1((markdown or "").encode("utf-8")).hexdigest()
 
 
 def lines_with_llm(markdown, server, timeout, log):
@@ -495,6 +503,7 @@ def _lines_with_llm(markdown, server, timeout, log):
     rj = post_json(f"{server}/v1/chat/completions", payload, timeout, log=log)
     choice = rj["choices"][0]
     content = re.sub(r"<think>.*?</think>", "", choice["message"]["content"] or "", flags=re.S).strip()
+    MODEL_RAW["27b"][md_key(markdown)] = {"content": content, "finish_reason": choice.get("finish_reason")}
     from decimal import Decimal
     fail = "model output limit reached" if choice.get("finish_reason") == "length" else ""
     try:
@@ -534,6 +543,7 @@ def lines_with_vl(pdf, pages, server, timeout, log):
             rj = post_json(f"{server}/v1/chat/completions", payload, timeout, log=log)
             content = rj["choices"][0]["message"]["content"]
             log(f"  Qwen2.5-VL respuesta p{i + 1}: {content}")  # tal cual, para auditar
+            MODEL_RAW["vl_pagina"][str(i)] = content
             data = json.loads(content)
             for it in data.get("items", []):
                 # El VL devuelve texto (prompt del cookbook): solo se usa una cifra con UNA lectura posible. Vacía o
@@ -785,6 +795,15 @@ def missing_table_rows(page_mds, lines, diff):
 FINE_NUM_RE = re.compile(r"(?<![\d.,])(?:\d{1,3}(?:,\d{3})+|\d+)\.\d{3,5}(?![\d])")
 
 
+def printed_count(amount, texts):
+    """Cuántas veces está impreso un importe ("1234.50") en los textos de página completa del OCR (sin las tablas
+    de regiones, que repiten las cifras): con o sin separador de miles, con punto o coma decimal."""
+    v = float(amount)
+    forms = {f"{v:.2f}", f"{v:,.2f}", f"{v:.2f}".replace(".", ","), f"{v:,.2f}".translate(str.maketrans(",.", ".,"))}
+    pat = re.compile(r"(?<![\d.,])(?:" + "|".join(re.escape(f) for f in forms) + r")(?![\d])")
+    return sum(len(pat.findall(t or "")) for t in texts)
+
+
 def fine_nums(text):
     """Números con 3 a 5 decimales del texto, sin separador de miles ("2,141.040" -> "2141.040")."""
     return [x.replace(",", "") for x in FINE_NUM_RE.findall(text or "")]
@@ -1007,7 +1026,9 @@ def photo_quantity(pdf, page_idx, rect, server, timeout):
                                                  {"type": "text", "text": PHOTO_QTY_PROMPT}]}],
         "temperature": 0, "top_k": 1, "repeat_penalty": 1.05, "cache_prompt": False, "max_tokens": 20,
         "response_format": {"type": "json_schema", "json_schema": {"name": "q", "schema": PHOTO_QTY_SCHEMA}}}, timeout)
-    q = json.loads(rj["choices"][0]["message"]["content"]).get("quantity")
+    raw = rj["choices"][0]["message"]["content"]
+    MODEL_RAW["vl_foto"][f"{page_idx}:{rect.x0:.1f},{rect.y0:.1f},{rect.x1:.1f},{rect.y1:.1f}"] = raw
+    q = json.loads(raw).get("quantity")
     # Fuera de 1..999 o no entero: sin lectura (None), nunca 1 por defecto; esa foto no aporta cantidad.
     return q if isinstance(q, int) and 1 <= q <= 999 else None
 
@@ -1255,6 +1276,7 @@ def ppocr_tokens(pdf, page_idx, timeout=120):
         j = r.json()
         _PPOCR_CACHE[key] = ([(b[0], b[1], b[2], b[3], t.strip()) for t, b in zip(j["texts"], j["boxes"]) if t.strip()],
                              pix.width, pix.height)
+        MODEL_RAW["ppocr"][str(page_idx)] = {"tokens": _PPOCR_CACHE[key][0], "w": pix.width, "h": pix.height}
     return _PPOCR_CACHE[key]
 
 
@@ -1546,6 +1568,7 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
     sq_text = p1.squash(md) + "|" + p1.squash(html.unescape(re.sub(r"<[^>]+>", " ", md)))
     divisa = currency_of(md)
     issues = []
+    header_open = False  # cabecera (vía 27B, sin subtotal impreso) que no cerró: se comprueba al final
     # Con qué deben cuadrar las líneas: el "Item(s) Subtotal" del pedido. El formato de escritorio
     # de Amazon imprime uno por envío y el global al final (caja de pago): se toma el último.
     subs = ITEMS_SUBTOTAL_RE.findall(md)
@@ -1624,11 +1647,29 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
         backed_totals = [d for d in model_totals if d["_total"] in ocr_amounts]
         model_total = (backed_totals or model_totals or [None])[-1]
         t = model_total["_total"] if model_total else ""
+        # Lo pagado (cobro a tarjeta, tarjeta regalo, saldo pendiente) es información aparte: el total que va a WTCP es
+        # el valor del pedido (declaraciones, seguro), no lo que quedó por pagar (decisión del usuario 2026-10-21; 32328:
+        # el 27B dio «Balance Due $0.00» como total). Con líneas `payment`, sus líneas subtotal_or_total literales también
+        # son candidatas a total; en el cuadre de la cabecera gana la primera que cierra (un «TOTAL DUE» sin nada pagado
+        # sigue valiendo: 31206).
+        paid = {l["amount"] for l in lines if l.get("kind") == "payment" and l.get("amount")}
+        sub_totals = []
+        if paid:  # con pagos impresos, el total impreso puede ser el que queda tras ellos (Amazon: Grand Total tras la tarjeta regalo)
+            sub_totals = [l["amount"] for l in reversed(lines) if l.get("kind") == "subtotal_or_total" and l.get("amount")
+                          and l["amount"] in ocr_amounts and float(l["amount"]) > 0 and l["amount"] not in total_cands]
         if t and t in ocr_amounts and t not in total_cands:
             total_cands.append(t)
+        total_cands += [v for v in dict.fromkeys(sub_totals) if v not in total_cands]
         if t and not total:
             if t in ocr_amounts:
                 total, total_printed = t, bool(model_total.get("total_is_printed", True))
+                # Sin etiqueta de total, la cifra del 27B solo prueba un total si está impresa además de como importe
+                # de un artículo (31865: página suelta sin resumen; el 27B dio el precio del único artículo como
+                # total y la suma «cuadraba» consigo misma). Si no, es un documento sin total impreso -> revisión.
+                if total_printed and printed_count(t, [res["full_text"].get(i) or "" for i in pages]) <= sum(
+                        l.get("amount") == t for l in lines if l.get("kind", "goods") == "goods"):
+                    total_printed = False
+                    log(f"  total del 27B {t}: solo impreso como importe de un artículo; no cuenta como total impreso")
             else:
                 issues.append(f"total {t} returned by the model not found in the OCR text")
         source = "llm"
@@ -1715,8 +1756,12 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
         for key, kind in (("envio", "shipping"), ("impuestos", "tax")):
             amts = list(dict.fromkeys(l["amount"] for l in backed if l["kind"] == kind))
             from_llm = f"{sum(float(a) for a in amts):.2f}" if amts else ""
-            # candidatos: el de la etiqueta, el del 27B y "sin cargo"; se queda el que cuadre el resumen
-            cands[key] = list(dict.fromkeys([v for v in (fields[key], from_llm) if v] + [""]))
+            # candidatos: el de la etiqueta, el del 27B y "sin cargo"; se queda el que cuadre el resumen. «Sin cargo» no
+            # si el 27B devolvió ese envío/impuesto impreso distinto de 0 con respaldo literal: no se desecha para hacer
+            # cuadrar (32862, 32357: líneas con el impuesto dentro cuadraban «sin impuesto»). La etiqueta sola no lo
+            # impide: sin importe a su lado toma la cifra siguiente (31397 p2: «Shipping» -> 31.89, el del artículo).
+            cands[key] = list(dict.fromkeys([v for v in (fields[key], from_llm) if v]
+                                            + ([] if from_llm and float(from_llm) else [""])))
         # Descuentos y otros cargos: el mismo mecanismo que envío e impuestos. Candidatos en orden: la lista de las
         # etiquetas y la de las líneas del 27B con importe literal en el OCR; se queda la primera con la que cuadra el
         # resumen (ver choose_header más abajo). Antes, si las etiquetas encontraban algo («FG Coupon Discount -$0.00»),
@@ -1729,10 +1774,11 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
                                "importe": k[1]} for k in seen]
             if not fields[key]:
                 fields[key] = list(llm_lists[key])
-        # Créditos: un "cargo" o "pago" impreso en NEGATIVO ("Refund -$48.15", "Gift Card Amount -$14.99") resta del
-        # total; el signo es el del documento. Van con los descuentos (importe en positivo), como candidatos del cuadre.
+        # Créditos: un "cargo" impreso en NEGATIVO ("Refund -$48.15") resta del total; el signo es el del documento. Va
+        # con los descuentos (importe en positivo), como candidato del cuadre. Un PAGO no («Gift Card Amount», «Store
+        # Credit», «Payments/Credits»): es información aparte, el total es el valor del pedido (usuario, 2026-10-21).
         for l in backed:
-            if l.get("neg") and l["kind"] in ("other_charges", "payment"):
+            if l.get("neg") and l["kind"] == "other_charges":
                 for lst in (fields["descuentos"], llm_lists["descuentos"]):
                     if not any(d["importe"] == l["amount"] for d in lst):
                         lst.append({"concepto": l["desc"], "importe": l["amount"]})
@@ -1770,6 +1816,7 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
                 if tc != total:
                     log(f"  total impreso que cuadra el resumen: {tc} (en vez de {total})")
                 total = tc
+                total_printed = total_printed or tc in sub_totals  # línea de total del 27B, literal en el OCR
                 break
         if pick:
             fields["envio"], fields["impuestos"], fields["descuentos"], fields["other_charges"] = pick
@@ -1780,6 +1827,8 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
             if items_subtotal and total and base is not None:
                 issues.append(f"order summary does not add up: items {base:.2f} + shipping + tax + other charges "
                               f"- discounts does not match total {total}")
+            else:  # sin subtotal impreso: se vuelve a comprobar al final, con las líneas ya completas (filas de tabla, VL)
+                header_open = True
         # Sin subtotal de artículos impreso, la cuenta completa de la cabecera también cuadra la factura:
         # artículos + envío + impuestos + otros cargos − descuentos = total (todos los importes leídos del OCR).
         extra = (float(fields["envio"] or 0) + float(fields["impuestos"] or 0)
@@ -1953,11 +2002,25 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
     # Sin total impreso, la suma de las líneas comparada consigo misma siempre "cuadra": no prueba que la lista esté
     # completa. Solo un subtotal de artículos impreso con el que cuadren las líneas lo prueba; si no, revisión
     # (decisión del usuario 2026-10-20: nunca fabricar; el total que va a WTCP es la suma, total_is_printed false).
-    if lines and not total_printed and not (items_subtotal and lines_sum(lines) is not None
-                                            and abs(lines_sum(lines) - float(items_subtotal)) < 0.01):
+    # La excepción del subtotal solo vale si la cabecera no tiene cargos ni descuentos: con ellos el total a WTCP no
+    # es la suma de las líneas y no está impreso (30887: descuento 74.72; total enviado 747.18, impreso 672.46).
+    charged = any(float(fields.get(k) or 0) for k in ("envio", "impuestos")) or any(
+        float(c.get("importe") or 0) for c in (fields.get("descuentos") or []) + (fields.get("other_charges") or []))
+    if lines and not total_printed and (charged or not (items_subtotal and lines_sum(lines) is not None
+                                                        and abs(lines_sum(lines) - float(items_subtotal)) < 0.01)):
         issues.append("no printed total: the item list cannot be checked for completeness; review against the paper")
     if target and lines_sum(lines) is not None and abs(lines_sum(lines) - float(target)) >= 0.01:
         issues.append(f"sum of lines {lines_sum(lines):.2f} vs " + ("items subtotal" if items_subtotal else "total") + f" {target}")
+    elif header_open and total and total_printed and lines_sum(lines) is not None:
+        # Sin subtotal impreso, las líneas pueden igualar el total y la cabecera no cerrar (líneas con el impuesto
+        # dentro: 32862, 32357): la cabecera también va a WTCP, así que nunca sin revisión.
+        pick = next((p for d_opt, o_opt in itertools.product(options["descuentos"], options["other_charges"])
+                     for p in [choose_header(lines_sum(lines), float(total), cands, d_opt, o_opt)] if p), None)
+        if pick:
+            fields["envio"], fields["impuestos"], fields["descuentos"], fields["other_charges"] = pick
+        else:
+            issues.append(f"order summary does not add up: items {lines_sum(lines):.2f} + shipping + tax + other "
+                          f"charges - discounts does not match total {total}")
     # Sin marcador de pedido y sin ninguna línea: no parece una factura de mercadería (albarán,
     # confirmación de envío, recibo de pago...). Lo decide una persona: nunca se descarta en silencio.
     estructura = not inv["tipo"] and not lines and not read_failed
@@ -2058,6 +2121,8 @@ def build_all(res, use_llm=True, llm_server=QWEN27_SERVER, vl_server=VL_SERVER, 
     log = log or (lambda m: print(m, file=sys.stderr))
     _LLM_CACHE.clear()
     _PPOCR_CACHE.clear()
+    for v in MODEL_RAW.values():
+        v.clear()
     invoices = split_invoices(res)
     log(f"  {len(invoices)} factura(s) detectada(s): " + ", ".join(
         f"{inv['tipo'] or '?'} {inv['ref'] or 'sin ref'} p{inv['pages'][0] + 1}-{inv['pages'][-1] + 1}" for inv in invoices))
