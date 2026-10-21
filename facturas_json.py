@@ -81,8 +81,10 @@ import itertools
 import json
 import os
 import re
+import statistics
 import sys
 import time
+from collections import Counter
 from pathlib import Path
 
 import fitz  # PyMuPDF
@@ -1550,6 +1552,149 @@ def fix_page_breaks(lines, pdf, pages, page_texts, log):
     return issues
 
 
+# Saltos de página en diseños de BLOQUES (Amazon con fotos y parecidos): cada artículo es un bloque de renglones en una
+# columna de texto que termina en un renglón con solo el precio («$16.98»). El corte deja el bloque abierto al pie de la
+# página A (sin su precio) y la cola con el precio arriba de la B. Medido el 2026-10-21 sobre 850 saltos de 341 PDF:
+# 16 continuaciones, todas reales contra la imagen (herramientas/medir_saltos_bloques.py).
+BLOCK_PRICE_RE = re.compile(r"^\$\d{1,3}(?:,\d{3})*\.\d{2}$")
+
+
+def block_rows(pdf, page_idx):
+    """Renglones de PP-OCRv6 para el diseño de bloques: {c, text, x (borde izquierdo del texto), price (solo un precio
+    suelto; lo demás, marcas sin letras de la foto: «*4», «1», «口»)}."""
+    raw, _, _ = ppocr_tokens(pdf, page_idx)
+    rows = []
+    for y0, x0, x1, y1, t in sorted((y0, x0, x1, y1, t) for x0, y0, x1, y1, t in raw):
+        c = (y0 + y1) / 2
+        if rows and abs(rows[-1]["c"] - c) <= 10:
+            rows[-1]["toks"].append((x0, x1, t)); rows[-1]["c"] = (rows[-1]["c"] + c) / 2
+        else:
+            rows.append({"c": c, "toks": [(x0, x1, t)]})
+    for r in rows:
+        r["toks"].sort()
+        r["text"] = " ".join(t for _, _, t in r["toks"])
+        prices = [(x0, t) for x0, _, t in r["toks"] if BLOCK_PRICE_RE.match(t)]
+        rest = [t for _, _, t in r["toks"] if not BLOCK_PRICE_RE.match(t)]
+        r["price"] = money(prices[0][1]) if len(prices) == 1 and all(
+            len(t) <= 3 and not re.search(r"[A-Za-z]", t) for t in rest) else ""
+        words = [x0 for x0, _, t in r["toks"] if re.search(r"[A-Za-z]{3,}", t)]
+        r["x"] = prices[0][0] if r["price"] else (words[0] if words else r["toks"][0][0])
+    return rows
+
+
+def block_break(rows_a, rows_b, furn):
+    """Continuación de un bloque partido entre A y B, solo por geometría: {precio, titulo_b (primer renglón del primer
+    bloque propio de B)} o None. Condiciones: los precios de B en la columna de A; bloque abierto al pie de A (renglones
+    de la columna tras su último precio); antes del primer precio de B solo renglones de esa columna, sin importes (un
+    renglón con nombre e importe es otro artículo: 31183); abierto + cola no más largo que el mayor bloque del documento
+    (+1): si no, en B empieza otro artículo."""
+    norm = lambda t: re.sub(r"[^a-z]", "", t.lower())
+    a = [r for r in rows_a if r["price"] or norm(r["text"]) not in furn]
+    b = [r for r in rows_b if r["price"] or norm(r["text"]) not in furn]
+    pa = [i for i, r in enumerate(a) if r["price"]]
+    pb = [i for i, r in enumerate(b) if r["price"]]
+    if len(pa) < 2 or not pb:
+        return None
+    col = statistics.median(a[i]["x"] for i in pa)
+    in_col = lambda r: abs(r["x"] - col) <= 25
+    if not in_col(b[pb[0]]):
+        return None
+    open_a = [r for r in a[pa[-1] + 1:] if in_col(r)]
+    tail_b = [r for r in b[:pb[0]] if in_col(r)]
+    if not open_a or any(not in_col(r) for r in b[:pb[0]] if re.search(r"[A-Za-z]{2,}|\$\d", r["text"])) \
+            or any(re.search(r"\$\s?\d", r["text"]) for r in tail_b):
+        return None
+    sizes = []
+    for rows in (a, b):
+        cur, started = 0, False
+        for r in rows:
+            if in_col(r):
+                cur += 1
+                if r["price"]:
+                    if started and cur >= 2:  # 1 renglón = una cifra del resumen, no un artículo
+                        sizes.append(cur)
+                    started, cur = True, 0
+    if not sizes or len(open_a) + len(tail_b) + 1 > max(sizes) + 1:
+        return None
+    nxt = next((r for r in b[pb[0] + 1:] if in_col(r) and not r["price"]), None)
+    return {"precio": b[pb[0]]["price"], "titulo_b": nxt["text"] if nxt else ""}
+
+
+def block_furniture(pdf, pages):
+    """Marco de página (cabecera/pie repetidos en 2+ páginas: fecha, «Order Details», URL): texto sin cifras de los 3
+    primeros y 3 últimos renglones de cada página."""
+    seen = Counter()
+    for p in pages:
+        rows = block_rows(pdf, p)
+        seen.update({re.sub(r"[^a-z]", "", r["text"].lower()) for r in rows[:3] + rows[-3:]} - {""})
+    return {t for t, n in seen.items() if n >= 2}
+
+
+def fix_block_breaks(lines, pdf, pages, page_texts, log):
+    """Artículo partido por el salto en el diseño de bloques (ver block_break). Las cifras y descripciones son las del
+    27B; la geometría solo dice a qué artículo pertenece cada una:
+      - el precio que quedó arriba de B es del último artículo de A. Si el 27B lo dejó sin importe y en B devolvió una
+        línea con ese importe, el importe pasa al artículo de A y esa línea se quita: era la cola (sin título propio) o,
+        si su descripción es el título del primer bloque de B, el 27B CORRIÓ los precios de B un artículo y se devuelven
+        a su sitio en orden (cada descripción de B toma el importe siguiente; 30637, 31728);
+      - el precio debe estar impreso en el texto de GLM de B. Si algo no encaja (la última descripción corrida queda sin
+        importe, el artículo de A ya tenía otro importe...), no se cambia nada y la factura va a revisión."""
+    issues = []
+    try:
+        furn = block_furniture(pdf, pages)
+    except Exception as e:  # noqa: BLE001  sin geometría se queda como estaba
+        log(f"  PP-OCRv6 no disponible ({type(e).__name__}): sin comprobación de saltos en bloques")
+        return issues
+    for k in range(len(pages) - 1):
+        if pages[k + 1] != pages[k] + 1:
+            continue
+        goods = [l for l in lines if l.get("kind", "goods") == "goods"]
+        on_a = [l for l in goods if l.get("page_rel") == k + 1]
+        on_b = [l for l in goods if l.get("page_rel") == k + 2]
+        brk = block_break(block_rows(pdf, pages[k]), block_rows(pdf, pages[k + 1]), furn)
+        if not brk or not on_a:
+            continue
+        p, where, cut = brk["precio"], f"page {pages[k] + 1}->{pages[k] + 2}", on_a[-1]
+        log(f"  salto {where}: bloque partido; {p} (arriba de la página siguiente) es de «{cut['desc'][:45]}» (geometría PP-OCRv6)")
+        if cut.get("amount") == p:
+            continue
+        carrier = next((l for l in on_b if l.get("amount") == p), None)
+        printed = printed_count(p, [page_texts.get(pages[k + 1], "")]) >= 1
+        if not cut.get("amount") and carrier is None and printed:
+            # el 27B no devolvió ese precio en ninguna línea de B (sin título no lo tomó por artículo): es la cifra que GLM
+            # leyó arriba de B, y la geometría dice de qué artículo es (30703, 32431, 30972)
+            cut["amount"] = p
+            if not cut.get("unit") and cut.get("qty", 1) == 1:
+                cut["unit"] = p
+            log(f"    importe {p} (impreso arriba de la página siguiente) para «{cut['desc'][:40]}»")
+            continue
+        if cut.get("amount") or carrier is None or not printed or carrier is not on_b[0]:
+            issues.append(f"item split by the page break ({where}): the price {p} at the top of the next page belongs to "
+                          f"«{cut['desc'][:40]}»; review the items around the page break")
+            continue
+        title = brk["titulo_b"]
+        shifted = bool(title) and difflib.SequenceMatcher(
+            None, p1.squash(carrier["desc"])[:25], p1.squash(title)[:25]).ratio() >= 0.8
+        if shifted:  # cada descripción de B toma el importe de la siguiente línea del 27B (su orden se conserva)
+            amounts = [l.get("amount") for l in on_b]
+            if len(on_b) < 2:
+                issues.append(f"item split by the page break ({where}): prices of the next page shifted by one item; review them")
+                continue
+            for l, a in zip(on_b, amounts[1:]):
+                log(f"    importe realineado: «{l['desc'][:40]}» {l.get('amount')} -> {a}")
+                l["amount"] = a
+            on_b[-1]["amount"] = ""  # su precio no vino en la respuesta del 27B: sin importe -> revisión
+            log(f"    «{on_b[-1]['desc'][:40]}» queda sin importe (el 27B no devolvió su precio)")
+            cut["amount"] = p
+        else:
+            lines.remove(carrier)
+            cut["amount"] = p
+            log(f"    «{carrier['desc'][:40]}» era la cola del artículo partido, no un artículo")
+        if not cut.get("unit"):
+            cut["unit"] = p if cut.get("qty", 1) == 1 else ""
+    return issues
+
+
 def unit_price_candidates(lines):
     """Líneas de artículo con cantidad > 1 y un solo precio impreso (sin precio unitario distinto del importe): en ellas
     el importe impreso puede ser el total de la línea o el precio de UNA unidad («$9.49 x2»)."""
@@ -1677,6 +1822,7 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
             glm_pages = {i: html.unescape(re.sub(r"<[^>]+>", " ", p1.page_markdown(i + 1, res["full_text"].get(i) or "", regs)[0]))
                          for i, regs in zip(pages, regions)}
             issues += fix_page_breaks(lines, res["pdf"], pages, glm_pages, log)
+            issues += fix_block_breaks(lines, res["pdf"], pages, glm_pages, log)
     else:
         lines, source = [], "ninguna"
         issues.append("no shipment blocks and model extraction disabled")

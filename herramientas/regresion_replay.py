@@ -35,12 +35,26 @@ def fake_llm(markdown, server, timeout, log):
     return ({"lineas": replies.get(page, []), "total": t, "total_valor": num(t), "total_is_printed": bool(t)}, "")
 
 
+CUR = {}
+
+
+def cached_ppocr(pdf, page_idx, timeout=120):
+    """PP-OCRv6 desde ppocr.json del trabajo (herramientas/cache_ppocr.py); sin él, como si el servicio no respondiera."""
+    f = Path(pdf).parent / "ppocr.json"
+    if f not in CUR:
+        CUR[f] = json.loads(f.read_text(encoding="utf-8")) if f.exists() else None
+    if not CUR[f] or str(page_idx) not in CUR[f]:
+        raise RuntimeError("sin PP-OCRv6 guardado")
+    pg = CUR[f][str(page_idx)]
+    return [tuple(t) for t in pg["tokens"]], pg["w"], pg["h"]
+
+
 for mod in (new, old):
     mod.lines_with_llm = fake_llm
     mod.lines_with_vl = lambda *a, **k: ([], "")
     if hasattr(mod, "photo_quantities"):
         mod.photo_quantities = lambda *a, **k: None
-    mod.ppocr_tokens = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("sin PP-OCRv6 en la reconstrucción"))
+    mod.ppocr_tokens = cached_ppocr
     mod.post_json = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("sin modelos en la reconstrucción"))
 
 docs = sys.argv[1].split(",") if len(sys.argv) > 1 else list(latest)
