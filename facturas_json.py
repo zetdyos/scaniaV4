@@ -146,7 +146,7 @@ SYSTEM_PROMPT = ("You extract purchase line items from the OCR text of invoices 
 USER_PROMPT = ("OCR text of the document (Markdown; HTML tables are regions detected separately):\n\n{doc}\n\n"
                "Return every line of the document that carries an amount: each purchased item AND each amount of "
                "the order summary or totals section (in whatever language it is printed), with: descripcion (product name as printed), cantidad (quantity as "
-               "printed, or \"1\" when a single unit is implied), importe_linea (the amount printed for that line), "
+               "printed, or \"1\" when a single unit is implied), importe_linea (the amount printed for that line; when the line shows both an amount before tax and a total that includes tax, use the amount before tax), "
                "divisa (ISO 4217 code; use USD for $), precio_unitario (unit price if printed, else \"\"), vendedor "
                "(seller name after 'Sold by', else \"\"), seguimiento (tracking number printed for that item, else \"\"), "
                "estado_envio (delivery status text printed for that item such as 'Delivered October 8', else \"\"), "
@@ -487,6 +487,7 @@ def count_tokens(server, text):
     return len(requests.post(f"{server}/tokenize", json={"content": text}, timeout=30).json().get("tokens", []))
 
 
+VERIF_HEADER = "\n### Verificación de importes"  # sección de diagnóstico que la fase 1 añade al Markdown de cada página
 _LLM_CACHE = {}  # (servidor, Markdown de la página) -> respuesta; se vacía por documento en build_all
 # Respuestas crudas de los modelos del último documento (build_all las vacía al empezar): la API las guarda en
 # modelos.json de cada trabajo para medir cambios del código y calibrar los modelos sin volver a llamarlos.
@@ -1931,7 +1932,12 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
         log(f"  sin bloques de envío: extracción de líneas con Qwen3.6-27B, página por página ({len(pages)})")
         lines, model_totals, model_currencies = [], [], set()
         for k, (i, regs) in enumerate(zip(pages, regions)):
-            data, fail = lines_with_llm(p1.page_markdown(i + 1, res["full_text"].get(i) or "", regs)[0], llm_server, timeout, log)
+            # Al 27B va el texto de la página y sus tablas, sin la nota «### Verificación de importes» de la fase 1: es un
+            # diagnóstico, no parte del documento (31940: la tomó como un cargo). Las comprobaciones de literalidad siguen
+            # usando el Markdown completo. Calibrado el 2026-10-21 (con la frase del importe antes de impuestos del prompt):
+            # 68 documentos auditados, 88 -> 92 facturas sin revisión, todas correctas, sin empeorar ninguna.
+            page_md = p1.page_markdown(i + 1, res["full_text"].get(i) or "", regs)[0]
+            data, fail = lines_with_llm(page_md.split(VERIF_HEADER)[0].rstrip(), llm_server, timeout, log)
             if fail:  # incompleta: van las líneas que llegó a escribir enteras (si hay) y la factura a revisión
                 read_failed = True
                 issues.append(f"item list on page {i + 1} could not be read completely ({fail}); review against the paper")
