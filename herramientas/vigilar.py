@@ -9,7 +9,7 @@ last_busy_report = 0
 
 
 JOBS = str(__import__("pathlib").Path(__file__).resolve().parents[1] / "demo_jobs")
-DEPLOY = "20261021-1122"  # despliegue de 7bbc043 (calibración del VL: cantidad en la foto, foto por geometría): los trabajos anteriores son la referencia
+DEPLOY = "20261021-1754"  # despliegue de f96ebdc (27B calibrado: sin la nota de verificación, importe antes de impuestos): los trabajos anteriores son la referencia
 
 
 def summary(job_id):
