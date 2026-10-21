@@ -26,10 +26,23 @@ def fake_ppocr(pdf, page_idx, timeout=120):
     return [tuple(t) for t in pg["tokens"]], pg["w"], pg["h"]
 
 
+real_photo = f2.photo_quantity
+
+
 def fake_photo(pdf, page_idx, rect, server, timeout):
-    q = RAW["vl_foto"].get(f"{page_idx}:{rect.x0:.1f},{rect.y0:.1f},{rect.x1:.1f},{rect.y1:.1f}")
-    q = json.loads(q).get("quantity") if q else None
-    return q if isinstance(q, int) and 1 <= q <= 999 else None
+    """La lógica real de photo_quantity con las respuestas guardadas (pregunta cerrada y, si la hubo, la de la esquina)."""
+    key = f"{page_idx}:{rect.x0:.1f},{rect.y0:.1f},{rect.x1:.1f},{rect.y1:.1f}"
+    answers = [RAW["vl_foto"].get(key), RAW["vl_foto"].get(key + ":esquina")]
+    if answers[0] is None:
+        return None
+    it = iter(answers)
+    saved, img = f2.post_json, f2._vl_image
+    f2.post_json = lambda *a, **k: {"choices": [{"message": {"content": next(it) or ""}}]}
+    f2._vl_image = lambda *a: ""
+    try:
+        return real_photo(pdf, page_idx, rect, server, timeout)
+    finally:
+        f2.post_json, f2._vl_image = saved, img
 
 
 real_vl = f2.lines_with_vl

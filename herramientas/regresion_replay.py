@@ -3,7 +3,7 @@ desde el result.json guardado (líneas con su line_kind, descripción, cantidad,
 cambios que actúan DESPUÉS del 27B (cabecera, cuadre, división). Aproximada: no conserva el total del propio 27B, el
 signo negativo de los cargos ni las líneas que el código descartó; el rescate VL y los recortes de foto se desactivan
 (dan lo mismo en las dos versiones). Uso: regresion_replay.py [pdf,pdf]   (sin lista: todos los trabajos vía 27B)"""
-import importlib.util, json, sys
+import importlib.util, json, os, sys
 from pathlib import Path
 REPO = Path(r"C:\Users\LERIT\scaniaV4"); S = Path(__file__).parent
 sys.path.insert(0, str(REPO))
@@ -50,11 +50,14 @@ def cached_ppocr(pdf, page_idx, timeout=120):
     return [tuple(t) for t in pg["tokens"]], pg["w"], pg["h"]
 
 
+if os.environ.get("REPLAY_FOTOS"):
+    p1.server_ok = lambda url: True
 for mod in (new, old):
     mod.lines_with_llm = fake_llm
     mod.lines_with_vl = lambda *a, **k: ([], "")
     if hasattr(mod, "photo_quantities"):
-        mod.photo_quantities = lambda *a, **k: None
+        if not os.environ.get("REPLAY_FOTOS"):  # con REPLAY_FOTOS, la lectura de fotos la da quien llama (photo_quantity)
+            mod.photo_quantities = lambda *a, **k: None
     mod.ppocr_tokens = cached_ppocr
     mod.post_json = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("sin modelos en la reconstrucción"))
 

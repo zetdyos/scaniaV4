@@ -13,6 +13,7 @@ así que **solo se lanzan con WTCP parado** (si no, retrasan sus trabajos: 2026-
 | `repetir_trabajo.py JOB [JOB…]` | Repite la fase 2 de un trabajo con las respuestas guardadas en `modelos.json` (27B, VL, PP-OCRv6, regiones): **exacto y sin GPU**. Solo trabajos desde el 2026-10-21 08:43. |
 | `cache_ppocr.py lista.txt` | Guarda las cajas de PP-OCRv6 de cada página en `ppocr.json` del trabajo (una vez, ~1 s/página; solo PP-OCRv6). `regresion_replay.py` y `medir_saltos_bloques.py` las leen de ahí. |
 | `medir_saltos_bloques.py lista.txt` | Saltos de página en diseños de bloques (Amazon con fotos): continuaciones detectadas con la geometría guardada, sin modelos. |
+| `fotos_verdad.py dir lista.txt` / `calibra_fotos.py dir variante…` | Conjunto de calibración de la cantidad en la foto con el localizador de producción (recortes, hojas de contacto, verdad.json a mano) y medida de variantes de Qwen2.5-VL (respuestas guardadas por variante). |
 | `badge_crops.py` / `calibra_badge.py` | Recortes de fotos de Amazon y calibración de Qwen2.5-VL para la cantidad sobre la foto (53/53). |
 
 Regla del usuario: medir solo en las facturas donde el cambio puede aplicar, no en las que no pueden cambiar.

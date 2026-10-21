@@ -1030,7 +1030,7 @@ def vl_quantities(lines, vl_lines, literal, sq_text, goal):
 # $318.35) y fundía artículos repetidos (11/19); con el RECORTE de la foto + pregunta cerrada (JSON entero) a >= 1024
 # fichas de imagen (aviso de llama.cpp clip.cpp para Qwen-VL, issue 16842), 53/53. repeat_penalty y gramática: sin efecto.
 # La foto se localiza con PP-OCRv6: bloque «Sold by» alineado a la izquierda con el precio suelto debajo.
-PHOTO_PRICE_RE = re.compile(r"^\$\d{1,3}(?:,\d{3})*\.\d{2}$")
+PHOTO_PRICE_RE = re.compile(r"^(?:US)?\$\d{1,3}(?:,\d{3})*\.\d{2}$")  # «$19.99», «US$59.99» (Amazon en español)
 PHOTO_QTY_PROMPT = ("This is the photo of one purchased item from an order page. If a small number badge printed on the "
                     "photo shows how many units were bought, return that number as quantity. If there is no such badge, "
                     "return 1.")
@@ -1043,6 +1043,8 @@ def item_photos(pdf, page_idx):
     del bloque (descripción, vendedor, precio)."""
     toks, _, height = ppocr_tokens(pdf, page_idx)
     sold = [t for t in toks if t[4].lower().startswith("sold by")]
+    if not sold:
+        return block_photos(pdf, page_idx, height)
     out = []
     for x0, y0, x1, y1, t in sorted(toks, key=lambda t: (t[1], t[0])):
         if not PHOTO_PRICE_RE.match(t):
@@ -1063,23 +1065,82 @@ def item_photos(pdf, page_idx):
     return out
 
 
-def photo_quantity(pdf, page_idx, rect, server, timeout):
-    """Cantidad pintada en la foto según Qwen2.5-VL (el prompt le pide 1 si no hay); None si su respuesta no es un entero
-    de 1 a 999. Recorte renderizado desde el PDF a >= 1024 fichas."""
+PHOTO_OCR_PROMPT = "Read all the text in the image."  # prompt de OCR del cookbook oficial de Qwen2.5-VL
+
+
+def badge_text_number(raw):
+    """Número de la lectura OCR de la esquina: el contenido (bloque de código, entre comillas o tal cual) es SOLO un
+    entero 1-999 -> ese entero; sin ningún entero -> 0; otra cosa -> None."""
+    m = re.search(r"```\s*\n?(.*?)\n?```", raw or "", re.S) or re.search(r'"([^"]*)"', raw or "")
+    c = (m.group(1) if m else raw or "").strip()
+    if re.fullmatch(r"\d{1,3}", c) and 1 <= int(c) <= 999:
+        return int(c)
+    return None if re.search(r"(?<![\d.,])\d{1,3}(?![\d.,%])", c) else 0
+
+
+def _vl_image(pdf, page_idx, rect):
     area = (rect.width / 72) * (rect.height / 72)
     dpi = int(min(max(200, (1024 * 28 * 28 / area) ** 0.5), (4096 * 28 * 28 / area) ** 0.5))
     with fitz.open(pdf) as doc:
-        img = base64.b64encode(doc[page_idx].get_pixmap(dpi=dpi, clip=rect, alpha=False).tobytes("png")).decode("ascii")
+        return base64.b64encode(doc[page_idx].get_pixmap(dpi=dpi, clip=rect, alpha=False).tobytes("png")).decode("ascii")
+
+
+def block_photos(pdf, page_idx, height):
+    """Fotos de artículo sin la etiqueta «Sold by» (otro idioma: «Vendido por», 32079): por la geometría del bloque. El
+    artículo es un bloque de renglones en la columna de texto que termina en el renglón del precio suelto (block_rows);
+    su principio es el primer renglón de la columna tras el precio anterior (como mucho 7 renglones). La foto está a la
+    izquierda del bloque, de su altura, como en item_photos."""
+    rows = block_rows(pdf, page_idx)
+    prices = [i for i, r in enumerate(rows) if r["price"]]
+    out = []
+    for n, i in enumerate(prices):
+        col = rows[i]["x"]
+        top = rows[i]
+        for r in reversed(rows[(prices[n - 1] + 1) if n else 0:i]):
+            if not re.search(r"[A-Za-z]{2,}", r["text"]):
+                continue  # marcas de la foto (la cantidad «2», iconos): no son el borde del bloque
+            if abs(r["x"] - col) > 25 or rows[i]["c"] - r["c"] > 260:
+                break
+            top = r
+        if top is rows[i]:
+            continue  # precio sin texto encima: una cifra del resumen, no un artículo
+        y0, y1 = top["c"] - 20, rows[i]["c"] + 20
+        h = (y1 + 45) - (y0 - 15)
+        box = (max(0, col - 1.15 * h), max(0, y0 - 15), col - 8, min(height, y1 + 45))
+        if box[2] - box[0] > 20:
+            out.append((rows[i]["price"], fitz.Rect(*(v * 72 / PPOCR_DPI for v in box))))
+    return out
+
+
+def photo_quantity(pdf, page_idx, rect, server, timeout):
+    """Cantidad pintada en la foto según Qwen2.5-VL; None si no hay lectura fiable. Recortes a >= 1024 fichas.
+    1) Pregunta cerrada sobre la foto entera (esquema JSON entero; 1 si no hay número).
+    2) Si responde > 1, se comprueba con el prompt de OCR del cookbook sobre la esquina inferior derecha de la foto (donde
+       Amazon pinta la cantidad): se acepta solo si esa lectura es exactamente el mismo número. La pregunta cerrada sola
+       cuenta las unidades DIBUJADAS en el producto («3 botellas») o lee números del envase («40 Page», «8PCS»): 19 falsos
+       en 202 fotos con verdad a mano (2026-10-21); con la comprobación, 0 falsos y 188/202 (antes 180/202)."""
     rj = post_json(f"{server}/v1/chat/completions", {
-        "messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img}"}},
+        "messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": f"data:image/png;base64,{_vl_image(pdf, page_idx, rect)}"}},
                                                  {"type": "text", "text": PHOTO_QTY_PROMPT}]}],
         "temperature": 0, "top_k": 1, "repeat_penalty": 1.05, "cache_prompt": False, "max_tokens": 20,
         "response_format": {"type": "json_schema", "json_schema": {"name": "q", "schema": PHOTO_QTY_SCHEMA}}}, timeout)
     raw = rj["choices"][0]["message"]["content"]
-    MODEL_RAW["vl_foto"][f"{page_idx}:{rect.x0:.1f},{rect.y0:.1f},{rect.x1:.1f},{rect.y1:.1f}"] = raw
+    key = f"{page_idx}:{rect.x0:.1f},{rect.y0:.1f},{rect.x1:.1f},{rect.y1:.1f}"
+    MODEL_RAW["vl_foto"][key] = raw
     q = json.loads(raw).get("quantity")
     # Fuera de 1..999 o no entero: sin lectura (None), nunca 1 por defecto; esa foto no aporta cantidad.
-    return q if isinstance(q, int) and 1 <= q <= 999 else None
+    if not (isinstance(q, int) and 1 <= q <= 999):
+        return None
+    if q == 1:
+        return 1
+    corner = fitz.Rect(rect.x0 + rect.width / 2, rect.y0 + rect.height / 2, rect.x1, rect.y1)
+    rj = post_json(f"{server}/v1/chat/completions", {
+        "messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": f"data:image/png;base64,{_vl_image(pdf, page_idx, corner)}"}},
+                                                 {"type": "text", "text": PHOTO_OCR_PROMPT}]}],
+        "temperature": 0, "top_k": 1, "repeat_penalty": 1.05, "cache_prompt": False, "max_tokens": 300}, timeout)
+    raw2 = rj["choices"][0]["message"]["content"]
+    MODEL_RAW["vl_foto"][key + ":esquina"] = raw2
+    return q if badge_text_number(raw2) == q else None
 
 
 def photo_quantities(pdf, pages, lines, literal, server, timeout, log):
@@ -1609,7 +1670,7 @@ def fix_page_breaks(lines, pdf, pages, page_texts, log):
 # columna de texto que termina en un renglón con solo el precio («$16.98»). El corte deja el bloque abierto al pie de la
 # página A (sin su precio) y la cola con el precio arriba de la B. Medido el 2026-10-21 sobre 850 saltos de 341 PDF:
 # 16 continuaciones, todas reales contra la imagen (herramientas/medir_saltos_bloques.py).
-BLOCK_PRICE_RE = re.compile(r"^\$\d{1,3}(?:,\d{3})*\.\d{2}$")
+BLOCK_PRICE_RE = re.compile(r"^(?:US)?\$\d{1,3}(?:,\d{3})*\.\d{2}$")
 
 
 def row_break(rows_a, rows_b, furn=frozenset()):
@@ -1840,6 +1901,7 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
     divisa = currency_of(md)
     issues = []
     header_open = False  # cabecera (vía 27B, sin subtotal impreso) que no cerró: se comprueba al final
+    ambiguous = False  # descuento impreso fuera del cuadre y subtotal impreso = líneas + descuento (ver más abajo)
     # Con qué deben cuadrar las líneas: el "Item(s) Subtotal" del pedido. El formato de escritorio
     # de Amazon imprime uno por envío y el global al final (caja de pago): se toma el último.
     subs = ITEMS_SUBTOTAL_RE.findall(md)
@@ -2113,6 +2175,35 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
                               f"- discounts does not match total {total}")
             else:  # sin subtotal impreso: se vuelve a comprobar al final, con las líneas ya completas (filas de tabla, VL)
                 header_open = True
+        # Caso ambiguo (32079): las líneas cuadran con el total solo dejando fuera un descuento impreso que el 27B devolvió,
+        # y líneas + ese descuento = otro subtotal impreso (Amazon: «Productos 119.98, Promoción −59.99, Total 59.99»).
+        # Desde lo impreso es igual que un precio ya rebajado con un ahorro informativo (Home Depot 32925, Temu), y solo
+        # la foto los distingue: se prueba la cantidad pintada en las fotos y se acepta solo si con ella las líneas dan
+        # EXACTAMENTE ese subtotal; entonces la cabecera lleva el descuento. Si no, queda como estaba.
+        ambiguous = False
+        if pick and total_printed and lines and lines_sum(lines) is not None:
+            dropped = [d for d in llm_lists["descuentos"] if d not in fields["descuentos"] and float(d["importe"] or 0) > 0]
+            s0 = lines_sum(lines)
+            goals = [o["amount"] for o in others if o.get("kind") == "subtotal_or_total" and o.get("amount") in ocr_amounts
+                     and dropped and abs(s0 + sum(float(d["importe"]) for d in dropped) - float(o["amount"])) < 0.01
+                     and abs(float(o["amount"]) - s0) >= 0.01]
+            ambiguous = bool(goals)
+            if goals and vl and p1.server_ok(vl_server):
+                try:
+                    photo_lines = photo_quantities(res["pdf"], pages, lines, literal, vl_server, timeout, log)
+                except Exception as e:  # noqa: BLE001
+                    log(f"  lectura de cantidades en las fotos falló ({type(e).__name__})")
+                    photo_lines = []
+                merged = vl_quantities(lines, photo_lines, literal, sq_text, float(goals[0])) if photo_lines else None
+                full = choose_header(float(goals[0]), float(total), cands, llm_lists["descuentos"], fields["other_charges"]) if merged else None
+                if merged and full:
+                    lines = merged
+                    fields["envio"], fields["impuestos"], fields["descuentos"], fields["other_charges"] = full
+                    fields["subtotal_articulos"] = items_subtotal = target = goals[0]  # las líneas cuadran con él
+                    for l in lines:
+                        if l.get("qty_vl"):
+                            log(f"  cantidad leída en la foto (Qwen2.5-VL): {l['qty']} x {l['unit']} = {l['amount']} «{l['desc'][:40]}»")
+                    log(f"  con esas cantidades las líneas dan {goals[0]} (subtotal impreso) y la cabecera lleva el descuento")
         # Sin subtotal de artículos impreso, la cuenta completa de la cabecera también cuadra la factura:
         # artículos + envío + impuestos + otros cargos − descuentos = total (todos los importes leídos del OCR).
         extra = (float(fields["envio"] or 0) + float(fields["impuestos"] or 0)
@@ -2342,6 +2433,7 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
         # por grupo de artículos del mismo pedido, el primero). No corta facturas: solo la referencia.
         "referencia": inv["ref"] or next(iter(EBAY_ORDER_RE.findall(md)), ""),
         "ocr": fields,
+        "_ambiguo": source == "llm" and ambiguous,
         # interno (build_all lo retira): las líneas cuadran con un total o subtotal IMPRESO
         "_cuadra": all_ok and total_printed,
         "_unit_candidates": bool(unit_price_candidates(lines)) and not unit_alt,  # ver opción D en build_all
@@ -2502,7 +2594,7 @@ def build_all(res, use_llm=True, llm_server=QWEN27_SERVER, vl_server=VL_SERVER, 
                     + ", ".join(f"{p['ocr']['paginas'][0]}-{p['ocr']['paginas'][1]}" for p in parts))
                 docs.extend(parts)
             else:
-                if source == "llm" and not doc["_cuadra"]:  # el 27B está en caché: solo se añade la lectura visual
+                if source == "llm" and (not doc["_cuadra"] or doc.get("_ambiguo")):  # el 27B está en caché: solo se añade la lectura visual
                     doc, source = build_invoice(len(out), rs, inv, use_llm, llm_server, vl_server, timeout, log)
                 docs.append(doc)
             for doc in docs:
@@ -2515,6 +2607,7 @@ def build_all(res, use_llm=True, llm_server=QWEN27_SERVER, vl_server=VL_SERVER, 
     for doc in out:
         doc.pop("_cuadra", None)
         doc.pop("_unit_candidates", None)
+        doc.pop("_ambiguo", None)
     # El mismo pedido dos veces en el PDF sin referencia conocida (p. ej. la misma factura Shein escaneada dos
     # veces): ver same_order. Los bloques de envío de un mismo pedido de Amazon son envíos distintos: no cuentan.
     fps = order_fingerprints(out, res.get("markdown", ""))
