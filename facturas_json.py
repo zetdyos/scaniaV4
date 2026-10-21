@@ -103,7 +103,8 @@ INVOICE_START = [
     ("temu", re.compile(r"Order\s*ID:?\s*(PO-\d{3}-\d{8,})", re.I)),
 ]
 # Importes: 1,234.56 | 26,99 (coma decimal, capturas de la app) | 17,- (sin céntimos)
-AMOUNT_TXT = r"-?\s*\d[\d.,]*(?:[.,]\d{2}|,-)"
+# ",\d{2}" no puede ser el comienzo de un grupo de miles: "$1,250" no es 1,25 (antes se tomaba así).
+AMOUNT_TXT = r"-?\s*\d[\d.,]*(?:\.\d{2}|,\d{2}(?!\d)|,-)"
 ORDER_TOTAL_RE = re.compile(r"(?:Order|Grand)\s*Total:?\s*(?:USD|\$)?\s*(" + AMOUNT_TXT + ")", re.I)
 ITEMS_SUBTOTAL_RE = re.compile(r"Item\(?s?\)?\s*Subtotal:?\s*(?:USD|\$)?\s*(" + AMOUNT_TXT + ")", re.I)
 # Sin marca de moneda: con separador de miles (2,821.92) o sin él (2821.92).
@@ -122,13 +123,19 @@ LINES_SCHEMA = {
                            "importe_linea": {"type": "string"}, "divisa": {"type": "string"},
                            "precio_unitario": {"type": "string"}, "vendedor": {"type": "string"},
                            "seguimiento": {"type": "string"}, "estado_envio": {"type": "string"},
-                           "line_kind": {"type": "string", "enum": LINE_KINDS}},
-            "required": ["descripcion", "cantidad", "importe_linea", "divisa",
-                         "precio_unitario", "vendedor", "seguimiento", "estado_envio", "line_kind"]}},
+                           "line_kind": {"type": "string", "enum": LINE_KINDS},
+                           # El valor de cada cifra como número JSON: la gramática de llama.cpp (json-schema-to-grammar,
+                           # primitivo "number") no admite separador de miles ni coma decimal, así que el 27B decide con el
+                           # contexto del documento si "1.000" es 1 o 1000; el código solo comprueba (model_number).
+                           "cantidad_valor": {"type": "number"}, "importe_valor": {"type": "number"},
+                           "precio_unitario_valor": {"type": "number"}},
+            "required": ["descripcion", "cantidad", "cantidad_valor", "importe_linea", "importe_valor", "divisa",
+                         "precio_unitario", "precio_unitario_valor", "vendedor", "seguimiento", "estado_envio", "line_kind"]}},
         "total": {"type": "string"},
+        "total_valor": {"type": "number"},
         "total_is_printed": {"type": "boolean"},
     },
-    "required": ["lineas", "total", "total_is_printed"],
+    "required": ["lineas", "total", "total_valor", "total_is_printed"],
 }
 SYSTEM_PROMPT = ("You extract purchase line items from the OCR text of invoices and receipts. "
                  "Copy every value exactly as printed in the document. Never invent, estimate or compute values. "
@@ -144,7 +151,9 @@ USER_PROMPT = ("OCR text of the document (Markdown; HTML tables are regions dete
                "is: shipping, tax, discount, subtotal_or_total, payment for money paid or still due (amount charged "
                "to a payment method, balance due), or other_charges for any other charge that is not a purchased "
                "item). Also return total (the final amount payable as printed) and total_is_printed (true only if that total "
-               "is printed in the document).")
+               "is printed in the document). For cantidad, importe_linea, precio_unitario and total also return the "
+               "value as a number (cantidad_valor, importe_valor, precio_unitario_valor, total_valor), reading the "
+               "decimal and thousands separators the way this document uses them; 0 when the value is not printed.")
 
 # Patrón "Visual Information Extraction" del cookbook de Qwen: plantilla JSON con claves vacías.
 VL_PROMPT = ('Extract the key-value information in the format:'
@@ -200,6 +209,70 @@ def post_json(url, payload, timeout, attempts=3, log=None):
             _t.sleep(2 * (k + 1))
 
 
+# Importe entero impreso, sin céntimos ("$ 299", eBay): con marca de moneda y como único contenido del renglón o de la
+# celda, o tras una etiqueta al final del renglón ("Total: $803"); no dentro de una frase ("$ 2pcs", "Gift Card - $75").
+INT_AMOUNT_RE = re.compile(r"(?:^|<t[dh][^>]*>|\|)[ \t]*(?:[A-Za-z][\w ()/.*-]*:[ \t]*)?(?:USD|US\$|\$)[ \t]*-?[ \t]*"
+                           r"(\d{1,3}(?:,\d{3})+|\d+)[ \t]*(?=\r?\n|\Z|</t[dh]>|\|)", re.M)
+
+
+def printed_readings(s):
+    """Valores que admite una cifra tal como está impresa, según el separador que use el documento: "1.000" -> {1, 1000},
+    "1,250" -> {1.25, 1250}, "1,234.56" -> {1234.56}, "0.5" -> {0.5}. Sin signo. Conjunto vacío si no hay cifras.
+    No elige entre ellos: eso lo decide el 27B con el contexto del documento; esto solo comprueba su respuesta."""
+    from decimal import Decimal
+    out = set()
+    s = str(s or "")  # con y sin el espacio como separador de miles ("1 234,56" | "3 EA 3")
+    for tok in re.findall(r"\d(?:[\d.,'  ]*\d)?", s) + re.findall(r"\d(?:[\d.,']*\d)?", s):
+        t = re.sub(r"['  ]", "", tok)
+        seps = [c for c in t if c in ".,"]
+        if not seps:
+            out.add(Decimal(t))
+        elif len(set(seps)) == 2:  # "1,234.56" / "1.234,56": el último separador es el decimal
+            dec = t[max(t.rfind("."), t.rfind(","))]
+            out.add(Decimal(t.replace("." if dec == "," else ",", "").replace(",", ".")))
+        else:
+            c, parts = seps[0], t.split(seps[0])
+            if len(parts) > 2:  # "1,000,000": solo miles
+                out.add(Decimal("".join(parts)))
+            else:
+                out.add(Decimal(parts[0] + "." + parts[1]))
+                if len(parts[1]) == 3:  # "1.000" / "1,250": también miles
+                    out.add(Decimal(parts[0] + parts[1]))
+    return out
+
+
+def model_number(printed, value, what, issues):
+    """Valor que el 27B dio para una cifra (`value`, número JSON) contrastado con lo que copió como impreso (`printed`).
+    El valor lo decide el 27B; el código solo comprueba que es una lectura posible de lo impreso. Si no lo es (o falta),
+    se anota en `issues` (la factura va a revisión) y se devuelve el del 27B tal cual; si no hay cifra impresa, None."""
+    from decimal import Decimal, InvalidOperation
+    s = str(printed or "").strip()
+    reads = printed_readings(s)
+    if not reads:
+        return None
+    try:
+        v = abs(Decimal(str(value)))
+    except (InvalidOperation, ValueError, TypeError):
+        v = None
+    if v is not None and v in reads:
+        return v
+    issues.append(f'{what} printed as "{s}" but the model returned {value}; review against the paper')
+    return v if v is not None else (next(iter(reads)) if len(reads) == 1 else None)
+
+
+def vl_value(s):
+    """Cifra del VL (texto) con una única lectura posible; None si no hay cifra o admite varias ("1.000")."""
+    reads = printed_readings(s)
+    return next(iter(reads)) if len(reads) == 1 else None
+
+
+def cents(v):
+    """Decimal -> '1234.56' truncado a céntimos, como se han tratado siempre los precios de 3 a 5 decimales (ver
+    fine_amounts: el redondeo y el truncado cuentan como literales)."""
+    from decimal import ROUND_DOWN, Decimal
+    return str(v.quantize(Decimal("0.01"), rounding=ROUND_DOWN)) if v is not None else ""
+
+
 def money(v):
     """Texto con un importe -> '1234.56', o '' si no hay importe."""
     m = re.search(AMOUNT_TXT, str(v or ""))
@@ -216,6 +289,7 @@ def doc_amounts(text):
         val = parse_amount(a or b)
         if val is not None:
             out.add(f"{abs(val):.2f}")
+    out |= {f"{float(x.replace(',', '')):.2f}" for x in INT_AMOUNT_RE.findall(text or "")}
     return out
 
 
@@ -249,15 +323,6 @@ def parse_qty(txt):
         return int(m.group(0).replace(".", ""))
     m = re.search(r"\d+", t)
     return int(m.group(0)) if m else None
-
-
-def decimal_qty(txt, text):
-    """Cantidad decimal impresa ("0.50" de un tubo, "2.5" kg): tal cual, si aparece literal en el texto. Solo cuenta como
-    impresa si además cantidad x precio = importe exacto (ver build_invoice); si no, la línea va a revisión."""
-    t = str(txt or "").strip()
-    if re.fullmatch(r"\d+\.\d{1,3}", t) and float(t) % 1 and re.search(r"(?<![\d.])" + re.escape(t) + r"(?![\d])", text or ""):
-        return float(t)
-    return None
 
 
 def printed_negative(amt, text):
@@ -386,11 +451,31 @@ _LLM_CACHE = {}  # (servidor, Markdown de la página) -> respuesta; se vacía po
 def lines_with_llm(markdown, server, timeout, log):
     """Una llamada al 27B con el Markdown de UNA página. Devuelve (datos, motivo_de_fallo).
     max_tokens = n_ctx - prompt (antes 4096 fijo: una factura de 54 artículos se cortaba siempre). Si la
-    respuesta se corta o no es JSON devuelve (None, motivo) en vez de lanzar: la factura va a revisión.
+    respuesta se corta o no es JSON devuelve (las líneas completas que llegó a escribir o None, motivo) en vez de lanzar:
+    la factura va a revisión.
     Temperatura 0 y top_k 1: la misma página da la misma respuesta, así que se reutiliza (corte por pedidos)."""
     if (server, markdown) not in _LLM_CACHE:
         _LLM_CACHE[(server, markdown)] = _lines_with_llm(markdown, server, timeout, log)
     return _LLM_CACHE[(server, markdown)]
+
+
+def complete_objects(content, key):
+    """Objetos completos de la lista `key` de un JSON cortado ('{"lineas": [{...}, {...}, {"descr'): los que el modelo
+    llegó a cerrar, tal cual; el último a medias no se usa."""
+    from decimal import Decimal
+    m = re.search(r'"' + re.escape(key) + r'"\s*:\s*\[', content or "")
+    if not m:
+        return []
+    dec, pos, out = json.JSONDecoder(parse_float=Decimal), m.end(), []
+    while True:
+        while pos < len(content) and content[pos] in " \t\r\n,":
+            pos += 1
+        try:
+            obj, pos = dec.raw_decode(content, pos)
+        except json.JSONDecodeError:
+            return out
+        if isinstance(obj, dict):
+            out.append(obj)
 
 
 def _lines_with_llm(markdown, server, timeout, log):
@@ -401,21 +486,30 @@ def _lines_with_llm(markdown, server, timeout, log):
     payload = {
         "messages": [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": user}],
         "temperature": 0, "top_k": 1, "max_tokens": budget,
+        # cache_prompt false: el README de llama-server (38a5b42) avisa que reutilizar la caché de la orden «can cause
+        # nondeterministic results»; _LLM_CACHE y la opción D dan por hecho que la misma página da la misma respuesta.
+        "cache_prompt": False,
         "response_format": {"type": "json_schema", "json_schema": {"name": "factura", "schema": LINES_SCHEMA}},
         "chat_template_kwargs": {"enable_thinking": False},
     }
     rj = post_json(f"{server}/v1/chat/completions", payload, timeout, log=log)
     choice = rj["choices"][0]
     content = re.sub(r"<think>.*?</think>", "", choice["message"]["content"] or "", flags=re.S).strip()
-    if choice.get("finish_reason") == "length":
-        log(f"  27B: respuesta cortada al llegar a {budget} fichas")
-        return None, "model output limit reached"
+    from decimal import Decimal
+    fail = "model output limit reached" if choice.get("finish_reason") == "length" else ""
     try:
-        data = json.loads(content)
+        data = json.loads(content, parse_float=Decimal)  # 17.842 exacto, sin pasar por float
     except json.JSONDecodeError:
-        log("  27B: la respuesta no es JSON válido")
-        return None, "model output is not valid JSON"
+        fail = fail or "model output is not valid JSON"
+        data = None
+    if fail:
+        # Respuesta incompleta: se conservan las líneas que el 27B llegó a escribir enteras (no se tira su lectura);
+        # la factura va a revisión igualmente por el motivo `fail`.
+        log(f"  27B: {fail} ({budget} fichas); respuesta: {content}")
+        lines = complete_objects(content, "lineas")
+        return ({"lineas": lines, "total": "", "total_valor": 0, "total_is_printed": False} if lines else None), fail
     log(f"  27B devolvió {len(data.get('lineas', []))} línea(s), total «{data.get('total', '')}» (max_tokens {budget})")
+    log(f"  27B respuesta: {content}")  # tal cual, para poder auditar qué leyó el modelo y qué hizo el código
     return data, ""
 
 
@@ -434,19 +528,24 @@ def lines_with_vl(pdf, pages, server, timeout, log):
                 "messages": [{"role": "user", "content": [
                     {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img}"}},
                     {"type": "text", "text": VL_PROMPT}]}],
-                "temperature": 0, "top_k": 1, "repeat_penalty": 1.05, "max_tokens": 2048,
+                "temperature": 0, "top_k": 1, "repeat_penalty": 1.05, "cache_prompt": False, "max_tokens": 2048,
                 "response_format": {"type": "json_schema", "json_schema": {"name": "items", "schema": VL_SCHEMA}},
             }
             rj = post_json(f"{server}/v1/chat/completions", payload, timeout, log=log)
-            data = json.loads(rj["choices"][0]["message"]["content"])
+            content = rj["choices"][0]["message"]["content"]
+            log(f"  Qwen2.5-VL respuesta p{i + 1}: {content}")  # tal cual, para auditar
+            data = json.loads(content)
             for it in data.get("items", []):
-                qty = parse_qty(it.get("quantity")) or 1
-                unit = money(it.get("discounted_unit_price")) or money(it.get("unit_price"))
+                # El VL devuelve texto (prompt del cookbook): solo se usa una cifra con UNA lectura posible. Vacía o
+                # ambigua ("1.000") -> sin valor: ese artículo no puede completar ningún cuadre (nunca 1 por defecto).
+                q = vl_value(it.get("quantity"))
+                qty = int(q) if q is not None and q >= 1 and q == q.to_integral_value() else None
+                unit = cents(vl_value(it.get("discounted_unit_price"))) or cents(vl_value(it.get("unit_price")))
                 lines.append({"desc": str(it.get("description", "")).strip(), "qty": qty, "unit": unit,
-                              "amount": f"{qty * float(unit):.2f}" if unit else "", "src": "qwen-vl",
+                              "amount": f"{qty * float(unit):.2f}" if unit and qty else "", "src": "qwen-vl",
                               "page_rel": pages.index(i) + 1})
-            if not total and money(data.get("total")):
-                total = money(data.get("total"))
+            if not total and vl_value(data.get("total")) is not None:
+                total = cents(vl_value(data.get("total")))
             log(f"  Qwen2.5-VL p{i + 1} a {dpi} dpi: {len(data.get('items', []))} artículo(s), total «{data.get('total', '')}»")
     finally:
         doc.close()
@@ -842,7 +941,7 @@ def vl_quantities(lines, vl_lines, literal, sq_text, goal):
         m = None
         if not (l.get("qty_printed") or qty_printed(l["qty"], sq_text, p1.squash(l.get("desc", ""))[:20])):
             sim = lambda k: difflib.SequenceMatcher(None, desc_key(vl_lines[k]["desc"])[:30], key).ratio()
-            cands = [k for k, v in enumerate(vl_lines) if k not in used and v.get("unit") == unit and v["qty"] >= 1]
+            cands = [k for k, v in enumerate(vl_lines) if k not in used and v.get("unit") == unit and (v["qty"] or 0) >= 1]
             best = max(cands, key=sim, default=None)
             if best is not None and sim(best) >= 0.8:
                 m = best
@@ -897,7 +996,8 @@ def item_photos(pdf, page_idx):
 
 
 def photo_quantity(pdf, page_idx, rect, server, timeout):
-    """Cantidad pintada en la foto según Qwen2.5-VL (1 si no hay). Recorte renderizado desde el PDF a >= 1024 fichas."""
+    """Cantidad pintada en la foto según Qwen2.5-VL (el prompt le pide 1 si no hay); None si su respuesta no es un entero
+    de 1 a 999. Recorte renderizado desde el PDF a >= 1024 fichas."""
     area = (rect.width / 72) * (rect.height / 72)
     dpi = int(min(max(200, (1024 * 28 * 28 / area) ** 0.5), (4096 * 28 * 28 / area) ** 0.5))
     with fitz.open(pdf) as doc:
@@ -905,10 +1005,11 @@ def photo_quantity(pdf, page_idx, rect, server, timeout):
     rj = post_json(f"{server}/v1/chat/completions", {
         "messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img}"}},
                                                  {"type": "text", "text": PHOTO_QTY_PROMPT}]}],
-        "temperature": 0, "top_k": 1, "repeat_penalty": 1.05, "max_tokens": 20,
+        "temperature": 0, "top_k": 1, "repeat_penalty": 1.05, "cache_prompt": False, "max_tokens": 20,
         "response_format": {"type": "json_schema", "json_schema": {"name": "q", "schema": PHOTO_QTY_SCHEMA}}}, timeout)
     q = json.loads(rj["choices"][0]["message"]["content"]).get("quantity")
-    return q if isinstance(q, int) and 1 <= q <= 999 else 1
+    # Fuera de 1..999 o no entero: sin lectura (None), nunca 1 por defecto; esa foto no aporta cantidad.
+    return q if isinstance(q, int) and 1 <= q <= 999 else None
 
 
 def photo_quantities(pdf, pages, lines, literal, server, timeout, log):
@@ -932,6 +1033,8 @@ def photo_quantities(pdf, pages, lines, literal, server, timeout, log):
             used.add(id(l))
             q = photo_quantity(pdf, page_idx, rect, server, timeout)
             log(f"  foto p{page_idx + 1} ${price}: cantidad {q} según Qwen2.5-VL «{l['desc'][:40]}»")
+            if q is None:  # sin lectura válida: esta foto no aporta; el cuadre exacto decidirá sin ella
+                continue
             out.append({"desc": l["desc"], "unit": price, "qty": q})
     return out
 
@@ -1470,36 +1573,57 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
     elif use_llm:
         # Página por página: la salida de cada llamada está acotada por su página, no por el documento.
         log(f"  sin bloques de envío: extracción de líneas con Qwen3.6-27B, página por página ({len(pages)})")
-        lines, model_totals = [], []
+        lines, model_totals, model_currencies = [], [], set()
         for k, (i, regs) in enumerate(zip(pages, regions)):
             data, fail = lines_with_llm(p1.page_markdown(i + 1, res["full_text"].get(i) or "", regs)[0], llm_server, timeout, log)
-            if data is None:
+            if fail:  # incompleta: van las líneas que llegó a escribir enteras (si hay) y la factura a revisión
                 read_failed = True
                 issues.append(f"item list on page {i + 1} could not be read completely ({fail}); review against the paper")
+            if data is None:
                 continue
             for l in data.get("lineas", []):
-                amt = money(l.get("importe_linea"))
+                # Cifras: el VALOR lo da el 27B (número JSON); el código comprueba que es una lectura de lo que copió
+                # como impreso y, si no, lo anota (revisión). Nunca se sustituye por una parte del texto, por 1 ni sin signo.
+                kind = l.get("line_kind") if l.get("line_kind") in LINE_KINDS else "goods"
+                what = f'{"item" if kind == "goods" else kind} «{str(l.get("descripcion", ""))[:40]}»'
+                amt = cents(model_number(l.get("importe_linea"), l.get("importe_valor"), f"amount of {what}", issues))
+                unit_v = model_number(l.get("precio_unitario"), l.get("precio_unitario_valor"), f"unit price of {what}", issues)
+                qty = model_number(l.get("cantidad"), l.get("cantidad_valor"), f"quantity of {what}", issues)
+                if kind == "goods":
+                    if qty is None:
+                        issues.append(f'quantity of {what} not returned by the model ("{l.get("cantidad", "")}"); review against the paper')
+                    elif qty == 0:
+                        issues.append(f"quantity 0 for {what}; review against the paper")
+                    if amt and str(l.get("importe_linea", "")).strip().startswith("-"):
+                        issues.append(f"negative amount for {what}; review against the paper")
+                qty = 1 if qty is None else (int(qty) if qty == qty.to_integral_value() else float(qty))
                 # Solo los artículos: un importe de resumen sin respaldo no se usa (ver "backed"), no es incidencia.
-                if amt and amt not in ocr_amounts and l.get("line_kind", "goods") == "goods":
+                if amt and amt not in ocr_amounts and kind == "goods":
                     issues.append(f'amount {amt} not found in the OCR text ("{l.get("descripcion", "")[:40]}")')
-                lines.append({"desc": l.get("descripcion", "").strip(), "qty": decimal_qty(l.get("cantidad"), md) or parse_qty(l.get("cantidad")) or 1,
-                              "amount": amt, "unit": money(l.get("precio_unitario")), "src": "qwen27b", "page_rel": k + 1,
+                lines.append({"desc": l.get("descripcion", "").strip(), "qty": qty,
+                              "amount": amt, "unit": cents(unit_v), "src": "qwen27b", "page_rel": k + 1,
                               "unit_exact": exact_unit(l.get("precio_unitario"), md),
                               "neg": bool(amt) and str(l.get("importe_linea", "")).strip().startswith("-") and printed_negative(amt, md),
-                              "kind": l.get("line_kind") if l.get("line_kind") in LINE_KINDS else "goods",
+                              "kind": kind,
                               "order": len(lines),
                               "extra": {"vendedor": l.get("vendedor", ""), "seguimiento": l.get("seguimiento", ""),
                                         "estado_envio": l.get("estado_envio", "")}})
                 d = str(l.get("divisa") or "").strip().upper()
                 if ISO_CURRENCY_RE.match(d):
+                    model_currencies.add(d)
                     divisa = d
-            if money(data.get("total")):
+                elif d:
+                    issues.append(f'currency "{l.get("divisa")}" returned by the model for {what} is not an ISO 4217 code; review against the paper')
+            data["_total"] = cents(model_number(data.get("total"), data.get("total_valor"), "total", issues))
+            if data["_total"]:
                 model_totals.append(data)
+        if len(model_currencies) > 1:  # una sola divisa por factura en el esquema: no se elige una en silencio
+            issues.append(f"the model returned several currencies ({', '.join(sorted(model_currencies))}); review against the paper")
         # El total del documento: el de la última página que lo trae CON respaldo en el OCR (una página
         # puede devolver un importe que no está impreso); si ninguno lo tiene, el último (va a incidencia).
-        backed_totals = [d for d in model_totals if money(d.get("total")) in ocr_amounts]
+        backed_totals = [d for d in model_totals if d["_total"] in ocr_amounts]
         model_total = (backed_totals or model_totals or [None])[-1]
-        t = money(model_total.get("total")) if model_total else ""
+        t = model_total["_total"] if model_total else ""
         if t and t in ocr_amounts and t not in total_cands:
             total_cands.append(t)
         if t and not total:
@@ -1548,7 +1672,7 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
                 l["amount_calc"] = True
                 log(f"  importe = cantidad x precio literal: {l['qty']} x {l['unit']} = {l['amount']} «{l['desc'][:40]}»")
         for l in lines:
-            if l["qty"] % 1:  # cantidad decimal impresa (decimal_qty): vale solo si cantidad x precio literal = importe exacto
+            if l["qty"] % 1:  # cantidad decimal (la del 27B): cuenta como impresa solo si cantidad x precio literal = importe exacto
                 u = float(l.get("unit_exact") or l.get("unit") or 0)
                 if literal(l.get("unit")) and l.get("amount") in ocr_amounts and abs(l["qty"] * u - float(l["amount"])) < 0.006:
                     l["qty_printed"] = True
@@ -1826,6 +1950,12 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
     if not total and lines_sum(lines) is not None:
         total, total_printed = f"{lines_sum(lines):.2f}", False
         target = total
+    # Sin total impreso, la suma de las líneas comparada consigo misma siempre "cuadra": no prueba que la lista esté
+    # completa. Solo un subtotal de artículos impreso con el que cuadren las líneas lo prueba; si no, revisión
+    # (decisión del usuario 2026-10-20: nunca fabricar; el total que va a WTCP es la suma, total_is_printed false).
+    if lines and not total_printed and not (items_subtotal and lines_sum(lines) is not None
+                                            and abs(lines_sum(lines) - float(items_subtotal)) < 0.01):
+        issues.append("no printed total: the item list cannot be checked for completeness; review against the paper")
     if target and lines_sum(lines) is not None and abs(lines_sum(lines) - float(target)) >= 0.01:
         issues.append(f"sum of lines {lines_sum(lines):.2f} vs " + ("items subtotal" if items_subtotal else "total") + f" {target}")
     # Sin marcador de pedido y sin ninguna línea: no parece una factura de mercadería (albarán,

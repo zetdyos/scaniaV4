@@ -15,7 +15,12 @@ class Keep(dict):
         pass
 
 
-shared = Keep(); new._LLM_CACHE = shared; old._LLM_CACHE = shared
+shared = Keep(); new._LLM_CACHE = shared
+# Con el mismo prompt y esquema se comparten las respuestas del 27B (misma lectura para los dos); si cambian, cada
+# versión pregunta con los suyos (si no, la nueva reutilizaría respuestas pedidas con el prompt viejo).
+same_prompt = (old.USER_PROMPT, old.SYSTEM_PROMPT, old.LINES_SCHEMA) == (new.USER_PROMPT, new.SYSTEM_PROMPT, new.LINES_SCHEMA)
+old._LLM_CACHE = shared if same_prompt else Keep()
+print("prompt/esquema del 27B", "iguales: respuestas compartidas" if same_prompt else "DISTINTOS: cada versión llama al 27B", flush=True)
 latest = {}
 for d in sorted((REPO / "demo_jobs").iterdir()):
     m = d / "meta.json"
@@ -36,7 +41,7 @@ for pdf in sys.argv[1].split(","):
     meta = json.loads((d / "meta.json").read_text(encoding="utf-8"))
     res = {"pdf": str(d / meta["pdf"]), "n_pages": n, "markdown": full,
            "full_text": {i: page_md.get(i + 1, "") for i in range(n)}, "region_pages": [[] for _ in range(n)]}
-    dict.clear(shared)
+    dict.clear(shared); dict.clear(old._LLM_CACHE)
     t0 = time.time()
     with new.modelos_lock(lambda m: None):
         a = old.build_all(res, log=lambda m: None)
