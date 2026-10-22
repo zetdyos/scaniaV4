@@ -1678,7 +1678,12 @@ def fix_page_breaks(lines, pdf, pages, page_texts, log):
             continue
         where = f"page {pages[k] + 1}->{pages[k] + 2}"
         col = text_column(rows_a, col)
-        furniture = page_furniture(pdf, pages)
+        try:  # el marco de página pide PP-OCRv6 de las DEMÁS páginas (32560: OOM en la GPU1 -> 500 y error del trabajo)
+            furniture = page_furniture(pdf, pages)
+        except Exception as e:  # noqa: BLE001  hay continuación pero sin geometría no se puede arreglar: a revisión
+            log(f"  PP-OCRv6 no disponible ({type(e).__name__}): salto {where} sin comprobar")
+            issues.append(f"item description split by the page break ({where}) could not be checked; review against the paper")
+            continue
         orph_toks = _col_toks(orph, col)
         orph_text = " ".join(orph_toks)
         # El 27B a veces convierte el renglón huérfano en un «artículo» SIN importe al principio de B: es la
