@@ -4,7 +4,7 @@
 
 - Máquina de la app: Linux, Python 3.12, sin GPU (el layout PP-DocLayoutV3 corre en CPU; 16 hilos van bien). Internet solo la primera vez (descarga de paquetes y del modelo de layout desde Hugging Face, ~400 MB).
 - Host de modelos (`192.168.1.194` por defecto) con llama.cpp **posterior al 2026-02-18** (arreglo de GLM-OCR, PR 19677) y acceso desde la app a los puertos 8086, 8083, 8088 y 8089.
-- Modelos GGUF en el host de modelos: `GLM-OCR-Q8_0.gguf` + `mmproj-GLM-OCR-Q8_0.gguf`, `Qwen2.5-VL-7B-Q4_K_M.gguf` + su mmproj, `Qwen3.6-27B-Q6_K.gguf`.
+- Modelos GGUF en el host de modelos: `GLM-OCR-Q8_0.gguf` + `mmproj-GLM-OCR-Q8_0.gguf`, `Qwen2.5-VL-7B-Q4_K_M.gguf` + su mmproj, `Qwen3.6-27B-Q6_K.gguf` + `mmproj-Qwen3.6-27B-F16.gguf` (proyector de visión oficial de Qwen3.6, tipo `qwen3vl_merger`, 928 MB).
 - PP-OCRv6 (`PP-OCRv6_medium_det` + `PP-OCRv6_medium_rec`, PaddleOCR 3.7.0) como servicio HTTP en el host de modelos (sección 2.1).
 
 ## 2. Servidores de modelos (en 192.168.1.194)
@@ -18,8 +18,9 @@ llama-server -m GLM-OCR-Q8_0.gguf --mmproj mmproj-GLM-OCR-Q8_0.gguf -ngl 99 -c 1
 # Qwen2.5-VL-7B (rescate visual de precios y cantidades) — puerto 8088
 llama-server -m Qwen2.5-VL-7B-Q4_K_M.gguf --mmproj <mmproj-Qwen2.5-VL-7B>.gguf -ngl 99 -c 8192 -fa on --cache-type-k q8_0 --cache-type-v q8_0 --host 0.0.0.0 --port 8088   # GPU1; desde 2026-10-21 (drop-in achicar.conf): 8650 -> ~6900 MiB, lecturas de foto iguales (191/202)
 
-# Qwen3.6-27B (estructuración de líneas; solo texto) — puerto 8083
-llama-server -m Qwen3.6-27B-Q6_K.gguf -ngl 99 -c 16384 --host 0.0.0.0 --port 8083 --jinja
+# Qwen3.6-27B (estructuración de líneas; con visión desde 2026-10-21, drop-in zz-vision.conf) — puerto 8083, GPU0
+llama-server -m Qwen3.6-27B-Q6_K.gguf --mmproj mmproj-Qwen3.6-27B-F16.gguf --image-max-tokens 2048 -ngl 99 -c 16384 --parallel 1 -fa on --cache-type-k q8_0 --cache-type-v q8_0 --host 0.0.0.0 --port 8083 --jinja
+# Con el proyector: GPU0 ~22,9/24,5 GB (pico con imagen incluido); la respuesta de texto es idéntica a la de sin proyector (comprobado con una página).
 ```
 
 Notas: `--jinja` es necesario en el 27B para `chat_template_kwargs.enable_thinking=false`. Con un slot por servidor la app procesa un PDF a la vez. Comprobación desde la máquina de la app:
