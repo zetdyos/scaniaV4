@@ -99,6 +99,27 @@ VL_SERVER = p1.QWEN_SERVER  # Qwen2.5-VL-7B, puerto 8088
 # Marcadores de inicio de factura: (tipo, regex con grupo 1 = referencia). Tolerantes a espacios
 # perdidos por el OCR.
 EBAY_ORDER_RE = re.compile(r"Order\s*number:?\s*(\d{2}-\d{5}-\d{5})(?!\d)", re.I)
+# Número de pedido/factura impreso con su etiqueta en el MISMO renglón, para `referencia` cuando no hay marcador
+# conocido (2026-10-21: «Order No: 25085528», «Order# W7709007», «Order 361365724» de RockAuto, «INVOICE # IN260376»).
+# Nunca el renglón siguiente: ahí suele estar el número manuscrito del expediente («INVOICE #16548 — Hayden LA\n32949»).
+# Número: letras/cifras/guiones con >= 4 cifras; sin «$», puntos ni barras («Order Total $…», «Order Date 10.10.2026»).
+_REF_NUM = r"([A-Z0-9][A-Z0-9-]*[A-Z0-9])(?![A-Z0-9.,/$-])"
+PRINTED_REF_RES = [re.compile(r"(?<![A-Za-z])Order[ \t]*(?:No\.?|Number|#|ID)?[ \t]*[:#]?[ \t]*" + _REF_NUM, re.I),
+                   re.compile(r"(?<![A-Za-z])Invoice[ \t]*(?:No\.?|Number|#)?[ \t]*[:#]?[ \t]*" + _REF_NUM, re.I)]
+
+
+def printed_ref(text):
+    """Primer número de pedido (si no, de factura) impreso con su etiqueta en el mismo renglón; "" si no hay."""
+    for rx in PRINTED_REF_RES:
+        for m in rx.finditer(text or ""):
+            # «Purchase Order Number» es el número del comprador, no el pedido del vendedor
+            if (text[max(0, m.start() - 10):m.start()].strip().lower().endswith("purchase")
+                    or sum(c.isdigit() for c in m.group(1)) < 4):
+                continue
+            return m.group(1)
+    return ""
+
+
 INVOICE_START = [
     ("amazon", re.compile(r"Details\s*for\s*Order\s*#?\s*(\d{3}-\d{7}-\d{7})", re.I)),
     ("amazon", re.compile(r"Amazon\.com\s*order\s*number:?\s*(\d{3}-\d{7}-\d{7})", re.I)),
@@ -1587,6 +1608,31 @@ def glm_fragment(frag, words):
     return best if best_r >= 0.85 else None
 
 
+def join_split_items(lines, n_pages, log):
+    """Artículo partido por el salto de página que el 27B, leyendo página por página, devolvió en dos mitades
+    (Skechers 2026-10-21: «Skechers Slip-ins… Quantity: 1» al pie de la página 1, «Price: $135.00» arriba de la 2): la
+    última línea de artículo de la página N tiene descripción y no tiene importe, y la primera de la N+1 tiene importe y
+    la descripción vacía o un identificador. Se juntan (descripción y cantidad de la primera, importe de la segunda) y
+    se quita la segunda. Ninguna cifra cambia; sin unir, la factura iba siempre a revisión, y unida solo sale sin
+    revisión si pasan las comprobaciones de siempre (importe literal, cuadre exacto). Devuelve las incidencias."""
+    no_desc = lambda d: not (d or "").strip() or ID_LIKE_RE.match(re.sub(r"\s", "", d or "")) or COUNT_ONLY_RE.match(d or "")
+    for k in range(1, n_pages):
+        goods = [l for l in lines if l.get("kind", "goods") == "goods"]
+        on_a = [l for l in goods if l.get("page_rel") == k]
+        on_b = [l for l in goods if l.get("page_rel") == k + 1]
+        if not on_a or not on_b:
+            continue
+        a, b = on_a[-1], on_b[0]
+        if a.get("amount") or no_desc(a.get("desc")) or not b.get("amount") or not no_desc(b.get("desc")):
+            continue
+        a.update(amount=b["amount"], amount_exact=b.get("amount_exact"))
+        if not a.get("unit"):
+            a.update(unit=b.get("unit"), unit_exact=b.get("unit_exact"))
+        lines.remove(b)
+        log(f"  artículo partido por el salto de página {k}->{k + 1}: «{a['desc'][:40]}» + importe {a['amount']} de la página siguiente")
+    return []
+
+
 def fix_page_breaks(lines, pdf, pages, page_texts, log):
     """Artículos partidos por un salto de página (ver arriba). Para cada salto con continuación:
       - el último artículo de la página A (mismo importe que el renglón de PP-OCRv6) recibe los renglones huérfanos;
@@ -2061,6 +2107,7 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
         if len(pages) > 1:
             glm_pages = {i: html.unescape(re.sub(r"<[^>]+>", " ", p1.page_markdown(i + 1, res["full_text"].get(i) or "", regs)[0]))
                          for i, regs in zip(pages, regions)}
+            issues += join_split_items(lines, len(pages), log)
             issues += fix_page_breaks(lines, res["pdf"], pages, glm_pages, log)
             issues += fix_block_breaks(lines, res["pdf"], pages, glm_pages, log)
     else:
@@ -2482,7 +2529,7 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
                    for i, l in enumerate(lines)],
         # Sin marcador conocido: el número de pedido de eBay impreso («Order number: 13-15047-54805»; si hay varios, uno
         # por grupo de artículos del mismo pedido, el primero). No corta facturas: solo la referencia.
-        "referencia": inv["ref"] or next(iter(EBAY_ORDER_RE.findall(md)), ""),
+        "referencia": inv["ref"] or next(iter(EBAY_ORDER_RE.findall(md)), "") or printed_ref(md),
         "ocr": fields,
         "_ambiguo": source == "llm" and ambiguous,
         # interno (build_all lo retira): las líneas cuadran con un total o subtotal IMPRESO

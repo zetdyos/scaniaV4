@@ -9,8 +9,9 @@ last_busy_report = 0
 
 
 JOBS = str(__import__("pathlib").Path(__file__).resolve().parents[1] / "demo_jobs")
-DEPLOY = "20261021-2126"  # despliegue de 6cc483a (27B con visión: segundo intento con la imagen de la página): los trabajos anteriores son la referencia
+DEPLOY = "20261021-2303"  # despliegue de 90d1b21 (foto: cantidad > 1 con un solo precio impreso): los trabajos anteriores son la referencia
 count = {"docs": 0, "facturas": 0, "revision": 0, "imagen": 0}  # desde que arranca el vigilante
+count.update(json.loads(__import__("os").environ.get("VIGILAR_CONTADOR") or "{}"))  # seguir un recuento anterior
 
 
 def summary(job_id):
