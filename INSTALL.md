@@ -16,7 +16,7 @@ Un `llama-server` por modelo, escuchando en todas las interfaces:
 llama-server -m GLM-OCR-Q8_0.gguf --mmproj mmproj-GLM-OCR-Q8_0.gguf -ngl 99 -c 16384 --host 0.0.0.0 --port 8086
 
 # Qwen2.5-VL-7B (rescate visual de precios y cantidades) — puerto 8088
-llama-server -m Qwen2.5-VL-7B-Q4_K_M.gguf --mmproj <mmproj-Qwen2.5-VL-7B>.gguf -ngl 99 -c 12288 --host 0.0.0.0 --port 8088
+llama-server -m Qwen2.5-VL-7B-Q4_K_M.gguf --mmproj <mmproj-Qwen2.5-VL-7B>.gguf -ngl 99 -c 8192 -fa on --cache-type-k q8_0 --cache-type-v q8_0 --host 0.0.0.0 --port 8088   # GPU1; desde 2026-10-21 (drop-in achicar.conf): 8650 -> ~6900 MiB, lecturas de foto iguales (191/202)
 
 # Qwen3.6-27B (estructuración de líneas; solo texto) — puerto 8083
 llama-server -m Qwen3.6-27B-Q6_K.gguf -ngl 99 -c 16384 --host 0.0.0.0 --port 8083 --jinja
@@ -33,7 +33,7 @@ En 192.168.1.194 los servidores son unidades systemd `scania-mdl-*` agrupadas en
 
 ### 2.1 PP-OCRv6 (geometría de los saltos de página) — puerto 8089
 
-No es un llama-server: detección + reconocimiento de texto de PaddleOCR (no generativo) que devuelve cada renglón con su caja. La fase 2 lo usa solo en facturas de varias páginas, para ver qué renglones del principio de una página continúan el último artículo de la anterior (ver `fix_page_breaks` en `facturas_json.py`). Corre en la **GPU0** junto al 27B (petición expresa del usuario; usa ~2 GB, tope `FLAGS_gpu_memory_limit_mb=2048`), ~1 s por página.
+No es un llama-server: detección + reconocimiento de texto de PaddleOCR (no generativo) que devuelve cada renglón con su caja. La fase 2 lo usa solo en facturas de varias páginas, para ver qué renglones del principio de una página continúan el último artículo de la anterior (ver `fix_page_breaks` en `facturas_json.py`). Corre en la **GPU1** desde el 2026-10-21 (drop-in `scania-mdl-ppocr.service.d/gpu1.conf`: `CUDA_VISIBLE_DEVICES=1`, arranca tras GLM-OCR, Qwen2.5-VL, embedding y reranker); antes en la GPU0 junto al 27B. Usa ~1–2 GB (tope `FLAGS_gpu_memory_limit_mb=2048`, más ~0,4 GB de contexto CUDA fuera del tope) y libera la caché del asignador tras cada petición, ~1 s por página. En la GPU1 solo cabe con el Qwen2.5-VL achicado (sin él, una página pidió más de lo libre: OOM). Prueba de carga: 30 páginas más pesadas, mismas cajas, pico de GPU1 22,5/24,5 GB.
 
 ```bash
 # en 192.168.1.194, usuario techstudi
@@ -47,7 +47,7 @@ python3 -m venv ~/ppocr-gpu-venv
 #   fragmenta hasta el tope (OOM con solo 666 MB en uso real).
 ```
 
-Unidad `/etc/systemd/system/scania-mdl-ppocr.service` (`WantedBy=scania-models.target`, `PartOf=scania-models.target`): `CUDA_VISIBLE_DEVICES=0`, `FLAGS_gpu_memory_limit_mb=2048`, `After=scania-mdl-text.service` y un `ExecStartPre` que espera hasta 5 min al `/health` del 27B (puerto 8083) para que el 27B reserve su memoria de GPU0 antes (en la unidad el `$` se escribe `$$`). Comprobar: `systemctl is-enabled scania-mdl-ppocr` → `enabled`; `curl -s http://192.168.1.194:8089/health`.
+Unidad `/etc/systemd/system/scania-mdl-ppocr.service` (`WantedBy=scania-models.target`, `PartOf=scania-models.target`): `CUDA_VISIBLE_DEVICES=0` (sobrescrito a 1 por el drop-in `gpu1.conf`), `FLAGS_gpu_memory_limit_mb=2048`, `After=scania-mdl-text.service` y un `ExecStartPre` que espera hasta 5 min al `/health` del 27B (puerto 8083) para que el 27B reserve su memoria de GPU0 antes (en la unidad el `$` se escribe `$$`). Comprobar: `systemctl is-enabled scania-mdl-ppocr` → `enabled`; `curl -s http://192.168.1.194:8089/health`.
 
 Si el servicio no responde, la fase 2 sigue como antes de este paso (registra «PP-OCRv6 no disponible» y no realinea nada).
 
