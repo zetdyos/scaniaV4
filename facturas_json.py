@@ -1028,6 +1028,18 @@ def choose_header(base, total, cands, descuentos, otros, max_items=6):
     return None
 
 
+def photo_unit(l, literal):
+    """Precio por unidad de una línea para leer su cantidad en la foto: el precio unitario literal; si no hay, el único
+    precio impreso de la línea (importe literal) cuando la cantidad del 27B es 1 o cuando es > 1 con un solo precio
+    impreso (el caso de la opción D, 31144: «2» en la foto, «$84.52», el 27B dio 2 x 84.52 en el importe). Sin él, "".
+    Que ese precio sea por unidad lo confirma solo el cuadre exacto de vl_quantities."""
+    if literal(l.get("unit")):
+        return l["unit"]
+    if literal(l.get("amount")) and (l["qty"] == 1 or l in unit_price_candidates([l])):
+        return l["amount"]
+    return ""
+
+
 def vl_quantities(lines, vl_lines, literal, sq_text, goal):
     """Cantidades que solo se ven en la imagen (Amazon las pone sobre la foto del producto; el OCR no las lee).
     Las líneas del 27B se quedan; de Qwen2.5-VL solo se toma la CANTIDAD del mismo artículo (mismo precio
@@ -1035,7 +1047,7 @@ def vl_quantities(lines, vl_lines, literal, sq_text, goal):
     cantidad x precio de TODOS los artículos da exactamente lo impreso (goal); si no, None."""
     used, out, changed = set(), [], 0
     for l in lines:
-        unit = l.get("unit") if literal(l.get("unit")) else (l.get("amount") if l["qty"] == 1 and literal(l.get("amount")) else "")
+        unit = photo_unit(l, literal)
         if not unit or float(unit) <= 0:
             return None
         key = desc_key(l.get("desc"))[:30]
@@ -1048,7 +1060,8 @@ def vl_quantities(lines, vl_lines, literal, sq_text, goal):
                 m = best
                 used.add(m)
         q = vl_lines[m]["qty"] if m is not None else l["qty"]
-        if q != l["qty"]:
+        # la misma cantidad que el 27B también cambia la línea si su importe era el precio de una unidad (31144)
+        if q != l["qty"] or (m is not None and l["qty"] > 1 and not literal(l.get("unit")) and q * float(unit) != float(l["amount"])):
             changed += 1
             out.append(dict(l, qty=q, unit=unit, amount=f"{q * float(unit):.2f}", amount_calc=True, qty_vl=True))
         else:
@@ -1190,8 +1203,7 @@ def photo_quantities(pdf, pages, lines, literal, server, timeout, log):
             return []
         used = set()
         for price, rect in photos:
-            l = next((l for l in on_page if id(l) not in used and price and
-                      price == (l.get("unit") if literal(l.get("unit")) else l.get("amount") if l["qty"] == 1 else "")), None)
+            l = next((l for l in on_page if id(l) not in used and price and price == photo_unit(l, literal)), None)
             if l is None:
                 continue
             used.add(id(l))

@@ -9,7 +9,8 @@ last_busy_report = 0
 
 
 JOBS = str(__import__("pathlib").Path(__file__).resolve().parents[1] / "demo_jobs")
-DEPLOY = "20261021-1754"  # despliegue de f96ebdc (27B calibrado: sin la nota de verificación, importe antes de impuestos): los trabajos anteriores son la referencia
+DEPLOY = "20261021-2126"  # despliegue de 6cc483a (27B con visión: segundo intento con la imagen de la página): los trabajos anteriores son la referencia
+count = {"docs": 0, "facturas": 0, "revision": 0, "imagen": 0}  # desde que arranca el vigilante
 
 
 def summary(job_id):
@@ -86,6 +87,23 @@ while True:
                                   f"(importe {_ln['importe_linea']})", flush=True)
             except Exception as e:  # noqa: BLE001
                 print(f"{now}   (no se pudo revisar la regla de cantidad: {e})", flush=True)
+            try:
+                from pathlib import Path as _P
+                _r = json.loads((_P(JOBS) / j["id"] / "result.json").read_text(encoding="utf-8"))
+                count["docs"] += 1
+                count["facturas"] += len(_r)
+                count["revision"] += sum(1 for _i in _r if _i["motivo_revision"])
+                for _i in _r:
+                    if _i["ocr"].get("origen_lineas") == "llm+imagen":
+                        count["imagen"] += 1
+                        print(f"{now}   CON IMAGEN {j['pdf']}#{_i['id']}: total {_i['total']}, "
+                              f"{sum(1 for _l in _i['lineas'] if _l.get('line_kind') == 'goods')} artículos, sin revisión", flush=True)
+                _f = count["facturas"]
+                print(f"{now}   CONTADOR: {count['docs']} docs, {_f} facturas, {count['revision']} a revisión, "
+                      f"{_f - count['revision']} sin revisión ({100 * (_f - count['revision']) / _f:.1f} %), "
+                      f"{count['imagen']} por imagen", flush=True)
+            except Exception as e:  # noqa: BLE001
+                print(f"{now}   (contador: {e})", flush=True)
             if j.get("n_review"):
                 try:
                     from pathlib import Path as _P
