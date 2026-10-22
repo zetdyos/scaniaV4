@@ -1462,6 +1462,19 @@ def ppocr_tokens(pdf, page_idx, timeout=120):
     return _PPOCR_CACHE[key]
 
 
+def ppocr_text(pdf, pages, log=None):
+    """Texto de PP-OCRv6 de esas páginas, una caja por renglón (para las cifras impresas); "" si no está disponible."""
+    out = []
+    for p in pages:
+        try:
+            out += [t for *_, t in ppocr_tokens(pdf, p)[0]]
+        except Exception as e:  # noqa: BLE001  sin PP-OCRv6 las cifras se comprueban solo contra GLM (como antes)
+            if log:
+                log(f"  PP-OCRv6 no disponible ({type(e).__name__}): cifras comprobadas solo contra GLM")
+            return ""
+    return "\n".join(out)
+
+
 def ppocr_rows(pdf, page_idx, timeout=120):
     """Renglones de una página según PP-OCRv6: [{c (centro y), toks [(x0, x1, texto)], text, money, span, alpha_x}]."""
     key = (str(pdf), page_idx)
@@ -1909,7 +1922,8 @@ def fix_block_breaks(lines, pdf, pages, page_texts, log):
         if cut.get("amount") == p:
             continue
         carrier = next((l for l in on_b if l.get("amount") == p), None)
-        printed = printed_count(p, [page_texts.get(pages[k + 1], "")]) >= 1
+        # p lo leyó PP-OCRv6 arriba de B (lector de cifras desde 2026-10-22): impreso aunque GLM no lo leyera (31824)
+        printed = True
         if not cut.get("amount") and carrier is None and printed:
             # el 27B no devolvió ese precio en ninguna línea de B (sin título no lo tomó por artículo): es la cifra que GLM
             # leyó arriba de B, y la geometría dice de qué artículo es (30703, 32431, 30972)
@@ -1991,6 +2005,12 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
     full_texts = [res["full_text"].get(i) or "" for i in pages]
     md = "\n\n---\n\n".join(p1.page_markdown(i + 1, res["full_text"].get(i) or "", regs)[0] for i, regs in zip(pages, regions))
     ocr_amounts = doc_amounts(md) | exact_cents(md)  # "1975.0000" también es literal
+    # PP-OCRv6 también es lector de CIFRAS (decisión del usuario 2026-10-22): no genera texto, lee los caracteres de cada
+    # caja; una cifra que GLM perdió (columnas de la derecha, precio arriba de la página siguiente: 31635, 31824) cuenta
+    # como impresa si PP-OCRv6 la leyó en estas páginas. Solo importes: las descripciones siguen saliendo de GLM.
+    pp_text = ppocr_text(res["pdf"], pages, log)
+    pp_amounts = (doc_amounts(pp_text) | exact_cents(pp_text)) - ocr_amounts
+    ocr_amounts |= pp_amounts
     # también sin etiquetas HTML ni entidades: en las tablas del OCR la descripción viene partida con <br> ("4130158083<br>4130
     # Chromoly...") o con &quot;, y no se encontraría literal aunque esté leída
     sq_text = p1.squash(md) + "|" + p1.squash(html.unescape(re.sub(r"<[^>]+>", " ", md)))
@@ -2123,7 +2143,7 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
     # Se devuelven al final con su line_kind (WTCP solo declara las goods).
     others = [l for l in lines if l.get("kind", "goods") != "goods"]
     lines = [l for l in lines if l.get("kind", "goods") == "goods"]
-    ocr_units = fine_amounts(md)
+    ocr_units = fine_amounts(md) | fine_amounts(pp_text)
     if source == "llm":
         # Respaldo de la cantidad del 27B (solo comprobación, nunca sustitución): impresa en la misma fila de tabla,
         # «xN»/«Qty N» junto a la descripción o al inicio del renglón; si no, la evidencia la juzga (cantidad x precio
