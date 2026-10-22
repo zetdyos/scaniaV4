@@ -1,0 +1,236 @@
+### scania-models.target
+[Unit]
+Description=SCANIA: los modelos (5 llama.cpp + PP-OCRv6)
+Wants=scania-mdl-text.service scania-mdl-glm.service scania-mdl-embed.service scania-mdl-rerank.service
+After=scania-gpu-tune.service
+[Install]
+WantedBy=multi-user.target
+### scania-gpu-tune.service
+[Unit]
+Before=scania-models.service
+Description=SCANIA: desactiva ASPM y fija limite de las 2x RTX 3090
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/scania-gpu-tune.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+### scania-mdl-embed.service
+[Unit]
+Description=SCANIA modelo embed
+After=scania-gpu-tune.service
+Requires=scania-gpu-tune.service
+PartOf=scania-models.target
+
+[Service]
+User=techstudi
+Environment=CUDA_VISIBLE_DEVICES=1
+ExecStart=/home/techstudi/llama.cpp/build/bin/llama-server -m /home/techstudi/models/Qwen3-Embedding-8B-Q8_0.gguf --alias qwen3-embedding-8b --port 8084 --host 0.0.0.0 --embedding --pooling last -ngl 99 -c 2048 -ub 512 -b 2048
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=20
+
+[Install]
+WantedBy=scania-models.target
+### scania-mdl-glm.service
+[Unit]
+Description=SCANIA modelo glm
+After=scania-gpu-tune.service
+Requires=scania-gpu-tune.service
+PartOf=scania-models.target
+
+[Service]
+User=techstudi
+Environment=CUDA_VISIBLE_DEVICES=1
+ExecStart=/home/techstudi/llama.cpp/build/bin/llama-server -m /home/techstudi/models/GLM-OCR-Q8_0.gguf --mmproj /home/techstudi/models/mmproj-GLM-OCR-Q8_0.gguf --alias glm-ocr --port 8086 --host 0.0.0.0 -c 12288 --parallel 1 -ngl 99 -fa on
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=20
+
+[Install]
+WantedBy=scania-models.target
+### scania-mdl-ocr.service
+[Unit]
+Description=SCANIA modelo ocr
+After=scania-gpu-tune.service
+Requires=scania-gpu-tune.service
+PartOf=scania-models.target
+
+[Service]
+User=techstudi
+Environment=CUDA_VISIBLE_DEVICES=1
+ExecStart=/home/techstudi/llama.cpp/build/bin/llama-server -m /home/techstudi/models/OvisOCR2-Q8_0.gguf --mmproj /home/techstudi/models/mmproj-OvisOCR2-F16.gguf --alias ovis-ocr2 --port 8082 --host 0.0.0.0 -c 16384 --parallel 1 -ngl 99 -fa on -ub 1024
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=20
+
+[Install]
+WantedBy=scania-models.target
+### scania-mdl-ppocr.service
+[Unit]
+Description=SCANIA modelo ppocr (PP-OCRv6 det+rec, GPU0, :8089)
+# Arranca despues del 27B y espera a que este cargado: el 27B reserva su memoria de GPU0 primero.
+After=scania-gpu-tune.service scania-mdl-text.service
+Requires=scania-gpu-tune.service
+PartOf=scania-models.target
+
+[Service]
+User=techstudi
+WorkingDirectory=/home/techstudi/ppocr-svc
+Environment=CUDA_VISIBLE_DEVICES=0
+Environment=FLAGS_gpu_memory_limit_mb=2048
+Environment=PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True
+ExecStartPre=/bin/sh -c "for i in $$(seq 1 150); do curl -sf http://127.0.0.1:8083/health >/dev/null && exit 0; sleep 2; done; exit 0"
+ExecStart=/home/techstudi/ppocr-gpu-venv/bin/python app.py --host 0.0.0.0 --port 8089 -m PP-OCRv6_medium
+TimeoutStartSec=420
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=scania-models.target
+### scania-mdl-qwen-vl.service
+[Unit]
+Description=SCANIA modelo qwen-vl
+After=scania-gpu-tune.service
+Requires=scania-gpu-tune.service
+PartOf=scania-models.target
+
+[Service]
+User=techstudi
+Environment=CUDA_VISIBLE_DEVICES=1
+ExecStart=/home/techstudi/llama.cpp/build/bin/llama-server -m /home/techstudi/models/Qwen2.5-VL-7B-Q4_K_M.gguf --mmproj /home/techstudi/models/mmproj-Qwen2.5-VL-7B-f16.gguf --alias qwen2.5-vl --port 8088 --host 0.0.0.0 -c 12288 --parallel 1 -ngl 99 -fa on --temp 0 --top-k 1
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=20
+
+[Install]
+WantedBy=scania-models.target
+### scania-mdl-rerank-4b.service
+# Reranker Qwen3-Reranker-4B (discrimina donde el 0.6b aplana). Puerto NUEVO :8089
+# para A/B contra el 0.6b (:8085) antes de retirar el viejo.
+# Instalar: sudo install -Dm644 deploy/194/finetune/scania-mdl-rerank-4b.service \
+#             /etc/systemd/system/scania-mdl-rerank-4b.service
+#           sudo systemctl daemon-reload && sudo systemctl enable --now scania-mdl-rerank-4b
+# GGUF: ~/models/Qwen3-Reranker-4B-Q8_0.gguf (conversion Voodisss, con tensores de
+# reranker; las de la comunidad dan basura). Necesita --reranking --pooling rank --embedding.
+# VRAM: ~4.3GB en GPU1. Con el 0.6b tambien vivo quedan ~3GB libres -> al adoptar el 4B,
+# retirar el 0.6b (stop+disable scania-mdl-rerank) para hacer sitio a #2/#3.
+[Unit]
+Description=SCANIA modelo rerank 4B (Qwen3-Reranker-4B)
+After=network.target
+
+[Service]
+Environment=CUDA_VISIBLE_DEVICES=1
+ExecStart=/home/techstudi/llama.cpp/build/bin/llama-server -m /home/techstudi/models/Qwen3-Reranker-4B-Q8_0.gguf --alias qwen3-reranker-4b --port 8089 --host 0.0.0.0 --reranking --pooling rank --embedding -ngl 99 -c 2048 -ub 512
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=scania-models.target
+### scania-mdl-rerank.service
+[Unit]
+Description=SCANIA modelo rerank
+After=scania-gpu-tune.service
+Requires=scania-gpu-tune.service
+PartOf=scania-models.target
+
+[Service]
+User=techstudi
+Environment=CUDA_VISIBLE_DEVICES=1
+ExecStart=/home/techstudi/llama.cpp/build/bin/llama-server -m /home/techstudi/models/Qwen3-Reranker-0.6B-Q8_0.gguf --alias qwen3-reranker-0.6b --port 8085 --host 0.0.0.0 --reranking --pooling rank -ngl 99 -c 2048 -ub 512
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=20
+
+[Install]
+WantedBy=scania-models.target
+### scania-mdl-text.service
+[Unit]
+Description=SCANIA modelo text
+After=scania-gpu-tune.service
+Requires=scania-gpu-tune.service
+PartOf=scania-models.target
+
+[Service]
+User=techstudi
+Environment=CUDA_VISIBLE_DEVICES=0
+ExecStart=/home/techstudi/llama.cpp/build/bin/llama-server -m /home/techstudi/models/Qwen3.6-27B-Q6_K.gguf --alias qwen3-27b --port 8083 --host 0.0.0.0 -c 65536 --parallel 2 --jinja -ngl 99 -fa on --cache-type-k q8_0 --cache-type-v q8_0
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=20
+
+[Install]
+WantedBy=scania-models.target
+### scania-mdl-embed.service.d/lora.conf
+# Drop-in para servir el embedding AFINADO (base Q8 + LoRA) en scania-mdl-embed.
+# Instalar en: /etc/systemd/system/scania-mdl-embed.service.d/lora.conf
+# La primera linea ExecStart= vacia limpia la del unit; la segunda la reemplaza.
+[Service]
+ExecStart=
+ExecStart=/home/techstudi/llama.cpp/build/bin/llama-server -m /home/techstudi/models/Qwen3-Embedding-8B-Q8_0.gguf --lora /home/techstudi/models/qwen3-emb-8b-lora-f16.gguf --alias qwen3-embedding-8b-ft --port 8084 --host 0.0.0.0 --embedding --pooling last -ngl 99 -c 2048 -ub 512 -b 2048
+### scania-mdl-embed.service.d/oom.conf
+[Service]
+OOMScoreAdjust=600
+### scania-mdl-glm.service.d/cache-ram.conf
+[Service]
+Environment=LLAMA_ARG_CACHE_RAM=0
+### scania-mdl-glm.service.d/oom.conf
+[Service]
+OOMScoreAdjust=600
+### scania-mdl-ocr.service.d/f16.conf
+# Drop-in: OCR ovis a F16 (arregla el bucle de degeneracion del Q8 en facturas densas).
+# Instalar en: /etc/systemd/system/scania-mdl-ocr.service.d/f16.conf
+# Mismo puerto (:8082) y alias (ovis-ocr2) -> drop-in puro, nada downstream cambia.
+# GGUFs (bajados de mradermacher/OvisOCR2-GGUF, en ~/models de .194):
+#   OvisOCR2-F16.gguf (1.5GB) + mmproj-OvisOCR2-mrader-F16.gguf (205MB).
+# VRAM extra vs Q8: ~+0.7GB en GPU1 (cabe de sobra). Alternativa mas ligera: Q6_K.
+[Service]
+ExecStart=
+ExecStart=/home/techstudi/llama.cpp/build/bin/llama-server -m /home/techstudi/models/OvisOCR2-F16.gguf --mmproj /home/techstudi/models/mmproj-OvisOCR2-mrader-F16.gguf --alias ovis-ocr2 --port 8082 --host 0.0.0.0 -c 16384 --parallel 1 -ngl 99 -fa on -ub 1024
+### scania-mdl-ocr.service.d/oom.conf
+[Service]
+OOMScoreAdjust=600
+### scania-mdl-ppocr.service.d/gpu1.conf
+[Unit]
+Description=SCANIA modelo ppocr (PP-OCRv6 det+rec, GPU1, :8089)
+# 2026-10-21: en GPU1 (libera GPU0 para el proyector de vision del 27B); arranca tras los modelos de GPU1
+After=scania-mdl-glm.service scania-mdl-qwen-vl.service scania-mdl-embed.service scania-mdl-rerank.service
+
+[Service]
+Environment=CUDA_VISIBLE_DEVICES=1
+### scania-mdl-qwen-vl.service.d/achicar.conf
+[Service]
+# 2026-10-21: achicar el VL (caché q8_0 como el 27B; 8192 basta: imagen <= 4096 fichas + prompt + 2048 de salida)
+ExecStart=
+ExecStart=/home/techstudi/llama.cpp/build/bin/llama-server -m /home/techstudi/models/Qwen2.5-VL-7B-Q4_K_M.gguf --mmproj /home/techstudi/models/mmproj-Qwen2.5-VL-7B-f16.gguf --alias qwen2.5-vl --port 8088 --host 0.0.0.0 -c 8192 --parallel 1 -ngl 99 -fa on --cache-type-k q8_0 --cache-type-v q8_0 --temp 0 --top-k 1
+### scania-mdl-qwen-vl.service.d/cache-ram.conf
+[Service]
+Environment=LLAMA_ARG_CACHE_RAM=0
+### scania-mdl-qwen-vl.service.d/oom.conf
+[Service]
+OOMScoreAdjust=600
+### scania-mdl-rerank-4b.service.d/oom.conf
+[Service]
+OOMScoreAdjust=600
+### scania-mdl-rerank.service.d/oom.conf
+[Service]
+OOMScoreAdjust=600
+### scania-mdl-text.service.d/cache-ram.conf
+[Service]
+Environment=LLAMA_ARG_CACHE_RAM=0
+### scania-mdl-text.service.d/oom.conf
+[Service]
+OOMScoreAdjust=600
+### scania-mdl-text.service.d/v3.conf
+[Service]
+ExecStart=
+ExecStart=/home/techstudi/llama.cpp/build/bin/llama-server -m /home/techstudi/models/Qwen3.6-27B-Q6_K.gguf --alias qwen3-27b --port 8083 --host 0.0.0.0 -c 16384 --parallel 1 --jinja -ngl 99 -fa on --cache-type-k q8_0 --cache-type-v q8_0
+### scania-mdl-text.service.d/zz-vision.conf
+[Service]
+# 2026-10-21: 27B con su proyector de vision (Qwen3.6 mmproj F16, qwen3vl_merger); imagen <= 2048 fichas para acotar la memoria de GPU0
+ExecStart=
+ExecStart=/home/techstudi/llama.cpp/build/bin/llama-server -m /home/techstudi/models/Qwen3.6-27B-Q6_K.gguf --mmproj /home/techstudi/models/mmproj-Qwen3.6-27B-F16.gguf --image-max-tokens 2048 --alias qwen3-27b --port 8083 --host 0.0.0.0 -c 16384 --parallel 1 --jinja -ngl 99 -fa on --cache-type-k q8_0 --cache-type-v q8_0
+### ESTADO
+enabled enabled enabled enabled enabled enabled enabled
