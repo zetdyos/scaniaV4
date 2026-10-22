@@ -12,8 +12,8 @@ import ocr_pipeline as p1
 RAW = {}
 
 
-def fake_27b(markdown, server, timeout, log):
-    r = RAW["27b"].get(f2.md_key(markdown))
+def fake_27b(markdown, server, timeout, log, image=None):
+    r = RAW.get("27b_imagen" if image else "27b", {}).get(f2.md_key(markdown))
     if r is None:
         return None, "sin respuesta guardada del 27B para este texto"
     return json.loads(r["content"], parse_float=Decimal), ("model output limit reached" if r.get("finish_reason") == "length" else "")
@@ -61,6 +61,7 @@ def fake_vl(pdf, pages, server, timeout, log):
 
 f2.lines_with_llm, f2.ppocr_tokens, f2.photo_quantity, f2.lines_with_vl = fake_27b, fake_ppocr, fake_photo, fake_vl
 p1.server_ok = lambda url: True
+f2.server_has_vision = lambda server: bool(RAW.get("27b_imagen"))  # solo si el trabajo guardó respuestas con imagen
 
 for job in sys.argv[1:]:
     d = REPO / "demo_jobs" / job

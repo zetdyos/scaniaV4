@@ -29,7 +29,7 @@ def num(s):
         return 0
 
 
-def fake_llm(markdown, server, timeout, log):
+def fake_llm(markdown, server, timeout, log, image=None):
     cut = lambda x: x.split("\n### Verificación de importes")[0].rstrip()  # el texto que llega al 27B, con o sin la nota
     page = next((n for n, t in page_md.items() if cut(t) == cut(markdown)), None)
     t = totals.get(page, "")
@@ -53,6 +53,7 @@ def cached_ppocr(pdf, page_idx, timeout=120):
 if os.environ.get("REPLAY_FOTOS"):
     p1.server_ok = lambda url: True
 for mod in (new, old):
+    mod.server_has_vision = lambda server: False  # la reconstrucción no tiene respuestas con imagen
     mod.lines_with_llm = fake_llm
     mod.lines_with_vl = lambda *a, **k: ([], "")
     if hasattr(mod, "photo_quantities"):

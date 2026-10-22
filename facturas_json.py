@@ -491,7 +491,33 @@ VERIF_HEADER = "\n### Verificación de importes"  # sección de diagnóstico que
 _LLM_CACHE = {}  # (servidor, Markdown de la página) -> respuesta; se vacía por documento en build_all
 # Respuestas crudas de los modelos del último documento (build_all las vacía al empezar): la API las guarda en
 # modelos.json de cada trabajo para medir cambios del código y calibrar los modelos sin volver a llamarlos.
-MODEL_RAW = {"27b": {}, "vl_pagina": {}, "vl_foto": {}, "ppocr": {}}
+MODEL_RAW = {"27b": {}, "27b_imagen": {}, "vl_pagina": {}, "vl_foto": {}, "ppocr": {}}
+# 27B con su proyector de visión (desde 2026-10-21, --image-max-tokens 2048 en el host): cuando una factura no cuadra con
+# la lectura de texto, se repite con la imagen de cada página delante del texto de GLM (ver build_all).
+IMAGE_MAX_TOKENS = 2048
+IMAGE_PREFACE = ("The image is the page itself. The OCR text below was read from it and can contain errors: misread "
+                 "digits, rows paired with the wrong description, struck-through prices, text lost at the edges. Read "
+                 "each line and value from the image; use the OCR text only as help.\n\n")
+
+
+def page_image(pdf, page_idx):
+    """PNG en base64 de una página, al dpi que cabe en IMAGE_MAX_TOKENS fichas (p1.fit_dpi, como la fase 1)."""
+    with fitz.open(pdf) as doc:
+        pg = doc[page_idx]
+        return base64.b64encode(pg.get_pixmap(dpi=p1.fit_dpi(pg, 200, IMAGE_MAX_TOKENS), alpha=False).tobytes("png")).decode("ascii")
+
+
+_VISION = {}
+
+
+def server_has_vision(server):
+    """El servidor del 27B tiene proyector de visión (GET /props, modalities.vision); se pregunta una vez por proceso."""
+    if server not in _VISION:
+        try:
+            _VISION[server] = bool(requests.get(f"{server}/props", timeout=10).json().get("modalities", {}).get("vision"))
+        except Exception:  # noqa: BLE001
+            _VISION[server] = False
+    return _VISION[server]
 
 
 def md_key(markdown):
@@ -499,15 +525,16 @@ def md_key(markdown):
     return hashlib.sha1((markdown or "").encode("utf-8")).hexdigest()
 
 
-def lines_with_llm(markdown, server, timeout, log):
+def lines_with_llm(markdown, server, timeout, log, image=None):
     """Una llamada al 27B con el Markdown de UNA página. Devuelve (datos, motivo_de_fallo).
     max_tokens = n_ctx - prompt (antes 4096 fijo: una factura de 54 artículos se cortaba siempre). Si la
     respuesta se corta o no es JSON devuelve (las líneas completas que llegó a escribir o None, motivo) en vez de lanzar:
     la factura va a revisión.
     Temperatura 0 y top_k 1: la misma página da la misma respuesta, así que se reutiliza (corte por pedidos)."""
-    if (server, markdown) not in _LLM_CACHE:
-        _LLM_CACHE[(server, markdown)] = _lines_with_llm(markdown, server, timeout, log)
-    return _LLM_CACHE[(server, markdown)]
+    key = (server, markdown, md_key(image) if image else "")
+    if key not in _LLM_CACHE:
+        _LLM_CACHE[key] = _lines_with_llm(markdown, server, timeout, log, image)
+    return _LLM_CACHE[key]
 
 
 def complete_objects(content, key):
@@ -529,13 +556,18 @@ def complete_objects(content, key):
             out.append(obj)
 
 
-def _lines_with_llm(markdown, server, timeout, log):
+def _lines_with_llm(markdown, server, timeout, log, image=None):
     user = USER_PROMPT.format(doc=markdown)
-    budget = server_n_ctx(server) - count_tokens(server, SYSTEM_PROMPT + "\n" + user) - PROMPT_MARGIN_TOKENS
+    if image:  # la imagen de la página delante; sus fichas cuentan en el contexto (tope --image-max-tokens del host)
+        user = IMAGE_PREFACE + user
+    budget = (server_n_ctx(server) - count_tokens(server, SYSTEM_PROMPT + "\n" + user) - PROMPT_MARGIN_TOKENS
+              - (IMAGE_MAX_TOKENS if image else 0))
     if budget < 512:
         return None, "page text too long for the model context"
     payload = {
-        "messages": [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": user}],
+        "messages": [{"role": "system", "content": SYSTEM_PROMPT},
+                     {"role": "user", "content": [{"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image}"}},
+                                                  {"type": "text", "text": user}] if image else user}],
         "temperature": 0, "top_k": 1, "max_tokens": budget,
         # cache_prompt false: el README de llama-server (38a5b42) avisa que reutilizar la caché de la orden «can cause
         # nondeterministic results»; _LLM_CACHE y la opción D dan por hecho que la misma página da la misma respuesta.
@@ -546,7 +578,7 @@ def _lines_with_llm(markdown, server, timeout, log):
     rj = post_json(f"{server}/v1/chat/completions", payload, timeout, log=log)
     choice = rj["choices"][0]
     content = re.sub(r"<think>.*?</think>", "", choice["message"]["content"] or "", flags=re.S).strip()
-    MODEL_RAW["27b"][md_key(markdown)] = {"content": content, "finish_reason": choice.get("finish_reason")}
+    MODEL_RAW["27b_imagen" if image else "27b"][md_key(markdown)] = {"content": content, "finish_reason": choice.get("finish_reason")}
     from decimal import Decimal
     fail = "model output limit reached" if choice.get("finish_reason") == "length" else ""
     try:
@@ -1890,7 +1922,7 @@ def unit_price_candidates(lines):
             and (not l.get("unit") or l["unit"] == l["amount"])]
 
 
-def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log, vl=True, unit_alt=False):
+def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log, vl=True, unit_alt=False, img=False):
     pages = inv["pages"]
     regions = [res["region_pages"][i] if i < len(res["region_pages"]) else [] for i in pages]
     full_texts = [res["full_text"].get(i) or "" for i in pages]
@@ -1937,7 +1969,8 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
             # usando el Markdown completo. Calibrado el 2026-10-21 (con la frase del importe antes de impuestos del prompt):
             # 68 documentos auditados, 88 -> 92 facturas sin revisión, todas correctas, sin empeorar ninguna.
             page_md = p1.page_markdown(i + 1, res["full_text"].get(i) or "", regs)[0]
-            data, fail = lines_with_llm(page_md.split(VERIF_HEADER)[0].rstrip(), llm_server, timeout, log)
+            data, fail = lines_with_llm(page_md.split(VERIF_HEADER)[0].rstrip(), llm_server, timeout, log,
+                                        page_image(res["pdf"], i) if img else None)
             if fail:  # incompleta: van las líneas que llegó a escribir enteras (si hay) y la factura a revisión
                 read_failed = True
                 issues.append(f"item list on page {i + 1} could not be read completely ({fail}); review against the paper")
@@ -2591,6 +2624,17 @@ def build_all(res, use_llm=True, llm_server=QWEN27_SERVER, vl_server=VL_SERVER, 
                         if "precio por unidad" in m:
                             log(m)
                     log("     con el precio impreso por unidad, todo lo impreso cuadra exactamente")
+                    doc, source = alt, alt_source
+            # Lectura con la imagen (27B con su proyector de visión): si no cuadra, se repite con la imagen de cada página
+            # delante del texto de GLM. Se acepta solo si con ella la factura entera termina SIN revisión: las reglas de
+            # siempre siguen valiendo (una cifra que no esté literal en el OCR deja la línea sin verificar -> revisión).
+            if source == "llm" and not doc["_cuadra"] and server_has_vision(llm_server):
+                img_log = []
+                alt, alt_source = build_invoice(len(out), rs, inv, use_llm, llm_server, vl_server, timeout, img_log.append,
+                                                vl=False, img=True)
+                if alt_source == "llm" and alt["_cuadra"] and not alt["motivo_revision"]:
+                    log("     con la imagen de la página (27B con visión), todo lo impreso cuadra exactamente")
+                    alt["ocr"]["origen_lineas"] = "llm+imagen"
                     doc, source = alt, alt_source
             parts = None
             if source == "llm" and not doc["_cuadra"] and len(pages) > 1:
