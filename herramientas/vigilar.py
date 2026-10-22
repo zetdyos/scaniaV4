@@ -2,7 +2,7 @@
 import json, time, urllib.request
 
 API = "http://127.0.0.1:8091/api/jobs"
-SLOTS = {"GLM": 8086, "27B": 8083, "VL": 8088}
+SLOTS = {"GLM": 8086, "27B": 8083}  # el VL no: duerme a los 30 s (--sleep-idle-seconds) y GET /slots lo mantiene despierto
 seen = {}
 first = True
 last_busy_report = 0

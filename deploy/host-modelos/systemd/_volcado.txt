@@ -233,8 +233,9 @@ WantedBy=scania-models.target
 # /etc/systemd/system/scania-mdl-qwen-vl.service.d/achicar.conf
 [Service]
 # 2026-10-21: achicar el VL (caché q8_0 como el 27B; 8192 basta: imagen <= 4096 fichas + prompt + 2048 de salida)
+# 2026-10-22: --sleep-idle-seconds 30 (README de llama-server, Sleeping on Idle): libera toda la memoria tras 30 s sin tareas y recarga con la siguiente; el codificador de imagen sigue en la GPU
 ExecStart=
-ExecStart=/home/techstudi/llama.cpp/build/bin/llama-server -m /home/techstudi/models/Qwen2.5-VL-7B-Q4_K_M.gguf --mmproj /home/techstudi/models/mmproj-Qwen2.5-VL-7B-f16.gguf --alias qwen2.5-vl --port 8088 --host 0.0.0.0 -c 8192 --parallel 1 -ngl 99 -fa on --cache-type-k q8_0 --cache-type-v q8_0 --temp 0 --top-k 1 --no-mmproj-offload
+ExecStart=/home/techstudi/llama.cpp/build/bin/llama-server -m /home/techstudi/models/Qwen2.5-VL-7B-Q4_K_M.gguf --mmproj /home/techstudi/models/mmproj-Qwen2.5-VL-7B-f16.gguf --alias qwen2.5-vl --port 8088 --host 0.0.0.0 -c 8192 --parallel 1 -ngl 99 -fa on --cache-type-k q8_0 --cache-type-v q8_0 --temp 0 --top-k 1 --sleep-idle-seconds 30
 
 # /etc/systemd/system/scania-mdl-qwen-vl.service.d/cache-ram.conf
 [Service]
