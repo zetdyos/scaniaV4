@@ -1699,6 +1699,9 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
     # también sin etiquetas HTML ni entidades: en las tablas del OCR la descripción viene partida con <br> ("4130158083<br>4130
     # Chromoly...") o con &quot;, y no se encontraría literal aunque esté leída
     sq_text = p1.squash(md) + "|" + p1.squash(html.unescape(re.sub(r"<[^>]+>", " ", md)))
+    # también sin los importes intercalados: el 27B junta renglones de la descripción que en el texto llevan el precio
+    # en medio («PovBuds Pro / Amber $64.95 / DUO BUNDLE», 32287); la descripción sigue siendo texto leído.
+    sq_text += "|" + p1.squash(re.sub(r"\(?-?\s*(?:US)?\$\s*\d[\d,]*(?:\.\d{2})?\)?", " ", html.unescape(re.sub(r"<[^>]+>", " ", md))))
     divisa = currency_of(md)
     issues = []
     header_open = False  # cabecera (vía 27B, sin subtotal impreso) que no cerró: se comprueba al final
