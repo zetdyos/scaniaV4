@@ -219,6 +219,18 @@ def fingerprints_of(job_id):
     return fps
 
 
+def with_refs(job_id, fps):
+    """Huellas guardadas antes de 2026-10-22 no traen la referencia: se completa desde result.json (misma factura por id)."""
+    if all("ref" in f for f in fps):
+        return fps
+    try:
+        refs = {i["id"]: (i.get("referencia") or "").upper()
+                for i in json.loads((JOBS_DIR / job_id / "result.json").read_text(encoding="utf-8"))}
+    except (OSError, ValueError, KeyError):
+        refs = {}
+    return [dict(f, ref=f.get("ref", refs.get(f["id"], ""))) for f in fps]
+
+
 def mark_cross_document_duplicates(job, out, markdown, log):
     """El mismo pedido en OTRO documento ya procesado (mismo total, mismos artículos y un identificador impreso
     en común): se declararía dos veces. Va a revisión, con el documento anterior en el motivo. El reenvío del
@@ -230,7 +242,7 @@ def mark_cross_document_duplicates(job, out, markdown, log):
             latest[j["pdf"]] = j["id"]
     for pdf, jid in latest.items():
         try:
-            theirs = fingerprints_of(jid)
+            theirs = with_refs(jid, fingerprints_of(jid))
         except (OSError, ValueError, KeyError):
             continue
         for a, doc in zip(mine, out):
@@ -239,6 +251,14 @@ def mark_cross_document_duplicates(job, out, markdown, log):
                 log(f"  factura {doc['id']}: el mismo pedido ya vino en {pdf} (factura {b['id']})")
                 f2.mark_review(doc, f"same order as invoice {b['id']} of document {pdf} (identical items and total; "
                                     "possible duplicate declaration)")
+                continue
+            # Misma referencia impresa y algún artículo en común aunque cambien total o artículos (versión ampliada o
+            # recortada del mismo papel): la mercancía en común se declararía dos veces.
+            b = next((b for b in theirs if f2.partial_same_order(a, b)), None)
+            if b is not None:
+                log(f"  factura {doc['id']}: misma referencia {a['ref']} y artículos en común con {pdf} (factura {b['id']})")
+                f2.mark_review(doc, f"same order number {a['ref']} as invoice {b['id']} of document {pdf}, with item(s) "
+                                    "in common (possible partial duplicate declaration)")
     return mine
 
 

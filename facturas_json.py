@@ -104,8 +104,8 @@ EBAY_ORDER_RE = re.compile(r"Order\s*number:?\s*(\d{2}-\d{5}-\d{5})(?!\d)", re.I
 # Nunca el renglón siguiente: ahí suele estar el número manuscrito del expediente («INVOICE #16548 — Hayden LA\n32949»).
 # Número: letras/cifras/guiones con >= 4 cifras; sin «$», puntos ni barras («Order Total $…», «Order Date 10.10.2026»).
 _REF_NUM = r"([A-Z0-9][A-Z0-9-]*[A-Z0-9])(?![A-Z0-9.,/$-])"
-PRINTED_REF_RES = [re.compile(r"(?<![A-Za-z])Order[ \t]*(?:No\.?|Number|#|ID)?[ \t]*[:#]?[ \t]*" + _REF_NUM, re.I),
-                   re.compile(r"(?<![A-Za-z])Invoice[ \t]*(?:No\.?|Number|#)?[ \t]*[:#]?[ \t]*" + _REF_NUM, re.I)]
+PRINTED_REF_RES = [re.compile(r"(?<![A-Za-z])Order[ \t]*(?:No\.?|Number|#|ID)?[ \t]*(?:[:#][ \t]*){0,2}" + _REF_NUM, re.I),
+                   re.compile(r"(?<![A-Za-z])Invoice[ \t]*(?:No\.?|Number|#)?[ \t]*(?:[:#][ \t]*){0,2}" + _REF_NUM, re.I)]
 
 
 def printed_ref(text):
@@ -375,7 +375,8 @@ def lines_sum(ls):
 ID_LIKE_RE = re.compile(r"^[A-Z]{0,4}[\d-]{9,}$")
 
 
-COUNT_ONLY_RE = re.compile(r"^\s*\d+\s+\w+\s*$")  # "1 item", "2 items", "1 object": un recuento, no un producto
+# "1 item", "2 items", "1 object", "1 Electronics item" (28647): un recuento, no un producto
+COUNT_ONLY_RE = re.compile(r"^\s*\d+\s+(?:\w+|\w+\s+(?:items?|objects?))\s*$", re.I)
 
 
 def description_issues(lines):
@@ -387,6 +388,63 @@ def description_issues(lines):
     if no_amt:
         out.append(f"{len(no_amt)} item line(s) without an amount: " + ", ".join(f'"{d[:40]}"' for d in no_amt[:3]))
     return out
+
+
+# Descripción tomada de la columna equivocada (33355 «COPE-ZR61KCE-TFD», 33598 «MARMAFDERBYCLUBHC», 33733 «LI-TJ3T»): el
+# 27B devolvió la celda del código cuando la MISMA fila imprime la descripción. Se comprueba por posición, sin modelo:
+# la fila de tabla de la fase 1 (o el renglón de PP-OCRv6) que lleva el importe de la línea y una celda igual a su
+# descripción. Con una descripción así, el código arancelario saldría mal: la factura va a revisión (decisión del
+# usuario 2026-10-22, opción A).
+_MONEY_IN = re.compile(r"\d[.,]\d{2}(?!\d)")
+
+
+def _alpha_words(t):
+    return [w for w in re.split(r"\s+", (t or "").strip()) if re.fullmatch(r"[A-Za-z][A-Za-z'’&]{2,}[.,;)]?", w)]
+
+
+def code_like(t):
+    """Celda tipo código: sin espacios y con a lo sumo una palabra (COPE-ZR61KCE-TFD, MARMAFDERBYCLUBHC, LI-TJ3T)."""
+    t = (t or "").strip()
+    return bool(t) and " " not in t and len(_alpha_words(t)) <= 1
+
+
+def descriptive(t):
+    """Celda con texto de producto: dos o más palabras y sin importes."""
+    return len(_alpha_words(t)) >= 2 and not _MONEY_IN.search(t or "")
+
+
+def desc_column_issues(lines, md, pdf, pages, log):
+    rows = table_rows(md)
+    found = []
+    for l in lines:
+        if not l.get("amount") or not code_like(l.get("desc")):
+            continue
+        k = desc_key(l["desc"])
+        better = None
+        for cells in rows:  # 1) tabla de la fase 1 (celdas)
+            if any(money(c) == l["amount"] for c in cells) and any(desc_key(c) == k for c in cells):
+                better = next((c for c in cells if desc_key(c) != k and descriptive(c)), None)
+                if better:
+                    break
+        if better is None and pdf:  # 2) sin tabla: renglón de PP-OCRv6 con el importe y el código
+            try:
+                for r in ppocr_rows(pdf, pages[min(l.get("page_rel", 1), len(pages)) - 1]):
+                    toks = [t for _, _, t in r["toks"]]
+                    # PP-OCRv6 y GLM difieren en alguna letra del código («LI-TIJ3T» / «LI-TJ3T»): parecido >= 0.8
+                    same = [t for t in toks if difflib.SequenceMatcher(None, desc_key(t), k).ratio() >= 0.8]
+                    if any(money(t) == l["amount"] for t in toks) and same:
+                        better = next((t for t in toks if t not in same and descriptive(t)), None)
+                        if better:
+                            break
+            except Exception as e:  # noqa: BLE001  sin geometría no se comprueba por esa vía
+                log(f"  PP-OCRv6 no disponible ({type(e).__name__}): sin comprobar la columna de descripción")
+        if better:
+            found.append((l["desc"], better))
+    if found:
+        log("  descripción en la columna del código: " + "; ".join(f"«{a}» (la fila imprime «{b[:50]}»)" for a, b in found))
+        return [f"{len(found)} line(s) whose description is an item code while the same row prints a description: "
+                + ", ".join(f'"{a}" -> "{b[:50]}"' for a, b in found[:3])]
+    return []
 
 
 # ----------------------------------------------------------------------------- división en facturas
@@ -667,6 +725,7 @@ PAY_RE = re.compile(r"(Your Bank|Visa|Master\s?Card|Amex|American Express|Discov
 ADDR_START_RE = re.compile(r"^\s*(Ship to|Shipping Address:?|Shipping address)\s*$", re.I)
 ADDR_STOP_RE = re.compile(r"^\s*(Payment|Shipping Speed|Order Summary|Billing|Item\(s\)|Delivered|Not Yet|Shipped|Estimated|Arriving|Total|Sales)", re.I)
 DISCOUNT_RE = re.compile(r"^(.*?(?:discount|coupon|savings).*?)\s*-?\s*(?:USD|\$)\s*-?\s*(\d[\d.,]*(?:[.,]\d{2}))\s*$", re.I)
+NEG_RE = re.compile(r"^([A-Za-z][^$\d-]{2,40}?)\s*:?\s*(?:-\s*(?:USD|\$)|(?:USD|\$)\s*-)\s*(\d[\d.,]*[.,]\d{2})\s*$", re.I)
 SELLER_RE = re.compile(r"Sold by(?:\s+and\s+\w+\s+on\s+behalf\s+of)?:?\s*(.+?)\s*(?:\(seller profile\)|Seller Credentials|Business Price|Condition|Supplied by|$)", re.I)
 CONDITION_RE = re.compile(r"Condition:?\s*([A-Za-z]+)")
 
@@ -717,6 +776,17 @@ def invoice_fields(md, full_texts, inv, pdf):
             if key not in seen:
                 seen.add(key)
                 f["descuentos"].append({"concepto": concepto, "importe": money(d.group(2))})
+    # Envío bonificado: un renglón con importe impreso en NEGATIVO igual al envío impreso lo anula («Free Shipping:
+    # -USD 6.99» bajo «Shipping & Handling: USD 6.99»; 30725, 28074). Sin lista de palabras: lo decide la cifra.
+    if f["envio"] and float(f["envio"]) > 0:
+        for line in md.splitlines():
+            d = NEG_RE.match(line.strip())
+            if d and not line.lstrip().startswith("<") and money(d.group(2)) == f["envio"]:
+                concepto = re.sub(r"\s+", " ", d.group(1)).strip(" :")
+                key = (p1.squash(concepto), d.group(2))
+                if key not in seen:
+                    seen.add(key)
+                    f["descuentos"].append({"concepto": concepto, "importe": money(d.group(2))})
     for text in full_texts:
         lines = text.splitlines()
         for i, line in enumerate(lines):
@@ -967,9 +1037,10 @@ def qty_from_table(l, rows):
     for cells in rows:
         if key not in desc_key(" ".join(cells)):
             continue
-        # la cantidad sola en su celda, o con la unidad de medida ("144 EA", "2 ROL")
+        # la cantidad sola en su celda, o con la unidad de medida ("144 EA", "2 ROL"); también con decimales a cero
+        # ("6.00", "2,000.00": 33480, Complete Framer's Supply)
         ints = sorted({int(m.group(1).replace(",", "")) for c in cells
-                       for m in [re.fullmatch(r"(\d{1,3}(?:,\d{3})+|\d{1,5})(?:\s+[A-Za-z]{1,4})?", c)] if m})
+                       for m in [re.fullmatch(r"(\d{1,3}(?:,\d{3})+|\d{1,5})(?:\.0{1,3})?(?:\s+[A-Za-z]{1,4})?", c)] if m})
         unit, amt = l.get("unit") or "", l.get("amount") or ""
         fit = [q for q in ints if qty_matches(q, unit, amt, l.get("unit_exact"))]
         if len(fit) == 1:
@@ -1346,6 +1417,10 @@ def parse_blocks(regions):
                     v = sq_amount(norm, pats)
                     if v:
                         cur[key] = v
+                # envío bonificado: renglón con importe en negativo igual al envío del bloque («Free Shipping: -USD 6.99»)
+                if (cur["envio"] and float(cur["envio"]) > 0 and not re.search(r"savings|discount|promotionapplied", norm)
+                        and re.search(r"[a-z]:?-(?:usd)?-?\$?" + re.escape(cur["envio"]) + r"$", norm)):
+                    cur["envio_bonificado"] = cur["envio"]
                 if "totalforthisshipment" in norm:
                     t = p1.first_amount(norm.split("totalforthisshipment", 1)[1])
                     if t is not None:
@@ -1370,7 +1445,8 @@ def build_shipment_invoice(inv_id, res, inv, block, k, n, order_fields, order_to
     total, total_printed = block["total"], bool(block["total"])
     # El total del envío puede traer envío, impuestos y un cupón: cuadra si artículos + envío + impuestos − descuento
     # (todos impresos en el propio bloque) = total del envío.
-    extra = sum(float(block[k] or 0) for k in ("envio", "impuestos")) - float(block.get("descuento") or 0)
+    extra = (sum(float(block[k] or 0) for k in ("envio", "impuestos")) - float(block.get("descuento") or 0)
+             - float(block.get("envio_bonificado") or 0))
     derived = block.get("total_derived")  # Grand Total impreso - los demás envíos impresos (ver build_all)
     if not total and derived:
         total = derived
@@ -1636,7 +1712,9 @@ def join_split_items(lines, n_pages, log):
         if not on_a or not on_b:
             continue
         a, b = on_a[-1], on_b[0]
-        if a.get("amount") or no_desc(a.get("desc")) or not b.get("amount") or not no_desc(b.get("desc")):
+        # la segunda mitad sin descripción, o con la MISMA descripción repetida (28858: el 27B la copió en las dos)
+        same = desc_key(a.get("desc")) and desc_key(a.get("desc")) == desc_key(b.get("desc"))
+        if a.get("amount") or no_desc(a.get("desc")) or not b.get("amount") or not (no_desc(b.get("desc")) or same):
             continue
         a.update(amount=b["amount"], amount_exact=b.get("amount_exact"))
         if not a.get("unit"):
@@ -2289,6 +2367,14 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
                 break
         if pick:
             fields["envio"], fields["impuestos"], fields["descuentos"], fields["other_charges"] = pick
+            # Un «descuento» con el mismo importe que una línea de pago del propio 27B es lo pagado (tarjeta regalo,
+            # crédito de la tienda: 32962), que nunca resta del valor del pedido. El 27B se contradice: revisión.
+            paid_amts = {o["amount"] for o in others if o.get("kind") == "payment" and o.get("amount")
+                         and float(o["amount"]) > 0 and o["amount"] in ocr_amounts}
+            for d in fields["descuentos"]:
+                if d.get("importe") and float(d["importe"]) > 0 and d["importe"] in paid_amts:
+                    issues.append(f"discount «{d['concepto'][:40]}» {d['importe']} is also listed as a payment "
+                                  f"(gift card or store credit applied is not a discount)")
         else:
             fields["envio"], fields["impuestos"] = cands["envio"][0], cands["impuestos"][0]
             # Las líneas pueden cuadrar con el "Item(s) Subtotal" y aun así la cabecera no cerrar con el total
@@ -2487,6 +2573,8 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
             issues.append(f"vision model (Qwen2.5-VL) not responding at {vl_server}; no visual check")
 
     issues += description_issues(lines)
+    if source == "llm":
+        issues += desc_column_issues(lines, md, res["pdf"], pages, log)
     # Artículo con importe 0.00 pero precio unitario impreso: no se envió (pendiente, "B/O") o la cantidad no es la
     # enviada. WTCP declararía mercancía que no viene: siempre a revisión (decisión del usuario, 2026-10-19).
     zero = [l for l in lines if l.get("amount") and float(l["amount"]) == 0 and l.get("unit")
@@ -2636,13 +2724,24 @@ def order_fingerprints(docs, markdown):
         goods = sorted([l["importe_linea"], desc_key(l["descripcion"])[:20]] for l in d["lineas"] if l["line_kind"] == "goods")
         a, b = d["ocr"]["paginas"]
         ids = sorted({x.upper() for n in range(a, b + 1) for x in ORDER_ID_RE.findall(texts.get(n, ""))})
-        out.append({"id": d["id"], "total": d["total"], "goods": goods, "ids": ids,
+        out.append({"id": d["id"], "total": d["total"], "goods": goods, "ids": ids, "ref": (d.get("referencia") or "").upper(),
                     "envios": d["ocr"].get("origen_lineas") == "envios"})
     return out
 
 
 def same_order(a, b):
     return bool(a["goods"]) and a["total"] == b["total"] and a["goods"] == b["goods"] and bool(set(a["ids"]) & set(b["ids"]))
+
+
+def partial_same_order(a, b):
+    """El mismo pedido o factura impreso (misma referencia) con al menos un artículo en común (mismo importe y
+    descripción), aunque cambien el total o los demás artículos: una versión ampliada o recortada del mismo papel
+    (33135/32396: Streamline SLV-00488547 con 2 y luego 4 artículos; 33155/32671: el pedido entero y luego una parte).
+    Dos envíos distintos del mismo pedido de Amazon no comparten artículos y no cuentan. Medido 2026-10-22 sobre el
+    historial de WTCP: 14 parejas, todas para revisión humana."""
+    if not a.get("ref") or a.get("ref") != b.get("ref"):
+        return False
+    return bool({tuple(g) for g in a["goods"]} & {tuple(g) for g in b["goods"]})
 
 
 def mark_review(doc, note):
@@ -2716,7 +2815,18 @@ def build_all(res, use_llm=True, llm_server=QWEN27_SERVER, vl_server=VL_SERVER, 
                 img_log = []
                 alt, alt_source = build_invoice(len(out), rs, inv, use_llm, llm_server, vl_server, timeout, img_log.append,
                                                 vl=False, img=True)
-                if alt_source == "llm" and alt["_cuadra"] and not alt["motivo_revision"]:
+                # La imagen solo completa la lectura de texto, nunca la contradice: cada importe de artículo que la vía de
+                # texto leyó literal sigue en alguna línea (como importe o como precio unitario: «3» en la foto), y el
+                # total es el mismo total impreso que ya había encontrado la vía de texto (33349, 33440, 33447, 33117).
+                txt_amts = {l["importe_linea"] for l in doc["lineas"] if l["line_kind"] == "goods" and l["importe_linea"]
+                            and l["ocr"]["evidencia"].get("importe_linea") == "leido"}
+                alt_vals = {v for l in alt["lineas"] if l["line_kind"] == "goods"
+                            for v in (l["importe_linea"], l["ocr"].get("precio_unitario"))}
+                keeps = (txt_amts <= alt_vals and doc["total_is_printed"] and doc["total"]
+                         and alt["total"] and float(alt["total"]) == float(doc["total"]))
+                if alt_source == "llm" and alt["_cuadra"] and not alt["motivo_revision"] and not keeps:
+                    log("     con la imagen cuadraría, pero cambia lo que la vía de texto leyó (importe o total): se descarta")
+                if alt_source == "llm" and alt["_cuadra"] and not alt["motivo_revision"] and keeps:
                     log("     con la imagen de la página (27B con visión), todo lo impreso cuadra exactamente")
                     alt["ocr"]["origen_lineas"] = "llm+imagen"
                     doc, source = alt, alt_source
