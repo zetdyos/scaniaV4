@@ -261,16 +261,16 @@ def mark_cross_document_duplicates(job, out, markdown, log):
             b = next((b for b in theirs if f2.same_order(a, b)), None)
             if b is not None:
                 log(f"  factura {doc['id']}: el mismo pedido ya vino en {pdf} (factura {b['id']})")
-                f2.mark_review(doc, f"same order as invoice {b['id']} of document {pdf} (identical items and total; "
-                                    "possible duplicate declaration)")
+                f2.mark_duplicate(doc, f"same order as invoice {b['id']} of document {pdf} (identical items and total; "
+                                       "possible duplicate declaration)", pdf, b["id"], "total", jid)
                 continue
             # Misma referencia impresa y algún artículo en común aunque cambien total o artículos (versión ampliada o
             # recortada del mismo papel): la mercancía en común se declararía dos veces.
             b = next((b for b in theirs if f2.partial_same_order(a, b)), None)
             if b is not None:
                 log(f"  factura {doc['id']}: misma referencia {a['ref']} y artículos en común con {pdf} (factura {b['id']})")
-                f2.mark_review(doc, f"same order number {a['ref']} as invoice {b['id']} of document {pdf}, with item(s) "
-                                    "in common (possible partial duplicate declaration)")
+                f2.mark_duplicate(doc, f"same order number {a['ref']} as invoice {b['id']} of document {pdf}, with item(s) "
+                                       "in common (possible partial duplicate declaration)", pdf, b["id"], "parcial", jid)
     return mine
 
 

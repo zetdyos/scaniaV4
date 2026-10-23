@@ -66,9 +66,10 @@ Convenciones del esquema:
     devuelva un modelo fuera de ese formato se descarta.
   - estado "DONE" al terminar. motivo_revision (lo decide la lectura, por prioridad):
     "ESTRUCTURA" si la factura no tiene marcador de pedido ni líneas (no parece una factura de
-    mercadería), "LECTURA" si hubo incidencias de lectura, "" si no. "CLASIFICACION" queda
-    reservado para la fase de clasificación. mismatch: discrepancias o notas de rescate, en
-    inglés (lo muestra WTCP tal cual a quien revisa), o "".
+    mercadería), "DUPLICADO" si el mismo pedido ya vino (en este archivo o en otro documento;
+    ocr.duplicado dice con quién: ver mark_duplicate), "LECTURA" si hubo incidencias de lectura,
+    "" si no. "CLASIFICACION" queda reservado para la fase de clasificación. mismatch:
+    discrepancias o notas de rescate, en inglés (lo muestra WTCP tal cual a quien revisa), o "".
   - total_is_printed: true si el total se leyó impreso; false si se sumó de las líneas.
   - result_version: versión de este formato (1).
 
@@ -310,14 +311,20 @@ def money(v):
     return f"{abs(val):.2f}" if val is not None else ""
 
 
+ONE_DEC_RE = re.compile(r"(?<![\d.,])(?:\d{1,3}(?:,\d{3})+|\d+)\.\d(?![\d.,A-Za-z%])")  # «1172.9»: sin el cero final
+
+
 def doc_amounts(text):
-    """Importes presentes en el texto (con o sin marca de moneda), normalizados a '1234.56'."""
+    """Importes presentes en el texto (con o sin marca de moneda), normalizados a '1234.56'. También los impresos con
+    UN decimal («1172.9» por 1172.90: TD SYNNEX 33611 imprime el extendido sin el cero final), que valen lo mismo;
+    no si les sigue una letra o un signo («3.3oz», «4.2o»)."""
     out = set()
     for a, b in AMOUNT_RE.findall(text or ""):
         val = parse_amount(a or b)
         if val is not None:
             out.add(f"{abs(val):.2f}")
     out |= {f"{float(x.replace(',', '')):.2f}" for x in INT_AMOUNT_RE.findall(text or "")}
+    out |= {f"{float(x.replace(',', '')):.2f}" for x in ONE_DEC_RE.findall(text or "")}
     return out
 
 
@@ -761,6 +768,8 @@ def invoice_fields(md, full_texts, inv, pdf):
         # cargos que no son artículos, envío, impuestos ni descuentos (categoría abierta, acordada con el usuario);
         # misma forma que descuentos. Las etiquetas no lo rellenan; en la vía del 27B, build_invoice lo toma de sus líneas other_charges.
         "other_charges": [],
+        # el mismo pedido ya enviado: [{documento, factura, alcance ('total'|'parcial'), trabajo}] (ver mark_duplicate)
+        "duplicado": [],
         "metodo_pago": "",
         "destinatario": "",
         "direccion_envio": "",
@@ -1041,10 +1050,10 @@ def qty_from_table(l, rows):
     for cells in rows:
         if key not in desc_key(" ".join(cells)):
             continue
-        # la cantidad sola en su celda, o con la unidad de medida ("144 EA", "2 ROL"); también con decimales a cero
-        # ("6.00", "2,000.00": 33480, Complete Framer's Supply)
+        # la cantidad sola en su celda, o con la unidad de medida ("144 EA", "2 ROL"; también pegada: "10EA", TD SYNNEX
+        # 33611, la celda pierde el salto de línea); también con decimales a cero ("6.00", "2,000.00": 33480)
         ints = sorted({int(m.group(1).replace(",", "")) for c in cells
-                       for m in [re.fullmatch(r"(\d{1,3}(?:,\d{3})+|\d{1,5})(?:\.0{1,3})?(?:\s+[A-Za-z]{1,4})?", c)] if m})
+                       for m in [re.fullmatch(r"(\d{1,3}(?:,\d{3})+|\d{1,5})(?:\.0{1,3})?(?:\s*[A-Za-z]{1,4})?", c)] if m})
         unit, amt = l.get("unit") or "", l.get("amount") or ""
         fit = [q for q in ints if qty_matches(q, unit, amt, l.get("unit_exact"))]
         if len(fit) == 1:
@@ -2281,9 +2290,21 @@ def partial_same_order(a, b):
 
 def mark_review(doc, note):
     doc["mismatch"] = "; ".join(filter(None, [doc["mismatch"], note]))
-    if doc["motivo_revision"] != "ESTRUCTURA":
+    if doc["motivo_revision"] not in ("ESTRUCTURA", "DUPLICADO"):
         doc["motivo_revision"] = "LECTURA"
     doc["ocr"]["incidencias"].append(note)
+
+
+def mark_duplicate(doc, note, documento, factura, alcance, trabajo=None):
+    """El mismo pedido ya enviado (en este archivo o en otro documento): `motivo_revision: DUPLICADO`, por encima de
+    LECTURA (la persona debe saber que se declararía dos veces, no buscar un error de suma: 032707/32707, pedido por el
+    usuario el 2026-10-23), y `ocr.duplicado` dice con quién se comparte: documento, factura, alcance ('total' = mismos
+    artículos y total; 'parcial' = misma referencia con artículos en común) y trabajo (None dentro del mismo archivo)."""
+    doc["mismatch"] = "; ".join(filter(None, [doc["mismatch"], note]))
+    doc["ocr"]["incidencias"].append(note)
+    doc["ocr"].setdefault("duplicado", []).append({"documento": documento, "factura": factura, "alcance": alcance, "trabajo": trabajo})
+    if doc["motivo_revision"] != "ESTRUCTURA":
+        doc["motivo_revision"] = "DUPLICADO"
 
 
 def build_all(res, use_llm=True, llm_server=QWEN27_SERVER, vl_server=VL_SERVER, timeout=600, log=None):
@@ -2397,8 +2418,8 @@ def build_all(res, use_llm=True, llm_server=QWEN27_SERVER, vl_server=VL_SERVER, 
     for i, a in enumerate(fps):
         for j, b in enumerate(fps):
             if i != j and not (a["envios"] and b["envios"]) and same_order(a, b):
-                mark_review(out[i], f"same order as invoice {b['id']} of this file (identical items and total; "
-                                    "possible duplicate declaration)")
+                mark_duplicate(out[i], f"same order as invoice {b['id']} of this file (identical items and total; "
+                                       "possible duplicate declaration)", Path(res["pdf"]).name, b["id"], "total")
                 break
     return out
 
