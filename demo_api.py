@@ -91,6 +91,10 @@ def require_key(request: Request, key: Optional[str] = Security(api_key_header))
 
 # ----------------------------------------------------------------------------- entrada
 
+# Drenaje antes de un reinicio (deploy/windows/lanzar_api.ps1 -Redeploy): mientras existe este archivo no se aceptan
+# subidas nuevas (503: WTCP corta la pasada y reintenta más tarde, §4 del contrato) y los trabajos en curso terminan.
+DRAIN_FILE = HERE / ".no_aceptar"
+
 INPUT_TYPES = {".pdf": "pdf", ".png": "png", ".jpg": "jpeg", ".jpeg": "jpeg", ".bmp": "bmp"}
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 IMAGE_PAGE_WIDTH_PT = 612  # 8.5 in: la fase 1 está ajustada para escaneos Letter (fit_dpi)
@@ -349,9 +353,12 @@ def health():
 
 
 @app.post("/api/jobs", response_model=JobCreated, status_code=201, tags=["trabajos"], summary="Subir un archivo y encolarlo",
-          responses={400: {"description": "archivo no aceptado"}, 413: {"description": "archivo demasiado grande"}})
+          responses={400: {"description": "archivo no aceptado"}, 413: {"description": "archivo demasiado grande"},
+                     503: {"description": "el servidor se va a reiniciar: reintentar más tarde"}})
 async def create_job(file: UploadFile = File(..., description="PDF, PNG, JPG/JPEG o BMP (nombre en ASCII)"),
                      client: str = Security(require_key)):
+    if DRAIN_FILE.exists():
+        raise HTTPException(503, "server restarting: retry later", headers={"Retry-After": "120"})
     filename = Path(file.filename or "").name
     ext = Path(filename).suffix.lower()
     if ext not in INPUT_TYPES:

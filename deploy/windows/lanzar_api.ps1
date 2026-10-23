@@ -5,9 +5,13 @@
 #     alias de WindowsApps y acabaria en otro interprete sin las dependencias).
 #   * cwd = raiz del repo: demo_api.py importa ocr_pipeline/facturas_json y escribe demo_jobs\.
 #
-# Uso:  powershell -NoProfile -ExecutionPolicy Bypass -File deploy\windows\lanzar_api.ps1 [-Force]
+#   * -Redeploy: reinicio sin cortar trabajos. Crea .no_aceptar (POST /api/jobs responde 503 y WTCP
+#     reintenta mas tarde), espera a que no haya trabajos en curso ni en cola, para el proceso que
+#     escucha, arranca el nuevo, espera /api/health y borra .no_aceptar.
+#
+# Uso:  powershell -NoProfile -ExecutionPolicy Bypass -File deploy\windows\lanzar_api.ps1 [-Force | -Redeploy]
 
-param([switch]$Force)
+param([switch]$Force, [switch]$Redeploy)
 
 $ErrorActionPreference = 'Stop'
 
@@ -21,6 +25,42 @@ if (-not (Test-Path $Pythonw)) {
   exit 2
 }
 if (-not (Test-Path $LogDir)) { New-Item -ItemType Directory -Path $LogDir -Force | Out-Null }
+
+$Drain = Join-Path $Root '.no_aceptar'
+if ($Redeploy) {
+  New-Item -ItemType File -Path $Drain -Force | Out-Null
+  Write-Output "Drenaje: no se aceptan subidas nuevas; esperando a que terminen los trabajos..."
+  try {
+    while ($true) {
+      $h = $null
+      try { $h = Invoke-RestMethod "http://127.0.0.1:$Puerto/api/health" -TimeoutSec 10 } catch { }
+      if (-not $h -or ($h.jobs_running -eq 0 -and $h.jobs_queued -eq 0)) { break }
+      Start-Sleep 2
+    }
+    $c = $null
+    try { $c = Get-NetTCPConnection -LocalPort $Puerto -State Listen -ErrorAction Stop } catch { }
+    if ($c) {
+      Stop-Process -Id $c.OwningProcess -Force -Confirm:$false
+      for ($i = 0; $i -lt 30; $i++) {
+        Start-Sleep 1
+        $c = $null
+        try { $c = Get-NetTCPConnection -LocalPort $Puerto -State Listen -ErrorAction Stop } catch { }
+        if (-not $c) { break }
+      }
+    }
+    & $PSCommandPath -Force
+    $ok = $false
+    for ($i = 0; $i -lt 60; $i++) {
+      Start-Sleep 2
+      try { $null = Invoke-RestMethod "http://127.0.0.1:$Puerto/api/health" -TimeoutSec 10; $ok = $true; break } catch { }
+    }
+    $p = (Get-NetTCPConnection -LocalPort $Puerto -State Listen -ErrorAction SilentlyContinue).OwningProcess
+    Write-Output ("Redeploy: " + $(if ($ok) { "API nueva responde (PID $p)" } else { "la API nueva NO responde: ver logs\api.err.log" }))
+  } finally {
+    Remove-Item $Drain -Force -ErrorAction SilentlyContinue
+  }
+  exit 0
+}
 
 $escucha = $null
 try { $escucha = Get-NetTCPConnection -LocalPort $Puerto -State Listen -ErrorAction Stop } catch { }

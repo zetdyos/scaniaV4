@@ -25,3 +25,6 @@ __pycache__/
 /verdad/
 /herramientas/facturas_json_head.py
 divisas_cache/
+
+# drenaje durante un reinicio (lanzar_api.ps1 -Redeploy)
+/.no_aceptar
