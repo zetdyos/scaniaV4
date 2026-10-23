@@ -15,8 +15,10 @@ C:/Share/CONTRATO-WTCP.md (carpeta compartida con WTCP).
 - GET  /docs  y  /redoc      documentación OpenAPI (Swagger UI y ReDoc).
 
 Acceso: todas las rutas /api/... y el WebSocket exigen un API-Token en la cabecera X-API-Key
-(401 si falta o no es válido). Los tokens viven en api_keys.json ({"nombre": "token", ...}, fuera
-de git; otra ruta con SCANIA_API_KEYS_FILE). Desde 127.0.0.1 no se pide token: es la propia demo.
+(401 si falta o no es válido). Los tokens viven en api_keys.json ({"nombre": "token", ...} o
+{"nombre": {"token": "...", "moneda": "USD"}}, fuera de git; otra ruta con SCANIA_API_KEYS_FILE). La moneda
+del cliente (por defecto USD) es la de todos los importes de su resultado (divisas.py). Desde 127.0.0.1 no se
+pide token: es la propia demo (moneda DEMO_MONEDA, por defecto USD).
 /docs, /redoc y /openapi.json son públicos (solo esquemas, sin datos).
 
 Puerto por defecto 8091 (variable DEMO_PORT). Arranque:
@@ -45,6 +47,7 @@ from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
 
+import divisas
 import facturas_json as f2
 import ocr_pipeline as p1
 
@@ -55,7 +58,12 @@ JOBS_DIR.mkdir(exist_ok=True)
 # ----------------------------------------------------------------------------- acceso (API-Token)
 
 API_KEYS_FILE = Path(os.environ.get("SCANIA_API_KEYS_FILE") or HERE / "api_keys.json")
-API_KEYS: dict[str, str] = json.loads(API_KEYS_FILE.read_text(encoding="utf-8")) if API_KEYS_FILE.exists() else {}
+# {"nombre": "token"} o {"nombre": {"token": "...", "moneda": "USD"}}: cada cliente (instancia de WTCP) con su moneda
+_KEYS_RAW: dict = json.loads(API_KEYS_FILE.read_text(encoding="utf-8")) if API_KEYS_FILE.exists() else {}
+API_KEYS: dict[str, str] = {n: (v["token"] if isinstance(v, dict) else v) for n, v in _KEYS_RAW.items()}
+CLIENT_CURRENCY: dict[str, str] = {n: (v.get("moneda") or "USD").upper() if isinstance(v, dict) else "USD"
+                                   for n, v in _KEYS_RAW.items()}
+CLIENT_CURRENCY["local"] = (os.environ.get("DEMO_MONEDA") or "USD").upper()
 LOCAL_HOSTS = {"127.0.0.1", "::1", "localhost"}
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False, description="API-Token del cliente")
 
@@ -289,7 +297,8 @@ def process(job_id):
         with f2.modelos_lock(log, on_wait=lambda: set_step(job, 2, "Esperando a los modelos (otro proceso los está usando)")):
             res = p1.run(str(d / job["pdf"]), log=log)
             out = f2.build_all(res, log=log)
-        fps = mark_cross_document_duplicates(job, out, res["markdown"], log)
+        fps = mark_cross_document_duplicates(job, out, res["markdown"], log)  # con los importes impresos
+        divisas.convert_all(out, job.get("moneda") or CLIENT_CURRENCY.get(job.get("client"), "USD"), log)
         (d / "huellas.json").write_text(json.dumps(fps, ensure_ascii=False), encoding="utf-8")
         (d / "result.json").write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
         # Respuestas crudas de los modelos y regiones de la fase 1: para medir cambios y calibrar sin volver a llamarlos.
@@ -373,7 +382,8 @@ async def create_job(file: UploadFile = File(..., description="PDF, PNG, JPG/JPE
     if pdf_bytes is not None:  # la fase 1 recibe siempre un PDF
         pdf = Path(name).stem + ".pdf"
         (d / pdf).write_bytes(pdf_bytes)
-    job = {"id": job_id, "pdf": pdf, "original": name, "client": client, "state": "queued", "progress": 0,
+    job = {"id": job_id, "pdf": pdf, "original": name, "client": client,
+           "moneda": CLIENT_CURRENCY.get(client, "USD"), "state": "queued", "progress": 0,
            "step": "En cola", "log": [f"subido por {client}: {name}"], "created": time.time()}
     with lock:
         jobs[job_id] = job

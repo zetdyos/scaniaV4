@@ -55,6 +55,10 @@ Campos adicionales (objeto `ocr`, anidado para no alterar las claves del esquema
   descarta; las líneas del VL solo se aceptan si todos sus precios unitarios están literalmente en
   el OCR y cantidad x precio reproduce el subtotal impreso. La cantidad es lo único que puede
   sostenerse solo por aritmética (el "x2" casi nunca se lee) y queda marcada como tal.
+  - linea.estimacion (fase 3, fase3.py): en las líneas goods sin importe de una factura en revisión,
+    {importe_estimado, maximo, metodo}; null en las demás. importe_linea sigue vacío.
+  - Moneda: build_all deja los importes en la moneda impresa; divisas.convert_all (API y CLI) los pasa a
+    la del cliente y guarda lo original en ocr (moneda_factura, tipo_cambio, *_original).
 
 Convenciones del esquema:
   - importe_linea: importe total de la línea (cantidad x precio unitario cuando el documento
@@ -90,6 +94,7 @@ from pathlib import Path
 import fitz  # PyMuPDF
 import requests
 
+import fase3
 import ocr_pipeline as p1
 
 RESULT_VERSION = 1
@@ -2847,6 +2852,10 @@ def build_all(res, use_llm=True, llm_server=QWEN27_SERVER, vl_server=VL_SERVER, 
         if dups:
             for doc in docs:
                 mark_review(doc, "order reference repeated in the file (the same order appears more than once)")
+        # Fase 3: importe estimado de las líneas sin importe (solo facturas en revisión; ver fase3.py). No cambia nada de
+        # lo anterior: añade `estimacion` a las líneas y una frase a mismatch.
+        for doc in docs:
+            fase3.estimate(doc, rs, sys.modules[__name__], llm_server, timeout, log, use_llm)
         out.extend(docs)
     for doc in out:
         doc.pop("_cuadra", None)
@@ -2912,6 +2921,7 @@ def main():
     ap.add_argument("--vl-server", default=VL_SERVER, help=f"llama-server con Qwen2.5-VL para el rescate visual (default {VL_SERVER})")
     ap.add_argument("--no-llm", action="store_true", help="no usar el 27B cuando no hay bloques de envío")
     ap.add_argument("--timeout", type=int, default=600)
+    ap.add_argument("--moneda", default="USD", help="moneda del cliente: todos los importes de salida en ella (default USD; ver divisas.py)")
     args = ap.parse_args()
     log = lambda m: print(m, file=sys.stderr)
     Path(args.out_dir).mkdir(parents=True, exist_ok=True)
@@ -2925,6 +2935,8 @@ def main():
             except RuntimeError as e:
                 sys.exit(str(e))
             out = build_all(res, not args.no_llm, args.llm_server, args.vl_server, args.timeout, log)
+        import divisas
+        divisas.convert_all(out, args.moneda.upper(), log)
         if args.md_dir:
             Path(args.md_dir).mkdir(parents=True, exist_ok=True)
             (Path(args.md_dir) / f"{stem}.md").write_text(res["markdown"], encoding="utf-8")

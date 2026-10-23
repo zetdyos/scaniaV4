@@ -24,3 +24,4 @@ __pycache__/
 # verdad fijada a mano contra la imagen (datos de clientes)
 /verdad/
 /herramientas/facturas_json_head.py
+divisas_cache/

@@ -12,6 +12,8 @@ Todo en español. Sin GPU local: los modelos corren en llama-server remotos.
 | `ocr_pipeline.py` | **Fase 1 (CONGELADA).** Página completa + regiones (SDK glmocr, layout PP-DocLayoutV3 en CPU) + verificación de importes y envíos + rescate de precios con Qwen2.5-VL. Expone `run(pdf, ...)`. |
 | `glmocr.yaml` | Configuración del SDK glmocr (copia del `config.yaml` del paquete con cambios mínimos; el cargador NO fusiona YAML parciales). |
 | `facturas_json.py` | **Fase 2.** Usa PP-OCRv6 (servicio en el host de modelos, :8089) solo para la geometría de los saltos de página. Divide cada PDF en facturas, construye el JSON del esquema acordado, enriquece con `ocr` y aplica las reglas de evidencia. Expone `build_all(res)`. |
+| `fase3.py` | **Fase 3.** Importe estimado (`estimacion`) de las líneas `goods` sin importe en facturas en revisión; WTCP lo usa para el SED. Se llama desde `build_all`. |
+| `divisas.py` | Importes en la moneda del cliente (por API-Token; tasa del BCE del día de la factura, o la última disponible). Se aplica en `demo_api.process` y en el CLI (`--moneda`), después de las huellas de duplicados. |
 | `demo_api.py` | API FastAPI (cliente: WTCP) + demo: UI en `/` (solo 127.0.0.1), Swagger `/docs`, ReDoc `/redoc`, WebSocket `/ws/jobs/{id}`. `/api/...` exige `X-API-Key` (tokens en `api_keys.json`, fuera de git). Acepta PDF, PNG, JPG/JPEG, BMP. Trabajos en `demo_jobs/`. |
 | `C:\Share\CONTRATO-WTCP.md` (fuera del repo, carpeta compartida que WTCP lee y actualiza; junto a `WTCP-campos-cabecera.md`) | Contrato con WTCP: qué rutas y campos lee el cliente. **Cualquier cambio de esquema se contrasta con él.** |
 | `deploy/windows/` | Arranque de la API al iniciar sesión en Windows (`SCANIA-api.vbs` → `lanzar_api.ps1`). |
@@ -82,6 +84,18 @@ Si la factura de la vía del 27B no cuadra y `/props` del 27B anuncia visión, s
 - «1 Electronics item» es un recuento, no un producto (`COUNT_ONLY_RE`; 28647: $1,599.99 sin descripción salía sin revisión).
 - Descuento del 27B con el mismo importe que una de sus líneas `payment` literal (tarjeta regalo, crédito de la tienda: 32962) → revisión: lo pagado nunca resta y el 27B se contradice.
 - Medido y NO aplicado: prompt v3 (172 facturas en sombra: 2 mejoras reales, 1 empeora, desordena líneas y corre precios en los saltos); franja del salto y corrección del salto con las dos páginas (arreglan el salto en 3–4 casos pero ninguna factura sale de revisión y pueden reescribir cifras manuscritas); cantidad en fotos de Shopify (ninguna factura del historial saldría de revisión).
+
+## Fase 3: importe estimado de las líneas sin importe (2026-10-23, decisión del usuario)
+
+En exportación solo se declara lo que supera un umbral; una línea sin importe podría quedar sin declarar. Solo en facturas en revisión y en líneas `goods` con `importe_linea` vacío; `importe_linea` sigue vacío y la factura sigue en revisión: se añade `estimacion = {importe_estimado, maximo, metodo}` (null en las demás líneas goods) y una frase en `mismatch`. WTCP usa `importe_estimado` para el SED. Sin umbral en el código (el usuario: «solo estima el valor»).
+- Fuentes: cuadre del resumen impreso (R = subtotal de artículos − líneas con importe, o total − cargos + descuentos − líneas) y re-lectura de la página con la imagen (la misma llamada calibrada `lines_with_llm` + `page_image`, casi siempre ya en caché por el rescate con imagen). Nada de precio de mercado.
+- La re-lectura se intenta también con una sola línea vacía: el cuadre da por buenas las demás líneas y en revisión a menudo no lo son (31728: corrimiento silencioso, cuadre 9.00 y papel 19.24; 32382: 418.36 y papel 17.99; 32253 #11: cuadre 10.63 y papel 5.63, la re-lectura acierta). Si coinciden → `relectura+cuadre`; si no, gana la lectura de la línea y la frase lo dice.
+- Sin estimación: las demás líneas ya cubren el resumen (R ≤ 0: 33335 filas sin cargo de un presupuesto, 33404 filas duplicadas); la línea es el mismo producto que otra con importe (31699: capturas que repiten la lista); la re-lectura da el importe de otra línea del mismo producto o el total entero.
+- Medido sin GPU (411 trabajos con modelos.json, HEAD contra el árbol): el resto del JSON idéntico; 6 estimaciones, todas correctas contra la verdad auditada; los 35 casos sin estimación, correctos (componentes sin precio de Supermicro 31202, documento editado 31550…).
+
+## Importes en la moneda del cliente (2026-10-23, decisión del usuario)
+
+`api_keys.json` admite `{"nombre": {"token": "...", "moneda": "USD"}}` (la forma vieja = USD); la demo local usa `DEMO_MONEDA`. Factura en otra moneda → todos los importes de salida convertidos con la tasa de referencia del BCE del día de la factura (`ocr.fecha_pedido`, día hábil anterior si no hay publicación; sin fecha → día del análisis); si no se puede obtener la del día, la **última disponible** (caché `divisas_cache/`), con su fecha real en `ocr.tipo_cambio`. Lo original en `ocr` (`moneda_factura`, `tipo_cambio`, `total_original`, `importe_original`, `precio_unitario_original`). Moneda sin tasa del BCE (ANG/XCG) o no determinada → sin convertir y `LECTURA`. 15 CFR 30.6(a)(17) pide dólares pero no fija fuente ni fecha. Historial: 8 de ~2160 facturas en otra moneda (EUR 3, GBP 2, CAD 1, ANG 1, vacía 1). Las comprobaciones de fase 2/3 y las huellas de duplicados usan los importes impresos.
 
 ## Hechos documentados (no volver a investigar)
 
