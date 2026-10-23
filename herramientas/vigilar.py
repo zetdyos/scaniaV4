@@ -10,7 +10,7 @@ last_busy_report = 0
 
 JOBS = str(__import__("pathlib").Path(__file__).resolve().parents[1] / "demo_jobs")
 DEPLOY = "20261023-1303"  # despliegue de 2f49606 (saltos.py: un solo mecanismo por geometría): los trabajos anteriores son la referencia
-count = {"docs": 0, "facturas": 0, "revision": 0, "imagen": 0, "estimadas": 0, "sin_estimar": 0, "convertidas": 0}  # desde que arranca el vigilante
+count = {"docs": 0, "facturas": 0, "revision": 0, "imagen": 0, "estimadas": 0, "sin_estimar": 0, "convertidas": 0, "duplicados": 0, "dup_limpios": 0}  # desde que arranca el vigilante
 count.update(json.loads(__import__("os").environ.get("VIGILAR_CONTADOR") or "{}"))  # seguir un recuento anterior
 
 
@@ -94,6 +94,13 @@ while True:
                 count["docs"] += 1
                 count["facturas"] += len(_r)
                 count["revision"] += sum(1 for _i in _r if _i["motivo_revision"])
+                # Duplicados: para WTCP van «A revisión - DUPLICADO»; para nosotros, si la lectura no tiene otra incidencia,
+                # la clasificación de SCANIA es «No-Revisión» (pedido del usuario 2026-10-23).
+                for _i in _r:
+                    if _i["motivo_revision"] == "DUPLICADO":
+                        count["duplicados"] += 1
+                        if all("duplicate declaration" in _n for _n in _i["ocr"].get("incidencias", [])):
+                            count["dup_limpios"] += 1
                 for _i in _r:
                     for _l in _i["lineas"]:  # fase 3: líneas sin importe con su estimación (o sin ella)
                         _e = _l.get("estimacion")
@@ -114,6 +121,9 @@ while True:
                 _f = count["facturas"] or 1
                 _pc = lambda n, d: f"{100 * n / d:.1f} %" if d else "-"
                 _l3 = count["estimadas"] + count["sin_estimar"]
+                _nr = count["facturas"] - count["revision"] + count["dup_limpios"]
+                print(f"{now}   SCANIA (nuestro): no-revisión {_nr} ({_pc(_nr, _f)}) | revisión {count['facturas'] - _nr} "
+                      f"({_pc(count['facturas'] - _nr, _f)}) | duplicados {count['duplicados']} (limpios {count['dup_limpios']})", flush=True)
                 print(f"{now}   CONTADOR: {count['docs']} docs, {count['facturas']} facturas | sin revisión "
                       f"{count['facturas'] - count['revision']} ({_pc(count['facturas'] - count['revision'], _f)}) | a revisión "
                       f"{count['revision']} ({_pc(count['revision'], _f)}) | por imagen {count['imagen']} ({_pc(count['imagen'], _f)}) | "

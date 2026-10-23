@@ -136,6 +136,7 @@ Método (pedido por el usuario: "no arregles esto y rompas otra cosa"): cachear 
    - en revisión → «correcto ir a revisión» o no + por qué + la solución propuesta (regla general, con cuántas facturas afecta; el usuario decide).
 4. Guardar el veredicto: `auditar.py --veredicto JOB '{...}'` en `verdad/27b.jsonl`.
 5. Contador con porcentajes: sin revisión, a revisión, correctas según la auditoría.
+6. (Pedido del usuario 2026-10-23) Lo que se audita es la CLASIFICACIÓN de SCANIA: sin revisión → comprobar que no es un falso positivo (error que pasa sin revisión); en revisión → «por qué», «qué modelo falló» (GLM-OCR, PP-OCRv6, 27B, VL, código o el propio invoice) y «solución». Los duplicados van a WTCP como «A revisión - DUPLICADO», pero en NUESTRA cuenta, si la lectura es correcta (sin otra incidencia), cuentan como «No-Revisión»: `vigilar.py` imprime la línea «SCANIA (nuestro)» con esa cuenta.
 Los documentos que el usuario va a reenviar se excluyen del contador cuando lo pida. Desplegar durante un lote solo con `lanzar_api.ps1 -Redeploy`.
 
 ## Convenciones de trabajo
