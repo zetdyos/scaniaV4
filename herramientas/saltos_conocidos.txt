@@ -30,6 +30,9 @@ TBA335178824474-TBA335047818852-TBA335065526351.pdf 1->2 real Ywdiml MAF Sensor 
 31053.pdf 1->2 real
 31593.pdf 1->2 real
 31734.pdf 6->7 real (p2->3 sigue sin detectarse: «USS» por «US$»)
+33652.pdf 1->2 real Yo-Zuri: «CRYSTAL 3D MINNOW (F) 90mm F1145 C58» arriba de p2 (tabla con UPC y descripción DEBAJO de la fila; comprobado 2026-10-23)
+33652.pdf 2->3 real Yo-Zuri: «CRYSTAL 3D MINNOW (F) 130mm F1147 GHIW» arriba de p3; el 27B corrió las 10 descripciones de p3 SIN revisión (comprobado 2026-10-23)
+32351.pdf 1->2 real Regency: renglones de DETALLE del último artículo («Country of Origin…», «Inner 1 Carton…») arriba de p2; unión «débil» (sin firma del 27B no se pega texto; comprobado 2026-10-23)
 # Tabla con la descripción ENCIMA de su fila (FashionGo)
 32836.pdf 1->2 real Plaid … fila MIX COLOR 12 12 $1.10 $13.20
 # Falsos conocidos

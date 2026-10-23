@@ -215,11 +215,18 @@ def table_page(rows, furn):
     between = [r for s, e in zip(anchors, anchors[1:]) for r in a[s + 1:e] if r["alpha_x"] and not r["money"]]
     col_text = statistics.median(r["alpha_x"][0] for r in between) if between else None
     gap = lambda r1, r2: abs(r2["c"] - r1["c"])
-    ups = [gap(r, a[e]) < gap(a[s], r) for s, e in zip(anchors, anchors[1:]) for r in a[s + 1:e] if r["alpha_x"] and not r["money"]]
     tail = a[anchors[-1] + 1:]
     heads = [i for i in range(anchors[0]) if a[i]["span"] > 0.45 and a[i]["money"] == 0 and not re.search(r"\d", a[i]["text"])]
+    # Si la primera fila llega justo tras la cabecera de la tabla (sin ningún renglón de texto entre medias), el texto va
+    # DEBAJO de su fila por construcción: la distancia vertical vota al revés cuando la descripción se imprime pegada a la
+    # fila siguiente (Yo-Zuri 33652: 10 descripciones corridas en p3 sin revisión). Sin cabecera, o con texto antes de
+    # la primera fila (FashionGo 32836, cabeceras de grupo 32560), decide la distancia como hasta ahora.
+    anchor_first = bool(heads) and not any(r["alpha_x"] and not r["money"] for r in a[heads[-1] + 1:anchors[0]])
+    ups = [False if anchor_first else gap(r, a[e]) < gap(a[s], r)
+           for s, e in zip(anchors, anchors[1:]) for r in a[s + 1:e] if r["alpha_x"] and not r["money"]]
     return {"rows": a, "anchors": anchors, "amt_x": amt_x, "between": between, "col_text": col_text, "tail": tail,
-            "head": a[:anchors[0]], "heads": heads,
+            "head": a[:anchors[0]], "heads": heads, "anchor_first": anchor_first,
+            "head_text": norm_alnum(a[heads[-1]]["text"]) if heads else "",  # para reconocer la misma tabla en otras páginas
             "closed_single": any(r["money"] == 1 for r in tail),
             "closed_amt": any(abs(x0 - amt_x) <= AMT_COL_TOL for r in tail for x0, _, t in r["toks"] if GEO_MONEY_RE.search(t)),
             "votes": (sum(ups), len(ups) - sum(ups))}
@@ -259,7 +266,7 @@ def table_before_continuation(pa, pb):
             "title_b": ""}, "continuación"
 
 
-def table_after_continuation(pa, pb, doc_style):
+def table_after_continuation(pa, pb, doc_style, proven=False):
     """Descripción DEBAJO de su fila (21750: «0003 B309 $59.87» y «HIGH PERFORM. GLASS F-FLU» ya en la página siguiente;
     page_break_continuation de hoy): la tabla no cerró en A (ningún renglón de un solo importe tras la última fila); B
     tiene cabecera de tabla; los huérfanos son los renglones con texto entre la última cabecera de B y su primera fila,
@@ -287,13 +294,21 @@ def table_after_continuation(pa, pb, doc_style):
         return None, "sin continuación"
     gap = lambda r1, r2: abs(r2["c"] - r1["c"])
     anchors = pa["anchors"]
-    between = [(r, gap(r, a[e]) < gap(a[s], r)) for s, e in zip(anchors, anchors[1:]) for r in a[s + 1:e] if r["alpha_x"] and r["money"] == 0]
+    # mismo criterio que el voto de table_page: con la primera fila pegada a la cabecera, el texto va debajo (33652)
+    between = [(r, False if pa["anchor_first"] else gap(r, a[e]) < gap(a[s], r))
+               for s, e in zip(anchors, anchors[1:]) for r in a[s + 1:e] if r["alpha_x"] and r["money"] == 0]
     same_shape = lambda r, o: abs(r["toks"][0][0] - o["toks"][0][0]) <= 20 and len(r["toks"]) == len(o["toks"]) and \
         all(any(abs(x - y) <= 25 for y, _, _ in r["toks"]) for x, _, _ in o["toks"])
+    # Con el estilo probado por la cabecera (33652) el voto por distancia no rechaza, pero la unión queda «débil»: solo
+    # vale si el 27B muestra la firma del corrimiento (reconcile_table); sin firma no se añade texto (32351, 33585: los
+    # renglones de detalle que siguen a una fila no son descripción).
+    weak = False
     for o in orph:
         pool = [up for r, up in between if same_shape(r, o)] or [up for r, up in between if col[0] <= min(r["alpha_x"]) <= col[1]]
         if pool and sum(pool) > len(pool) - sum(pool):
-            return None, "el renglón encabeza el primer artículo de su página"
+            if not proven:
+                return None, "el renglón encabeza el primer artículo de su página"
+            weak = True
     # Tabla agrupada (32560, Rip Curl): cada grupo empieza por un renglón con su código de artículo («12TWSW PARAISO
     # SLIDING TRI 2XS XS M») encima de sus filas. Un renglón que empieza por un código es la CABEZA de un grupo, nunca la
     # cola de la descripción anterior: si A ya tiene 2+ renglones así entre sus filas y en la franja huérfana hay alguno,
@@ -301,11 +316,11 @@ def table_after_continuation(pa, pb, doc_style):
     code_like = lambda r: bool(re.fullmatch(r"(?=.*\d)(?=.*[A-Z])[A-Z0-9-]{5,}", (r["text"].split() or [""])[0]))
     if sum(code_like(r) for r, _ in between) >= 2 and any(code_like(o) for o in orph):
         return None, "la franja huérfana contiene un renglón que empieza por un código de artículo (cabecera de grupo)"
-    if doc_style == "before":
+    if doc_style == "before" and not proven:
         return None, "en este documento las descripciones encabezan su fila (estilo del documento)"
     a_anchor = a[last_a]
     return {"kind": "table", "price": a_anchor["amounts"][-1], "a_rows": [a_anchor], "b_rows": orph, "b_anchor": None,
-            "a_anchor": a_anchor, "col": col, "title_b": ""}, "continuación"
+            "a_anchor": a_anchor, "col": col, "title_b": "", "weak": weak}, "continuación"
 
 
 # ----------------------------------------------------------------------------- documento
@@ -319,7 +334,8 @@ def segment(pages_tokens):
 
 def doc_style(seg):
     """Estilo de las tablas del documento: 'before' (las descripciones encabezan su fila), 'after' (van debajo) o None
-    (sin mayoría de 2/3 o sin votos)."""
+    (sin mayoría de 2/3 o sin votos). Las páginas cuya primera fila llega justo tras la cabecera votan «después» por
+    construcción (table_page); la prueba por cabecera para un corte concreto la hace `continuation` (33652)."""
     up = sum(s["table"]["votes"][0] for s in seg.values() if s["table"])
     down = sum(s["table"]["votes"][1] for s in seg.values() if s["table"])
     if up + down == 0:
@@ -341,8 +357,15 @@ def continuation(seg, page_a, page_b, style):
     j, why["block"] = block_continuation(sa["block"], sb["block"])
     if j:
         return j, "continuación (bloques)"
-    if style != "before":
-        j, why["table"] = table_after_continuation(sa["table"], sb["table"], style)
+    # Estilo «debajo» PROBADO para esta tabla: en alguna página con la MISMA cabecera la primera fila llega justo tras la
+    # cabecera, sin texto entre medias (imposible si las descripciones encabezan su fila). Yo-Zuri 33652: la descripción se
+    # imprime pegada a la fila siguiente, la distancia vota «antes» y las páginas partidas empiezan con la huérfana. La
+    # cabecera acota la prueba a la misma tabla: un PDF con varios diseños (33585) no contagia a sus páginas FashionGo.
+    ta = sa["table"]
+    proven = bool(ta and ta["head_text"] and any(s["table"] and s["table"]["anchor_first"] and s["table"]["head_text"] == ta["head_text"]
+                                                   for s in seg.values()))
+    if style != "before" or proven:
+        j, why["table"] = table_after_continuation(sa["table"], sb["table"], style, proven)
         if j:
             return j, "continuación (tabla, descripción debajo)"
     if style != "after":
@@ -725,15 +748,20 @@ def reconcile_table(lines, k, pages, seg, join, glm_pages, furn, log):
         step = steps[len(steps) // 2] if steps else 0
         below, prev = [], rows[i]
         for r in rows[i + 1:end]:
-            if r["money"] or not r["alpha_x"] or not _col_toks([r], col) or (step and r["c"] - prev["c"] > 2 * step):
+            if r["money"] or not _col_toks([r], col) or (step and r["c"] - prev["c"] > 2 * step):
                 break
             prev = r
+            if not r["alpha_x"]:  # renglón solo de cifras (UPC «756791485549», Yo-Zuri 33652): no cierra el bloque ni es descripción
+                continue
             if r["na"] not in furn["alnum"]:
                 below.append(r)
         return _col_toks([rows[i]] + below, col)
 
     orph_glm = glm(orph_toks, pages[k + 1])
     shifted = orph_glm is not None and bool(on_b) and squash(orph_glm) in squash(on_b[0].get("desc"))
+    if join.get("weak") and not shifted:
+        log(f"  salto {where}: continuación «{orph_text[:45]}» solo probada por la cabecera y el 27B no corrió la página: sin cambios")
+        return []
     anchors_a = [i for i, r in enumerate(rows_a) if r["money"] >= 2]
     last = rows_a[anchors_a[-1]]
     if shifted:
