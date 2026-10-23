@@ -1282,8 +1282,33 @@ def photo_quantity(pdf, page_idx, rect, server, timeout):
     # Fuera de 1..999 o no entero: sin lectura (None), nunca 1 por defecto; esa foto no aporta cantidad.
     if not (isinstance(q, int) and 1 <= q <= 999):
         return None
-    if q == 1:
+    # Segundo lector: el dígito que PP-OCRv6 leyó DENTRO de la caja de la foto (31899, 2026-10-23: la caja de item_photos
+    # tiene la altura de todo el bloque, la «esquina inferior derecha» caía en la foto siguiente y el VL devolvía
+    # «[blurred text]» aunque el badge «2» estaba clarísimo; PP-OCRv6 había leído los tres «2»). Solo cuenta si hay UN
+    # dígito (1..999; un «0» o varias cifras son texto del envase: Canon 33542) y decide con la pregunta cerrada:
+    #   - coinciden -> confirmado; difieren -> sin lectura;
+    #   - la pregunta cerrada dijo 1 y PP-OCRv6 leyó un badge > 1 (Purina 33542): lo confirma la esquina del VL.
+    # Sin dígito de PP-OCRv6 -> la esquina del VL, como antes.
+    # Solo cuenta un dígito en la zona donde Amazon pinta el badge: borde DERECHO de la foto (x relativa >= 0.8) y su
+    # mitad INFERIOR (y relativa >= 0.4). Las cajas de fotos vecinas se solapan: un dígito arriba del todo es el badge de
+    # la foto anterior (27600: «6» a y=0.07 y «10» a y=0.82), y uno en medio de la foto es texto del envase («32», «000»).
+    try:
+        toks, _, _ = ppocr_tokens(pdf, page_idx)
+        sc = 72 / PPOCR_DPI
+        w, h = max(rect.width, 1e-6), max(rect.height, 1e-6)
+        digits = {int(m.group(1)) for x0, y0, x1, y1, t in toks
+                  for m in [re.fullmatch(r"\(?(\d{1,3})\)?", t.strip())] if m and 1 <= int(m.group(1)) <= 999
+                  and 0.8 <= ((x0 + x1) / 2 * sc - rect.x0) / w <= 1.1 and 0.4 <= ((y0 + y1) / 2 * sc - rect.y0) / h <= 1.05}
+    except Exception:  # noqa: BLE001  sin PP-OCRv6, la esquina del VL decide (como antes)
+        digits = set()
+    pp = next(iter(digits)) if len(digits) == 1 else None
+    if pp is not None:
+        MODEL_RAW["vl_foto"][key + ":ppocr"] = pp
+    if q == 1 and (pp is None or pp == 1):
         return 1
+    if pp is not None and q > 1:
+        return q if pp == q else None
+    want = pp if q == 1 else q  # q == 1 con badge de PP-OCRv6 > 1: la esquina del VL tiene que dar ese número
     corner = fitz.Rect(rect.x0 + rect.width / 2, rect.y0 + rect.height / 2, rect.x1, rect.y1)
     rj = post_json(f"{server}/v1/chat/completions", {
         "messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": f"data:image/png;base64,{_vl_image(pdf, page_idx, corner)}"}},
@@ -1291,7 +1316,7 @@ def photo_quantity(pdf, page_idx, rect, server, timeout):
         "temperature": 0, "top_k": 1, "repeat_penalty": 1.05, "cache_prompt": False, "max_tokens": 300}, timeout)
     raw2 = rj["choices"][0]["message"]["content"]
     MODEL_RAW["vl_foto"][key + ":esquina"] = raw2
-    return q if badge_text_number(raw2) == q else None
+    return want if badge_text_number(raw2) == want else None
 
 
 def photo_quantities(pdf, pages, lines, literal, server, timeout, log):
@@ -1868,6 +1893,7 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
                         lst.append({"concepto": l["desc"], "importe": l["amount"]})
         options = {key: [fields[key]] + ([llm_lists[key]] if llm_lists[key] and llm_lists[key] != fields[key] else [])
                    for key in ("descuentos", "other_charges")}
+        neg_pay_amts = set()  # «gift card dentro del resumen = descuento»: medido 2026-10-23 y NO aplicado (pendiente del usuario)
         if not fields["subtotal_articulos"]:
             fields["subtotal_articulos"] = items_subtotal
         # Recuento de eBay en el resumen («1 item $76.00») que el 27B dio como artículo mientras el artículo real (en la
@@ -1918,7 +1944,7 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
             # Un «descuento» con el mismo importe que una línea de pago del propio 27B es lo pagado (tarjeta regalo,
             # crédito de la tienda: 32962), que nunca resta del valor del pedido. El 27B se contradice: revisión.
             paid_amts = {o["amount"] for o in others if o.get("kind") == "payment" and o.get("amount")
-                         and float(o["amount"]) > 0 and o["amount"] in ocr_amounts}
+                         and float(o["amount"]) > 0 and o["amount"] in ocr_amounts and o["amount"] not in neg_pay_amts}
             for d in fields["descuentos"]:
                 if d.get("importe") and float(d["importe"]) > 0 and d["importe"] in paid_amts:
                     issues.append(f"discount «{d['concepto'][:40]}» {d['importe']} is also listed as a payment "
