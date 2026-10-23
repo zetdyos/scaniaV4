@@ -9,8 +9,8 @@ last_busy_report = 0
 
 
 JOBS = str(__import__("pathlib").Path(__file__).resolve().parents[1] / "demo_jobs")
-DEPLOY = "20261021-2303"  # despliegue de 90d1b21 (foto: cantidad > 1 con un solo precio impreso): los trabajos anteriores son la referencia
-count = {"docs": 0, "facturas": 0, "revision": 0, "imagen": 0}  # desde que arranca el vigilante
+DEPLOY = "20261023-0020"  # despliegue de deb751b (fase 3 y moneda del cliente): los trabajos anteriores son la referencia
+count = {"docs": 0, "facturas": 0, "revision": 0, "imagen": 0, "estimadas": 0, "sin_estimar": 0, "convertidas": 0}  # desde que arranca el vigilante
 count.update(json.loads(__import__("os").environ.get("VIGILAR_CONTADOR") or "{}"))  # seguir un recuento anterior
 
 
@@ -95,6 +95,18 @@ while True:
                 count["facturas"] += len(_r)
                 count["revision"] += sum(1 for _i in _r if _i["motivo_revision"])
                 for _i in _r:
+                    for _l in _i["lineas"]:  # fase 3: líneas sin importe con su estimación (o sin ella)
+                        _e = _l.get("estimacion")
+                        if _e:
+                            count["estimadas" if _e["importe_estimado"] else "sin_estimar"] += 1
+                            print(f"{now}   FASE 3 {j['pdf']}#{_i['id']} línea {_l['seq']}: "
+                                  f"{_e['importe_estimado'] or 'sin estimación'} ({_e['metodo'] or '-'}, tope {_e['maximo'] or '-'}) "
+                                  f"«{_l['descripcion'][:50]}»", flush=True)
+                    _tc = _i["ocr"].get("tipo_cambio")
+                    if _tc:
+                        count["convertidas"] += 1
+                        print(f"{now}   MONEDA {j['pdf']}#{_i['id']}: {_tc['de']}->{_tc['a']} a {_tc['tasa']} (BCE {_tc['fecha']}, "
+                              f"factura {_tc.get('fecha_factura') or 'sin fecha'}); total {_i['ocr'].get('total_original')} -> {_i['total']}", flush=True)
                     if _i["ocr"].get("origen_lineas") == "llm+imagen":
                         count["imagen"] += 1
                         print(f"{now}   CON IMAGEN {j['pdf']}#{_i['id']}: total {_i['total']}, "
@@ -102,7 +114,8 @@ while True:
                 _f = count["facturas"]
                 print(f"{now}   CONTADOR: {count['docs']} docs, {_f} facturas, {count['revision']} a revisión, "
                       f"{_f - count['revision']} sin revisión ({100 * (_f - count['revision']) / _f:.1f} %), "
-                      f"{count['imagen']} por imagen", flush=True)
+                      f"{count['imagen']} por imagen; fase 3: {count['estimadas']} línea(s) estimadas, "
+                      f"{count['sin_estimar']} sin estimar; {count['convertidas']} convertidas de moneda", flush=True)
             except Exception as e:  # noqa: BLE001
                 print(f"{now}   (contador: {e})", flush=True)
             if j.get("n_review"):
