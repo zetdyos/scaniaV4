@@ -586,7 +586,7 @@ def reconcile_block(lines, k, pages, seg, join, glm_pages, log):
     return issues
 
 
-def reconcile_row(lines, k, pages, join, log):
+def reconcile_row(lines, k, pages, seg, join, log):
     """Tabla con la descripción ENCIMA de su fila (FashionGo 32836): la primera fila de B es del artículo abierto de A. Si el
     27B corrió las filas de B (cada descripción con la fila de encima), cada línea toma la fila siguiente (importe,
     cantidad y precio unitario de la fila: cifras del propio 27B, solo cambia el emparejamiento), se quita el texto de la
@@ -623,13 +623,26 @@ def reconcile_row(lines, k, pages, join, log):
             l["desc"] = l["desc"][mm.end():].strip() or l["desc"]
         l.update(v)
     cut.update({key: vals[0][key] for key in ("qty", "unit", "unit_exact", "qty_printed")})
+    cut["_requalified"] = True  # su cantidad y precio vienen ahora de su fila: la incidencia «quantity … not returned» caduca
     last = lb[-1]
     if vals[-1]["amount"] and amount_in_text(vals[-1]["amount"], last["desc"]):
         lines.remove(last)
         log(f"    «{last['desc'][:40]}» era la fila de importes, no un artículo: quitada")
     else:
-        last["amount"] = ""
-        log(f"    «{last['desc'][:40]}» queda sin importe (el 27B no devolvió su precio)")
+        # su fila no la devolvió el 27B. Sin el precio unitario viejo (era el de la fila con la que estaba mal emparejada;
+        # con él, cantidad x precio rellenaba un importe falso «calculado»: 32836, 13.20 por 33.00). Si B tiene exactamente
+        # una fila por línea (la primera es la del artículo partido), la última fila es la suya: su importe y el precio
+        # unitario que cuadra con la cantidad del 27B son cifras impresas (PP-OCRv6), como el P0 de la primera fila.
+        last["amount"], last["amount_exact"] = "", None
+        last["unit"], last["unit_exact"] = "", None
+        tb = seg[pages[k + 1]]["table"]
+        if tb and len(tb["anchors"]) == len(lb) + 1:
+            row = tb["rows"][tb["anchors"][-1]]
+            last["amount"] = row["amounts"][-1]
+            last["unit"] = next((a for a in row["amounts"][:-1] if qty_ok(last.get("qty", 1), a, last["amount"])), "")
+            log(f"    «{last['desc'][:40]}» toma su fila (última de la página): importe {last['amount']}, unitario {last['unit'] or '-'}")
+        else:
+            log(f"    «{last['desc'][:40]}» queda sin importe ni precio unitario (el 27B no devolvió su fila)")
     cut["amount"], cut["amount_exact"] = p0, None
     return []
 
@@ -773,16 +786,19 @@ def fix_breaks(lines, pdf, pages, glm_pages, log, *, tokens_of):
         elif join["kind"] == "block":
             issues += reconcile_block(lines, k, pages, seg, join, glm_pages, log)
         elif join["kind"] == "row":
-            issues += reconcile_row(lines, k, pages, join, log)
+            issues += reconcile_row(lines, k, pages, seg, join, log)
         else:
             issues += reconcile_table(lines, k, pages, seg, join, glm_pages, furn, log)
     # Las líneas quitadas (cifra huérfana, fantasma, cola) no existen: una incidencia de lectura generada para ellas
     # («quantity of item «ISO 32…» not returned by the model», 31053) no debe llegar a WTCP.
     removed = [l for l in before if not any(l is x for x in lines)]
-    return issues, removed
+    requalified = [l for l in lines if l.pop("_requalified", False)]
+    return issues, removed + requalified
 
 
-def drop_issues_of(issues, removed):
-    """Incidencias que citan la descripción («…[:40]») de una línea que el módulo quitó."""
-    keys = {f"«{(l.get('desc') or '')[:40]}»" for l in removed if (l.get("desc") or "").strip()}
+def drop_issues_of(issues, stale):
+    """Incidencias que citan la descripción («…[:40]») de una línea que el módulo quitó, o la incidencia «quantity of
+    item «…» not returned» de una línea cuya cantidad asignó el realineado de filas (32836: el 27B no dio cantidad a la
+    descripción partida; su fila, arriba de la página siguiente, la trae)."""
+    keys = {f"«{(l.get('desc') or '')[:40]}»" for l in stale if (l.get("desc") or "").strip()}
     return [i for i in issues if not any(k in i for k in keys)]
