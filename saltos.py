@@ -773,7 +773,7 @@ def fix_breaks(lines, pdf, pages, glm_pages, log, *, tokens_of):
         for k in range(len(pages) - 1):
             if pages[k + 1] == pages[k] + 1:
                 join_text_rule(lines, k, log)
-        return ["page breaks could not be checked (PP-OCRv6 unavailable); review the items around the page breaks"]
+        return ["page breaks could not be checked (PP-OCRv6 unavailable); review the items around the page breaks"], []
     issues = []
     style = doc_style(seg)
     before = list(lines)
