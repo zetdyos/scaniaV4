@@ -2936,7 +2936,7 @@ def main():
                 sys.exit(str(e))
             out = build_all(res, not args.no_llm, args.llm_server, args.vl_server, args.timeout, log)
         import divisas
-        divisas.convert_all(out, args.moneda.upper(), log)
+        divisas.convert_all(out, args.moneda.upper(), log, res["markdown"])
         if args.md_dir:
             Path(args.md_dir).mkdir(parents=True, exist_ok=True)
             (Path(args.md_dir) / f"{stem}.md").write_text(res["markdown"], encoding="utf-8")

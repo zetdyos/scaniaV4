@@ -298,7 +298,7 @@ def process(job_id):
             res = p1.run(str(d / job["pdf"]), log=log)
             out = f2.build_all(res, log=log)
         fps = mark_cross_document_duplicates(job, out, res["markdown"], log)  # con los importes impresos
-        divisas.convert_all(out, job.get("moneda") or CLIENT_CURRENCY.get(job.get("client"), "USD"), log)
+        divisas.convert_all(out, job.get("moneda") or CLIENT_CURRENCY.get(job.get("client"), "USD"), log, res["markdown"])
         (d / "huellas.json").write_text(json.dumps(fps, ensure_ascii=False), encoding="utf-8")
         (d / "result.json").write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
         # Respuestas crudas de los modelos y regiones de la fase 1: para medir cambios y calibrar sin volver a llamarlos.

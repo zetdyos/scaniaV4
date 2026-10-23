@@ -111,11 +111,14 @@ while True:
                         count["imagen"] += 1
                         print(f"{now}   CON IMAGEN {j['pdf']}#{_i['id']}: total {_i['total']}, "
                               f"{sum(1 for _l in _i['lineas'] if _l.get('line_kind') == 'goods')} artículos, sin revisión", flush=True)
-                _f = count["facturas"]
-                print(f"{now}   CONTADOR: {count['docs']} docs, {_f} facturas, {count['revision']} a revisión, "
-                      f"{_f - count['revision']} sin revisión ({100 * (_f - count['revision']) / _f:.1f} %), "
-                      f"{count['imagen']} por imagen; fase 3: {count['estimadas']} línea(s) estimadas, "
-                      f"{count['sin_estimar']} sin estimar; {count['convertidas']} convertidas de moneda", flush=True)
+                _f = count["facturas"] or 1
+                _pc = lambda n, d: f"{100 * n / d:.1f} %" if d else "-"
+                _l3 = count["estimadas"] + count["sin_estimar"]
+                print(f"{now}   CONTADOR: {count['docs']} docs, {count['facturas']} facturas | sin revisión "
+                      f"{count['facturas'] - count['revision']} ({_pc(count['facturas'] - count['revision'], _f)}) | a revisión "
+                      f"{count['revision']} ({_pc(count['revision'], _f)}) | por imagen {count['imagen']} ({_pc(count['imagen'], _f)}) | "
+                      f"fase 3: {count['estimadas']} de {_l3} línea(s) sin importe estimadas ({_pc(count['estimadas'], _l3)}) | "
+                      f"moneda convertida {count['convertidas']} ({_pc(count['convertidas'], _f)})", flush=True)
             except Exception as e:  # noqa: BLE001
                 print(f"{now}   (contador: {e})", flush=True)
             if j.get("n_review"):

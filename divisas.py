@@ -114,6 +114,48 @@ def parse_date(text, dayfirst=True):
     return None
 
 
+# Fecha con etiqueta en el texto de la factura, cuando la fase 2 no dejó fecha_pedido (solo reconoce los formatos de
+# tienda conocidos; 26746: «Invoice date: 09.07.2026» de un proveedor europeo). Primero las etiquetas de factura/pedido.
+DATE_LABEL_RE = re.compile(r"(?:invoice|order|purchase|bill|document)\s*date|(?:placed|ordered|purchased)\s+on|order\s+placed|date\s+of\s+(?:invoice|order)|fecha(?:\s+de\s+(?:factura|pedido|emisi[oó]n))?"
+                           r"|rechnungsdatum|bestelldatum|datum|date\s+de\s+(?:facture|commande)|\bdate\b", re.I)
+
+
+def labeled_date(text, dayfirst=True, today=None):
+    """Primera fecha legible que sigue a una etiqueta de fecha (en el mismo renglón), en el orden de DATE_LABEL_RE. Una
+    fecha posterior a hoy no es la de la factura (33409: «hasta el 21 Nov. 2026», validez de una oferta)."""
+    today = today or date.today()
+    best = None
+    for line in (text or "").splitlines():
+        m = DATE_LABEL_RE.search(line)
+        if not m:
+            continue
+        d = parse_date(line[m.end():m.end() + 60], dayfirst)
+        if d and d <= today:
+            rank = 0 if re.match(r"(?:invoice|order|purchase|bill|document|placed|ordered|purchased|fecha|rechnungs|bestell|date\s+(?:of|de))", m.group(0), re.I) else 1
+            if best is None or rank < best[0]:
+                best = (rank, d)
+            if rank == 0:
+                break
+    if best:
+        return best[1]
+    # sin etiqueta (30751: «28 Sept 2026» en la cabecera): la primera fecha legible de la factura, más cerca de la real que
+    # el día del análisis
+    for line in (text or "").splitlines():
+        d = parse_date(line, dayfirst)
+        if d and d <= today:
+            return d
+    return None
+
+
+def invoice_text(markdown, paginas):
+    """Texto de las páginas [a, b] de la factura en el Markdown de la fase 1 («## Página N»)."""
+    if not markdown or not paginas:
+        return ""
+    parts = re.split(r"(?m)^## Página (\d+)\s*$", markdown)
+    a, b = paginas
+    return "\n".join(parts[i + 1] for i in range(1, len(parts) - 1, 2) if a <= int(parts[i]) <= b)
+
+
 def _month(word):
     w = word.lower()
     return MONTHS.get(w[:4]) or MONTHS.get(w[:3])
@@ -132,8 +174,9 @@ def _conv(v, r):
     return str((Decimal(str(v)) * r).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
 
 
-def convert_invoice(doc, dst, log, today=None):
-    """Pasa los importes de una factura a la moneda `dst`. Devuelve True si convirtió."""
+def convert_invoice(doc, dst, log, today=None, markdown=""):
+    """Pasa los importes de una factura a la moneda `dst`. Devuelve True si convirtió. `markdown` (fase 1) sirve para
+    hallar la fecha con etiqueta cuando la fase 2 no dejó fecha_pedido."""
     o = doc["ocr"]
     cur = {l["divisa"] for l in doc["lineas"] if l.get("divisa")}
     o["moneda_factura"] = next(iter(cur)) if len(cur) == 1 else ""
@@ -146,7 +189,8 @@ def convert_invoice(doc, dst, log, today=None):
         mark_review(doc, f"the invoice currency {what}: amounts not converted to {dst}; review against the paper")
         return False
     src = o["moneda_factura"]
-    day = parse_date(o.get("fecha_pedido", ""), dayfirst=src != "USD")
+    day = (parse_date(o.get("fecha_pedido", ""), dayfirst=src != "USD")
+           or labeled_date(invoice_text(markdown, o.get("paginas")), dayfirst=src != "USD"))
     when = day or today or date.today()
     found = rate(src, dst, when, log)
     if found is None:
@@ -177,7 +221,7 @@ def convert_invoice(doc, dst, log, today=None):
     return True
 
 
-def convert_all(out, dst, log):
+def convert_all(out, dst, log, markdown=""):
     for doc in out:
-        convert_invoice(doc, dst, log)
+        convert_invoice(doc, dst, log, markdown=markdown)
     return out
