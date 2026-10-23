@@ -491,7 +491,10 @@ def reconcile_block(lines, k, pages, seg, join, glm_pages, log):
     la = [l for l in goods if l.get("page_rel") == k + 1]
     lb = [l for l in goods if l.get("page_rel") == k + 2]
     others_b = [l for l in lines if l.get("kind", "goods") != "goods" and l.get("page_rel") == k + 2]
-    ob = [l for l in others_b if no_desc(l.get("desc"))]
+    # La cifra huérfana puede venir en una línea sin descripción o pegada a un renglón de la COLA del bloque partido
+    # («Return or replace items: Eligible…» como other_charges 139.99, 30972): no es un cargo ni un artículo.
+    tail_like = lambda l: no_desc(l.get("desc")) or any(same_text(l.get("desc"), r["text"]) for r in join["b_rows"])
+    ob = [l for l in others_b if tail_like(l)]
     open_text = " ".join(r["text"] for r in join["a_rows"])
     if not la:  # el 27B no devolvió líneas en A (página no leída): nada que reconciliar, como hoy
         return []
@@ -517,7 +520,7 @@ def reconcile_block(lines, k, pages, seg, join, glm_pages, log):
     shifted = (items and len(matched) == len(items) and all(l.get("amount") == prices[m[id(l)]] for l in matched))
     issues = []
     if consistent and not shifted:
-        for l in [x for x in lb + ob if id(x) not in m and no_desc(x.get("desc")) and x.get("amount") == p0]:
+        for l in [x for x in lb + ob if id(x) not in m and tail_like(x) and x.get("amount") == p0]:
             lines.remove(l)
             log(f"    «{(l.get('desc') or '')[:30]}» ({l.get('kind', 'goods')}, {p0}) era la cifra del artículo partido, no una línea")
         if a_line is None:
@@ -533,7 +536,7 @@ def reconcile_block(lines, k, pages, seg, join, glm_pages, log):
         glm_b = squash(glm_pages.get(pages[k + 1], ""))
 
         def orphan(l):
-            if no_desc(l.get("desc")):
+            if tail_like(l):
                 return True
             key = squash(l.get("desc"))[:30]
             return bool(key) and glm_b.count(key) < sum(1 for x in lb if squash(x.get("desc"))[:30] == key)

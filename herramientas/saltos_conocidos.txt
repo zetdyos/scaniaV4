@@ -2,7 +2,7 @@
 # «falso» = NO es una continuación (comprobado); «hoy» = detectado por el código de hoy, sin auditoría propia del salto.
 # Bloques (Amazon con fotos y parecidos)
 30972.pdf 1->2 real Meinl Cymbals 139.99 arriba de p2
-30703.pdf 4->5 real ActFirst banner 24.89
+30703.pdf 4->5 real ActFirst banner 9.90 (C3 2026-10-23: 13 líneas = 168.87 = subtotal)
 32382.pdf 1->2 real DinoFire 17.99 (verdad: corrimiento de p2)
 32420.pdf 1->2 real FRAMAR 9.99 (el 27B no devolvió el artículo)
 30626.pdf 2->3 real Clean Skin Club Towels 35.90
