@@ -119,7 +119,7 @@ def estimate(doc, rs, f2, llm_server, timeout, log, use_llm=True):
         return
     # Línea sin importe con la misma descripción que una con importe: puede ser el mismo artículo repetido (31699: páginas
     # de detalle que repiten la lista) o una variante distinta que el 27B cortó antes del color o la talla (27692: polo
-    # «Black» y «Surf the Web», 24.34 arriba de la página siguiente). La descripción no lo distingue: se estima igual y la
+    # «Black» y «Surf the Web»; el 12.89 del Black quedó arriba de la página siguiente). La descripción no lo distingue: se estima igual y la
     # frase pide comprobarlo. Las repeticiones de verdad las paran el tope (R <= 0) y el descarte del importe hermano.
     dup = {id(l): next((p["seq"] for p in priced if same_item(p["descripcion"], l["descripcion"])), None) for l in empty}
     # Re-lectura de cada línea con la imagen (también con una sola línea vacía: el cuadre da por buenas todas las demás

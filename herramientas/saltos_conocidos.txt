@@ -1,0 +1,39 @@
+# Cortes de página conocidos (pdf salto veredicto nota). «real» = continuación comprobada contra la imagen;
+# «falso» = NO es una continuación (comprobado); «hoy» = detectado por el código de hoy, sin auditoría propia del salto.
+# Bloques (Amazon con fotos y parecidos)
+30972.pdf 1->2 real Meinl Cymbals 139.99 arriba de p2
+30703.pdf 4->5 real ActFirst banner 24.89
+32382.pdf 1->2 real DinoFire 17.99 (verdad: corrimiento de p2)
+32420.pdf 1->2 real FRAMAR 9.99 (el 27B no devolvió el artículo)
+30626.pdf 2->3 real Clean Skin Club Towels 35.90
+30637.pdf 1->2 real Hanes 16.98; p2 corrida (verdad)
+32431.pdf 1->2 real Bumble Bee Toppers 20.97
+31728.pdf 1->2 real Weleda 19.24; p2 corrida (verdad, PRIORIDAD ALTA)
+31824.pdf 1->2 real MARYRUTH 12.25 (PP-OCRv6 lo leyó, GLM no)
+31794.pdf 1->2 real tope de cola 2 renglones
+32177.pdf 2->3 hoy corrimiento que cuadraba por casualidad (CLAUDE.md)
+32177.pdf 3->4 hoy
+32205.pdf 8->9 real Source Naturals PABA 54.99 (comprobado 2026-10-23)
+32473.pdf 3->4 real Hilitchi 20.99 (el 27B no devolvió el artículo; verdad)
+32819.pdf 2->3 hoy Name Tape (verdad: 2 líneas faltan en el salto)
+27692.pdf 1->2 real Calvin Klein polo Black 12.89; p2 corrida (comprobado 2026-10-23)
+31173.pdf 2->3 hoy
+TBA335178824474-TBA335047818852-TBA335065526351.pdf 1->2 hoy Ywdiml 23.99
+31305.pdf 1->2 hoy
+31305.pdf 2->3 hoy
+31420.pdf 1->2 hoy DinoFire 418.36 (misma captura que 32382)
+28832.pdf 4->5 hoy verdad: Banana Boat / LOWNOUR / Christmas Ornaments sin importe (no inspeccionado)
+28832.pdf 5->6 hoy
+# Tablas con la descripción DEBAJO del código (21750)
+21750.pdf 1->2 real HIGH PERFORM. GLASS F-FLU (descripción bajo el código)
+21750.pdf 3->4 real
+31053.pdf 1->2 real
+31593.pdf 1->2 real
+31734.pdf 6->7 real (p2->3 sigue sin detectarse: «USS» por «US$»)
+# Tabla con la descripción ENCIMA de su fila (FashionGo)
+32836.pdf 1->2 real Plaid … fila MIX COLOR 12 12 $1.10 $13.20
+# Falsos conocidos
+31183.pdf 1->2 falso IKEA: SANDLÖPARE 1 $9.99 (nombre + importe) arriba de B
+32205.pdf 9->10 falso bloque AVEDA completo arriba de B (columna desplazada)
+28858.pdf 4->5 falso bloque Dunzoom completo arriba de B (PP-OCRv6 leyó «�17 00» al pie de A)
+32560.pdf 1->2 falso cabecera de grupo «12TWSW PARAISO SLIDING TRI» tomada como continuación (tabla agrupada)

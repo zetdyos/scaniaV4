@@ -9,8 +9,16 @@ REPO = Path(r"C:\Users\LERIT\scaniaV4"); S = Path(__file__).parent
 sys.path.insert(0, str(REPO))
 import facturas_json as new
 import ocr_pipeline as p1
+# El módulo de saltos del COMMIT (git show HEAD:saltos.py > herramientas/saltos_head.py): si no se carga antes, el
+# facturas_json de HEAD importaría en silencio el saltos.py del árbol de trabajo.
+_saltos_tree = sys.modules.pop("saltos", None)
+if (S / "saltos_head.py").exists():
+    _ss = importlib.util.spec_from_file_location("saltos", S / "saltos_head.py")
+    _sm = importlib.util.module_from_spec(_ss); sys.modules["saltos"] = _sm; _ss.loader.exec_module(_sm)
 spec = importlib.util.spec_from_file_location("facturas_json_head", S / "facturas_json_head.py")
 old = importlib.util.module_from_spec(spec); spec.loader.exec_module(old)
+if _saltos_tree is not None:
+    sys.modules["saltos"] = _saltos_tree
 
 latest = {}
 for d in sorted((REPO / "demo_jobs").iterdir()):
