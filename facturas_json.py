@@ -1319,6 +1319,38 @@ def photo_quantity(pdf, page_idx, rect, server, timeout):
     return want if badge_text_number(raw2) == want else None
 
 
+PP_MONEY_RE = re.compile(r"^\$?\d{1,3}(?:,\d{3})*\.\d{2}$|^\$?\d+\.\d{2}$")
+
+
+def pp_row_values(pdf, page_idx, desc):
+    """(cantidad, importe) impresos en la fila de una descripción según PP-OCRv6, o None. El bloque de la descripción
+    son sus renglones de la columna izquierda hasta un hueco vertical mayor que 1.4 interlineados (siguiente artículo);
+    dentro de esa franja, a la derecha, debe haber UN solo importe y una cantidad entera a su altura."""
+    from decimal import Decimal
+    toks, w, _ = ppocr_tokens(pdf, page_idx)
+    left = sorted([t for t in toks if t[0] < w * 0.5 and len(t[4]) > 3], key=lambda t: t[1])
+    if len(left) < 2:
+        return None
+    start = next((n for n, t in enumerate(left) if saltos.same_text(desc, t[4])), None)
+    if start is None:
+        return None
+    steps = sorted(b[1] - a[1] for a, b in zip(left, left[1:]) if b[1] - a[1] > 5)
+    step = steps[len(steps) // 2] if steps else 40
+    end = start
+    while end + 1 < len(left) and left[end + 1][1] - left[end][1] <= 1.4 * step:
+        end += 1
+    y0, y1 = left[start][1] - step * 0.5, left[end][3] + step * 0.3
+    money = [t for t in toks if t[0] > w * 0.6 and y0 <= (t[1] + t[3]) / 2 <= y1 and PP_MONEY_RE.match(t[4].strip())]
+    if len(money) != 1:
+        return None
+    m = money[0]
+    yc = (m[1] + m[3]) / 2
+    qtys = [t for t in toks if w * 0.5 < t[0] < m[0] and abs((t[1] + t[3]) / 2 - yc) <= 15 and re.fullmatch(r"\d{1,4}", t[4].strip())]
+    if len(qtys) != 1:
+        return None
+    return int(qtys[0][4].strip()), f"{Decimal(m[4].strip().lstrip('$').replace(',', '')):.2f}"
+
+
 DASH_RE = re.compile(r"[-–—]")
 
 
@@ -1756,6 +1788,21 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
                 amt = cents(amt_v)
                 unit_v = model_number(l.get("precio_unitario"), l.get("precio_unitario_valor"), f"unit price of {what}", issues)
                 qty = model_number(l.get("cantidad"), l.get("cantidad_valor"), f"quantity of {what}", issues)
+                pp_row = None
+                if kind == "goods" and qty is None and not amt:
+                    # GLM perdió la columna de la derecha en esa fila y el 27B, que solo ve el texto de GLM, devolvió la línea
+                    # sin cantidad ni importe (32253 #11). PP-OCRv6 lee el texto de cada caja: si en el bloque de ESA
+                    # descripción hay un único importe y una cantidad entera a su altura, son los valores impresos de la
+                    # fila (rellenan valores vacíos; nunca sustituyen uno que el 27B devolvió).
+                    try:
+                        pp_row = pp_row_values(res["pdf"], i, l.get("descripcion", ""))
+                    except Exception:  # noqa: BLE001
+                        pp_row = None
+                    if pp_row:
+                        from decimal import Decimal
+                        qty, amt = Decimal(pp_row[0]), pp_row[1]
+                        amt_v = None
+                        log(f"  fila leída por PP-OCRv6 (GLM perdió la columna): {qty} x «{str(l.get('descripcion', ''))[:40]}» = {amt}")
                 if kind == "goods":
                     if qty is None:
                         issues.append(f'quantity of {what} not returned by the model ("{l.get("cantidad", "")}"); review against the paper')
@@ -1767,7 +1814,8 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
                 # Solo los artículos: un importe de resumen sin respaldo no se usa (ver "backed"), no es incidencia.
                 if amt and amt not in ocr_amounts and kind == "goods":
                     issues.append(f'amount {amt} not found in the OCR text ("{l.get("descripcion", "")[:40]}")')
-                lines.append({"desc": l.get("descripcion", "").strip(), "qty": qty,
+                qty_pp = bool(pp_row)
+                lines.append({"desc": l.get("descripcion", "").strip(), "qty": qty, **({"qty_printed": True} if qty_pp else {}),
                               "amount": amt, "amount_exact": amt_v if amt_v is not None and amt_v != amt_v.quantize(amt_v.__class__("0.01")) else None, "unit": cents(unit_v), "src": "qwen27b", "page_rel": k + 1,
                               "unit_exact": exact_unit(l.get("precio_unitario"), md),
                               "neg": bool(amt) and str(l.get("importe_linea", "")).strip().startswith("-") and printed_negative(amt, md),
