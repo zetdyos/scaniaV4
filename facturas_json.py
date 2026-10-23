@@ -1743,7 +1743,11 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
                 # Sin etiqueta de total, la cifra del 27B solo prueba un total si está impresa además de como importe
                 # de un artículo (31865: página suelta sin resumen; el 27B dio el precio del único artículo como
                 # total y la suma «cuadraba» consigo misma). Si no, es un documento sin total impreso -> revisión.
-                if total_printed and printed_count(t, [res["full_text"].get(i) or "" for i in pages]) <= sum(
+                # PP-OCRv6 también lee el texto (decisión del usuario 2026-10-23, 31930: GLM omitió «VALUE (USD) $253.23»
+                # en el texto de página y solo PP-OCRv6 lo trae); se toma el mayor de los dos recuentos, no la suma (la
+                # misma cifra leída por los dos lectores sigue siendo UNA cifra impresa: 31865).
+                if total_printed and max(printed_count(t, [res["full_text"].get(i) or "" for i in pages]),
+                                         printed_count(t, [pp_text])) <= sum(
                         l.get("amount") == t for l in lines if l.get("kind", "goods") == "goods"):
                     total_printed = False
                     log(f"  total del 27B {t}: solo impreso como importe de un artículo; no cuenta como total impreso")
@@ -2367,6 +2371,9 @@ def build_all(res, use_llm=True, llm_server=QWEN27_SERVER, vl_server=VL_SERVER, 
             # Lectura con la imagen (27B con su proyector de visión): si no cuadra, se repite con la imagen de cada página
             # delante del texto de GLM. Se acepta solo si con ella la factura entera termina SIN revisión: las reglas de
             # siempre siguen valiendo (una cifra que no esté literal en el OCR deja la línea sin verificar -> revisión).
+            # Medido y NO aplicado (2026-10-23, 35 facturas con «no printed total» como única causa, pasada con GPU):
+            # disparar la imagen también sin total impreso no sacó ninguna de revisión (31930 salió por otra vía: PP-OCRv6
+            # cuenta como lector del total impreso, ver printed_count); el resto no tiene total o no cuadra tampoco con la imagen.
             if source == "llm" and not doc["_cuadra"] and server_has_vision(llm_server):
                 img_log = []
                 alt, alt_source = build_invoice(len(out), rs, inv, use_llm, llm_server, vl_server, timeout, img_log.append,
@@ -2380,6 +2387,8 @@ def build_all(res, use_llm=True, llm_server=QWEN27_SERVER, vl_server=VL_SERVER, 
                             for v in (l["importe_linea"], l["ocr"].get("precio_unitario"))}
                 keeps = (txt_amts <= alt_vals and doc["total_is_printed"] and doc["total"]
                          and alt["total"] and float(alt["total"]) == float(doc["total"]))
+                if alt_source == "llm" and alt["motivo_revision"]:
+                    log(f"     con la imagen seguiría en revisión ({alt['mismatch'][:160]})")
                 if alt_source == "llm" and alt["_cuadra"] and not alt["motivo_revision"] and not keeps:
                     log("     con la imagen cuadraría, pero cambia lo que la vía de texto leyó (importe o total): se descarta")
                 if alt_source == "llm" and alt["_cuadra"] and not alt["motivo_revision"] and keeps:
