@@ -9,7 +9,7 @@ last_busy_report = 0
 
 
 JOBS = str(__import__("pathlib").Path(__file__).resolve().parents[1] / "demo_jobs")
-DEPLOY = "20261023-0020"  # despliegue de deb751b (fase 3 y moneda del cliente): los trabajos anteriores son la referencia
+DEPLOY = "20261023-1303"  # despliegue de 2f49606 (saltos.py: un solo mecanismo por geometría): los trabajos anteriores son la referencia
 count = {"docs": 0, "facturas": 0, "revision": 0, "imagen": 0, "estimadas": 0, "sin_estimar": 0, "convertidas": 0}  # desde que arranca el vigilante
 count.update(json.loads(__import__("os").environ.get("VIGILAR_CONTADOR") or "{}"))  # seguir un recuento anterior
 
