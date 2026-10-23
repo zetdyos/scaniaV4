@@ -1319,6 +1319,38 @@ def photo_quantity(pdf, page_idx, rect, server, timeout):
     return want if badge_text_number(raw2) == want else None
 
 
+DASH_RE = re.compile(r"[-–—]")
+
+
+def dash_amount(l, md, rows):
+    """La fila del artículo imprime «-» como importe (última celda o último elemento del renglón): sin cargo, no se
+    calcula cantidad x precio (33351, RockAuto: componentes de un kit cuyo valor ya está en la línea del kit; calcularlo
+    lo declaraba dos veces). Se busca la fila por la descripción y el precio unitario impreso."""
+    key = desc_key(l.get("desc"))[:15]
+    unit = l.get("unit") or ""
+    if len(key) < 6 or not unit:
+        return False
+    cand = [[c.strip() for c in cells] for cells in rows] + [ln.split() for ln in (md or "").splitlines()]
+    for cells in cand:
+        if not cells or not DASH_RE.fullmatch(cells[-1]):
+            continue
+        txt = " ".join(cells)
+        if key in desc_key(txt) and unit in doc_amounts(txt):
+            return True
+    return False
+
+
+def photo_title(pdf, page_idx, rect):
+    """Texto de PP-OCRv6 a la derecha de la foto, en su franja vertical (el título del bloque va primero): solo para
+    EMPAREJAR la foto con su línea, nunca sale."""
+    toks, _, _ = ppocr_tokens(pdf, page_idx)
+    sc = 72 / PPOCR_DPI
+    band = [t for t in toks if t[0] * sc >= rect.x1 - 4 and rect.y0 - 2 <= (t[1] + t[3]) / 2 * sc <= rect.y1]
+    # el texto desde cada renglón de la franja: la caja puede empezar con la cola del artículo de arriba («$5.99 FSA…», 27600)
+    rows = [t[4] for t in sorted(band, key=lambda t: (round(t[1] / 12), t[0]))]
+    return [" ".join(rows[i:]) for i in range(len(rows))]
+
+
 def photo_quantities(pdf, pages, lines, literal, server, timeout, log):
     """Lecturas de cantidad sobre las fotos, en la forma que usa vl_quantities ([{desc, unit, qty}]): cada foto se
     empareja con la línea del 27B de la MISMA página y el MISMO precio literal, en orden de aparición. Vacío si la
@@ -1333,7 +1365,14 @@ def photo_quantities(pdf, pages, lines, literal, server, timeout, log):
             return []
         used = set()
         for price, rect in photos:
-            l = next((l for l in on_page if id(l) not in used and price and price == photo_unit(l, literal)), None)
+            # Mismo precio Y mismo título: en una página con dos pedidos (33542: Tallew 12.99 y Purina 12.99) el precio
+            # solo emparejaba la foto de un pedido con la línea del otro. Sin título legible, solo el precio (como antes).
+            try:
+                titles = photo_title(pdf, page_idx, rect)
+            except Exception:  # noqa: BLE001
+                titles = []
+            l = next((l for l in on_page if id(l) not in used and price and price == photo_unit(l, literal)
+                      and (not titles or any(saltos.same_text(l.get("desc"), x) for x in titles))), None)
             if l is None:
                 continue
             used.add(id(l))
@@ -1816,6 +1855,9 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
         # 27B estuviera mal, la factura no cuadra y va a revisión).
         for l in lines:
             if not l.get("amount") and literal(l.get("unit")) and l["qty"] >= 1:
+                if dash_amount(l, md, rows):
+                    log(f"  importe impreso «-» (sin cargo, p. ej. componente de un kit): no se calcula «{l['desc'][:40]}»")
+                    continue
                 from decimal import ROUND_HALF_UP, Decimal
                 u = l.get("unit_exact") or Decimal(l["unit"])
                 l["amount"] = str((Decimal(str(l["qty"])) * u).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
