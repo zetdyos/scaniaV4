@@ -119,6 +119,7 @@ export OCR_MODELS_HOST=192.168.1.194            # o 127.0.0.1 si los modelos lle
 .venv/bin/python ocr_pipeline.py doc.pdf -o doc.md          # fase 1 sola
 .venv/bin/python facturas_json.py doc.pdf -o salida/        # fase 1 + 2 → salida/doc.json
 .venv/bin/python demo_api.py                                # demo en 0.0.0.0:8091 (DEMO_PORT)
+powershell -File deploy\windows\lanzar_api.ps1 -Redeploy    # Windows: desplegar sin cortar trabajos (503 a subidas nuevas, espera, reinicia)
 fuser -k 8091/tcp                                           # parar el demo (NO usar pkill -f con el texto del relanzamiento en la misma línea: se mata a sí mismo)
 ```
 
