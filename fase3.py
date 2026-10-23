@@ -16,7 +16,7 @@ Fuentes (sin precio de mercado ni nada que no salga del propio documento):
      factura en revisión a menudo no lo son. Si la re-lectura y el cuadre no coinciden, gana la lectura de la línea y
      la frase lo dice.
 Sin estimación (la decide una persona): si las líneas con importe ya cubren el resumen (R <= 0: repetida, sin cargo u
-otra cifra mal leída) o si la línea es el mismo producto que otra con importe (páginas de detalle que repiten la lista).
+otra cifra mal leída). Una línea con la misma descripción que otra con importe se estima igual, con aviso (27692).
 
 `estimacion` = {importe_estimado, maximo, metodo}; metodo: "cuadre", "relectura", "relectura+cuadre" (las lecturas de
 todas las líneas vacías suman exactamente R) o "" (sin estimación). Medido el 2026-10-23 sin GPU sobre 411 trabajos con
@@ -117,11 +117,11 @@ def estimate(doc, rs, f2, llm_server, timeout, log, use_llm=True):
                        f"printed {'items subtotal' if base == 'subtotal' else 'total'} (repeated or free item?), check it against the paper")
         log(f"     fase 3: {len(empty)} línea(s) sin importe; las demás ya cubren el resumen ({base}, resto {rest:.2f}): sin estimación")
         return
-    # Línea sin importe que es el mismo producto que una con importe (31699: las páginas de detalle repiten los artículos
-    # sin precio; 33335: fila extra del mismo producto sin precio): puede ser una repetición o unidades sin cargo. No se
-    # estima, y el cuadre deja de ser exacto para las demás (solo vale como tope).
+    # Línea sin importe con la misma descripción que una con importe: puede ser el mismo artículo repetido (31699: páginas
+    # de detalle que repiten la lista) o una variante distinta que el 27B cortó antes del color o la talla (27692: polo
+    # «Black» y «Surf the Web», 24.34 arriba de la página siguiente). La descripción no lo distingue: se estima igual y la
+    # frase pide comprobarlo. Las repeticiones de verdad las paran el tope (R <= 0) y el descarte del importe hermano.
     dup = {id(l): next((p["seq"] for p in priced if same_item(p["descripcion"], l["descripcion"])), None) for l in empty}
-    exact = not any(v is not None for v in dup.values())
     # Re-lectura de cada línea con la imagen (también con una sola línea vacía: el cuadre da por buenas todas las demás
     # líneas, y en una factura en revisión a menudo no lo son; 31728: corrimiento silencioso, el cuadre daba 9.00 y el
     # papel 19.24). Sin visión en el servidor, solo el cuadre.
@@ -129,7 +129,7 @@ def estimate(doc, rs, f2, llm_server, timeout, log, use_llm=True):
     if use_llm and f2.server_has_vision(llm_server):
         for l in empty:
             pg = (l["ocr"].get("pagina") or 0) - 1
-            if pg < 0 or not (l["descripcion"] or "").strip() or dup[id(l)] is not None:
+            if pg < 0 or not (l["descripcion"] or "").strip():
                 continue
             try:
                 vals = reread_amounts(rs, f2, pg, l["descripcion"], llm_server, timeout, log)
@@ -146,9 +146,9 @@ def estimate(doc, rs, f2, llm_server, timeout, log, use_llm=True):
             if not sibling and not whole:
                 est[id(l)], method[id(l)] = v, "relectura"
     got = sum((est[id(l)] for l in empty if est[id(l)] is not None), Decimal(0))
-    left = [l for l in empty if est[id(l)] is None and dup[id(l)] is None]
+    left = [l for l in empty if est[id(l)] is None]
     disagree = False
-    if rest is not None and exact:
+    if rest is not None:
         if not left and got == rest:
             for l in empty:
                 method[id(l)] = "relectura+cuadre"
@@ -159,16 +159,16 @@ def estimate(doc, rs, f2, llm_server, timeout, log, use_llm=True):
     for l in empty:
         seq, v = l["seq"], est[id(l)]
         l["estimacion"] = {"importe_estimado": _s(v), "maximo": _s(rest), "metodo": method[id(l)]}
-        if dup[id(l)] is not None:
-            _note(doc, f"line {seq} without amount: no estimate, same product as line {dup[id(l)]} (repeated or free item?), check it against the paper")
-        elif v is not None:
+        same = (f", same description as line {dup[id(l)]}: check it is not the same item repeated"
+                if dup[id(l)] is not None else "")
+        if v is not None:
             how = {"cuadre": "order summary", "relectura": "page re-read", "relectura+cuadre": "page re-read, matches the order summary"}
             extra = (f", but the order summary leaves {rest:.2f} for the lines without amount: other amounts may be misread"
                      if disagree else "")
-            _note(doc, f"estimated amount for line {seq}: {v:.2f} ({how[method[id(l)]]}{extra})")
+            _note(doc, f"estimated amount for line {seq}: {v:.2f} ({how[method[id(l)]]}{extra}{same})")
         elif rest is not None:
-            _note(doc, f"line {seq} without amount: no estimate (at most {rest:.2f} for the lines without amount), check it against the paper")
+            _note(doc, f"line {seq} without amount: no estimate (at most {rest:.2f} for the lines without amount{same}), check it against the paper")
         else:
-            _note(doc, f"line {seq} without amount: no estimate, check it against the paper")
+            _note(doc, f"line {seq} without amount: no estimate{same}, check it against the paper")
     log(f"     fase 3: {len(empty)} línea(s) sin importe; tope del resumen ({base or 'sin base'}) {_s(rest) or '-'}; "
         + ", ".join(f"#{l['seq']} {l['estimacion']['importe_estimado'] or '?'} ({l['estimacion']['metodo'] or '-'})" for l in empty))
