@@ -1937,20 +1937,29 @@ def block_break(rows_a, rows_b, furn):
     pb = [i for i, r in enumerate(b) if r["price"]]
     if len(pa) < 2 or not pb:
         return None
-    col = statistics.median(a[i]["x"] for i in pa)
-    in_col = lambda r: abs(r["x"] - col) <= 25
-    if not in_col(b[pb[0]]):
+    # La columna de cada página con SUS precios: una hoja escaneada desplazada corre toda la columna (27692: x 341 en A y
+    # 311 en B) y con la columna de A la continuación no se veía.
+    col_a = statistics.median(a[i]["x"] for i in pa)
+    col_b = statistics.median(b[i]["x"] for i in pb)
+    in_a = lambda r: abs(r["x"] - col_a) <= 25
+    in_col = lambda r: abs(r["x"] - col_b) <= 25
+    if len(pb) < 2 and abs(col_b - col_a) > 25:  # un solo precio en B: sin columna propia fiable
         return None
-    open_a = [r for r in a[pa[-1] + 1:] if in_col(r)]
+    open_a = [r for r in a[pa[-1] + 1:] if in_a(r)]
     tail_b = [r for r in b[:pb[0]] if in_col(r)]
     if not open_a or any(not in_col(r) for r in b[:pb[0]] if re.search(r"[A-Za-z]{2,}|\$\d", r["text"])) \
             or any(re.search(r"\$\s?\d", r["text"]) for r in tail_b):
         return None
+    # Hoja desplazada: la columna de A ya no separa un bloque NUEVO de B (título + metadatos antes de su precio: 32205 p9
+    # AVEDA, 28858 p4 Dunzoom) de la cola del bloque de A. La cola de una continuación real es el resto de un bloque: en
+    # las medidas (1220 saltos, 2026-10-23) nunca más de 2 renglones (30972, 32382, 31794); un bloque completo, 3 o más.
+    if abs(col_b - col_a) > 25 and len(tail_b) > 2:
+        return None
     sizes = []
-    for rows in (a, b):
+    for rows, inc in ((a, in_a), (b, in_col)):
         cur, started = 0, False
         for r in rows:
-            if in_col(r):
+            if inc(r):
                 cur += 1
                 if r["price"]:
                     if started and cur >= 2:  # 1 renglón = una cifra del resumen, no un artículo
