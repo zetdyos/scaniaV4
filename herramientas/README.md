@@ -5,7 +5,7 @@ así que **solo se lanzan con WTCP parado** (si no, retrasan sus trabajos: 2026-
 
 | Script | Qué hace |
 |---|---|
-| `vigilar.py` | Vigilante de la API (:8091) y de los modelos de .194: trabajos nuevos/listos, facturas a revisión con su motivo, comparación con el último resultado anterior a `DEPLOY`, regla de cantidad (el 27B decide), PP-OCRv6 caído. |
+| `vigilar.py` | SOLO cuenta (no audita: la auditoría por factura contra la imagen la hace Claude con `auditar.py`, ver CLAUDE.md «Vigilancia de un lote de WTCP»). Vigilante de la API (:8091) y de los modelos de .194: trabajos nuevos/listos, facturas a revisión con su motivo, comparación con el último resultado anterior a `DEPLOY`, regla de cantidad (el 27B decide), PP-OCRv6 caído. |
 | `regresion_head.py pdf,pdf` | Fase 2 del último commit (`git show HEAD:facturas_json.py > herramientas/facturas_json_head.py`) frente al árbol de trabajo, sobre la misma lectura (ocr.md) y las mismas respuestas del 27B. |
 | `regresion_guardado.py DESDE [pdf,pdf]` | Fase 2 del árbol de trabajo frente al `result.json` guardado de los trabajos desde `DESDE` (yyyymmdd-hhmm): válido solo si esos trabajos los procesó el código de HEAD. |
 | `regresion_replay.py [pdf,pdf] [v]` | Fase 2 del commit frente al árbol **sin modelos**: la respuesta del 27B se reconstruye desde result.json (aproximada: sin signo negativo, sin líneas descartadas; VL y PP-OCRv6 apagados). Solo cuenta los documentos donde la versión del commit reproduce lo guardado. |

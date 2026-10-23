@@ -127,6 +127,18 @@ Pruebas de regresión manuales: `31143.pdf` (Amazon escritorio → 6 facturas, 4
 Sin GPU: `herramientas/regresion_replay.py` reconstruye la respuesta del 27B desde los result.json (cambios posteriores al 27B; solo cuenta los documentos que reproduce). Desde 2026-10-21 cada trabajo guarda `modelos.json` (respuestas crudas de 27B, VL, PP-OCRv6 y regiones de la fase 1).
 Método (pedido por el usuario: "no arregles esto y rompas otra cosa"): cachear `ocr_pipeline.run()` por documento y comparar la fase 2 del commit (`git show HEAD:facturas_json.py`) con la nueva sobre la misma caché; explicar cada diferencia. **No añadir reglas motivadas por una sola factura**: si algo no cuadra, va a LECTURA.
 
+## Vigilancia de un lote de WTCP («arranca el vigilante»)
+
+`herramientas/vigilar.py` solo CUENTA (trabajos, facturas, a revisión, fase 3, moneda): no juzga nada. El auditor es Claude, y la vigilancia es esto, trabajo por trabajo, en cuanto cada uno termina:
+1. Arrancar `vigilar.py` con el contador de la corrida en cero (o sembrado con `VIGILAR_CONTADOR` si el usuario lo pide) y porcentajes siempre.
+2. Por cada trabajo terminado: `herramientas/auditar.py JOB` y mirar **cada página en imagen** (PNG en `verdad/png/JOB/`), comparando cada línea (descripción, cantidad, importe), cabecera y total con el papel. Nunca dar una factura por buena solo por el texto OCR o porque la suma cuadra (un corrimiento de precios conserva la suma: 27692).
+3. Informar por factura, sin que el usuario lo pida:
+   - sin revisión → «correcto no ir a revisión» o «NO correcto» + por qué;
+   - en revisión → «correcto ir a revisión» o no + por qué + la solución propuesta (regla general, con cuántas facturas afecta; el usuario decide).
+4. Guardar el veredicto: `auditar.py --veredicto JOB '{...}'` en `verdad/27b.jsonl`.
+5. Contador con porcentajes: sin revisión, a revisión, correctas según la auditoría.
+Los documentos que el usuario va a reenviar se excluyen del contador cuando lo pida. Desplegar durante un lote solo con `lanzar_api.ps1 -Redeploy`.
+
 ## Convenciones de trabajo
 
 - Explicar al usuario en español, con decisiones basadas en documentación citada.
