@@ -402,13 +402,20 @@ def item_text(item):
     return " ".join(r["text"] for r in item["rows"])
 
 
+def line_is_item(desc, item):
+    """La descripción del 27B es la de este artículo geométrico: casa con el texto del bloque o con ALGUNO de sus
+    renglones (el título no siempre es el primer renglón: en una variante de Amazon la cola del artículo anterior,
+    «Fit Type/Color/Size: …», se imprime DESPUÉS de su precio y encabeza el bloque siguiente; 32177 p4)."""
+    return same_text(desc, item_text(item)) or any(same_text(desc, r["text"]) for r in item["rows"])
+
+
 def match_lines(lines, items):
     """Empareja líneas del 27B con artículos geométricos en orden de lectura: {id(línea): índice de artículo}. Cada
     artículo se usa una vez; empate (varios artículos parecidos) -> el primero libre en orden."""
     used, out = set(), {}
     for l in lines:
         for j, it in enumerate(items):
-            if j not in used and same_text(l.get("desc"), item_text(it)):
+            if j not in used and line_is_item(l.get("desc"), it):
                 used.add(j)
                 out[id(l)] = j
                 break
@@ -503,9 +510,13 @@ def reconcile_block(lines, k, pages, seg, join, glm_pages, log):
     if a_line is not None and a_line.get("amount"):
         if a_line["amount"] == p0:
             return []  # el 27B ya lo emparejó bien
-        rows_a = seg[pages[k]]["rows"]
-        if any(a_line["amount"] in r["amounts"] for r in rows_a) or amount_in_text(a_line["amount"], glm_pages.get(pages[k], "")):
-            log(f"    «{a_line['desc'][:40]}» ya tiene su importe {a_line['amount']} impreso en la página {pages[k] + 1}: el bloque no estaba abierto")
+        # ¿El bloque no estaba abierto (PP-OCRv6 leyó mal su precio al pie de A, 28858 p4)? Entonces GLM leyó ese importe
+        # DESPUÉS del título del bloque. Una cifra igual impresa en otro artículo de A no cuenta (32177: 17.49 tres veces).
+        glm_a = glm_pages.get(pages[k], "")
+        title = glm_quote(join["a_rows"], glm_a, 60)
+        after = glm_a[glm_a.index(title):] if title and title in glm_a else (glm_a if not title else "")
+        if amount_in_text(a_line["amount"], after):
+            log(f"    «{a_line['desc'][:40]}» ya tiene su importe {a_line['amount']} impreso tras su título en la página {pages[k] + 1}: el bloque no estaba abierto")
             return []
         return [f"item split by the page break ({where}): the price {p0} at the top of the next page belongs to "
                 f"«{a_line['desc'][:40]}», which the model gave {a_line['amount']}; review the items around the page break"]
@@ -534,18 +545,31 @@ def reconcile_block(lines, k, pages, seg, join, glm_pages, log):
         last_price = prices[-1]
         rest = [l for l in lb + ob if id(l) not in m]
         glm_b = squash(glm_pages.get(pages[k + 1], ""))
+        # El bloque abierto al pie de B (su precio está en la página siguiente): en un corrimiento su línea carga con el
+        # último precio de B (32177 p3: «100th Day… Truck» con el 17.49 del Root Beer). No es una línea sobrante: se queda
+        # sin importe y el corte siguiente le dará el suyo.
+        open_b = seg[pages[k + 1]]["block"]["open"]
+        open_text_b = " ".join(r["text"] for r in open_b)
+        next_open = [l for l in rest if open_b and l.get("kind", "goods") == "goods" and same_text(l.get("desc"), open_text_b)]
+        rest = [l for l in rest if l not in next_open[:1]]
 
         def orphan(l):
             if tail_like(l):
                 return True
             key = squash(l.get("desc"))[:30]
             return bool(key) and glm_b.count(key) < sum(1 for x in lb if squash(x.get("desc"))[:30] == key)
-        if all(l.get("amount") == last_price and orphan(l) for l in rest):
+        if (all(l.get("amount") == last_price and orphan(l) for l in rest)
+                and all(l.get("amount") == last_price for l in next_open[:1])):
             for l in matched:
                 new = items[m[id(l)]]["price"]
                 if l.get("amount") != new:
                     log(f"    importe realineado: «{l['desc'][:40]}» {l.get('amount')} -> {new}")
                     retarget(l, new)
+            for l in next_open[:1]:
+                l["amount"], l["amount_exact"] = "", None
+                if l.get("unit") == last_price:
+                    l["unit"], l["unit_exact"] = "", None
+                log(f"    «{l['desc'][:40]}» es el bloque abierto al pie de la página {pages[k] + 2}: su precio está en la siguiente")
             for l in rest:
                 lines.remove(l)
                 log(f"    «{(l.get('desc') or '')[:30]}» ({l.get('kind', 'goods')}, {last_price}) era la cifra sobrante del corrimiento, no una línea")
