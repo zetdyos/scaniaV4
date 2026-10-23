@@ -390,12 +390,13 @@ def no_desc(d):
 
 
 def same_text(desc, text):
-    """La descripción del 27B es el artículo geométrico (texto de PP-OCRv6, solo para emparejar): mismos 30 primeros
-    caracteres alfanuméricos con similitud >= 0.8 y el mismo arranque."""
+    """La descripción del 27B es el artículo geométrico (texto de PP-OCRv6, solo para emparejar): 30 primeros caracteres
+    alfanuméricos con similitud >= 0.8 (el criterio medido del código anterior). Sin exigir el mismo arranque: PP-OCRv6 y
+    GLM confunden I/1, O/0 («Bifenthrin I/T» y «1/T», 31173) y el artículo abierto pasaba por «no devuelto»."""
     a, b = desc_key(desc)[:30], desc_key(text)[:30]
     if not a or not b:
         return False
-    return a[:12] == b[:12] and difflib.SequenceMatcher(None, a, b).ratio() >= SIM
+    return difflib.SequenceMatcher(None, a, b).ratio() >= SIM
 
 
 def item_text(item):
@@ -409,16 +410,22 @@ def line_is_item(desc, item):
     return same_text(desc, item_text(item)) or any(same_text(desc, r["text"]) for r in item["rows"])
 
 
-def match_lines(lines, items):
+def match_lines(lines, items, exact_first=False):
     """Empareja líneas del 27B con artículos geométricos en orden de lectura: {id(línea): índice de artículo}. Cada
-    artículo se usa una vez; empate (varios artículos parecidos) -> el primero libre en orden."""
+    artículo se usa una vez; empate (varios artículos parecidos) -> el primero libre en orden. Con `exact_first`, antes
+    las parejas con el MISMO importe: una descripción que el 27B repitió no le quita el artículo a la línea que lleva su
+    precio (31420, «Vagabond…» con 17.99 y con 159.00). Solo para la firma CONSISTENTE: en un corrimiento la copia que
+    lleva el último precio se quedaría con el artículo y la firma se perdería (30637)."""
     used, out = set(), {}
-    for l in lines:
-        for j, it in enumerate(items):
-            if j not in used and line_is_item(l.get("desc"), it):
-                used.add(j)
-                out[id(l)] = j
-                break
+    for exact in ((True, False) if exact_first else (False,)):
+        for l in lines:
+            if id(l) in out:
+                continue
+            for j, it in enumerate(items):
+                if j not in used and line_is_item(l.get("desc"), it) and (not exact or l.get("amount") == it["price"]):
+                    used.add(j)
+                    out[id(l)] = j
+                    break
     return out
 
 
@@ -524,14 +531,34 @@ def reconcile_block(lines, k, pages, seg, join, glm_pages, log):
     # un artículo geométrico que el 27B devolvió como línea NO-goods con concepto (una cifra del resumen en su renglón) no cuenta
     taken = set(match_lines([l for l in others_b if not no_desc(l.get("desc"))], items).values())
     items = [it for j, it in enumerate(items) if j not in taken]
-    m = match_lines(lb, items)
-    matched = [l for l in lb if id(l) in m]
     prices = [p0] + [it["price"] for it in items]
-    consistent = all(l.get("amount") == items[m[id(l)]]["price"] for l in matched)
-    shifted = (items and len(matched) == len(items) and all(l.get("amount") == prices[m[id(l)]] for l in matched))
+
+    def signatures(m):
+        matched = [l for l in lb if id(l) in m]
+        consistent = all(l.get("amount") == items[m[id(l)]]["price"] for l in matched)
+        shifted = (items and len(matched) == len(items) and all(l.get("amount") == prices[m[id(l)]] for l in matched))
+        return matched, consistent, shifted
+    m = match_lines(lb, items)  # por orden de lectura: así se ve la firma del corrimiento
+    matched, consistent, shifted = signatures(m)
+    if not consistent and not shifted:
+        # Una descripción repetida por el 27B se queda con el artículo de la línea que lleva su precio (31420): se
+        # reintenta con las parejas de mismo importe primero, y solo vale si así la página es CONSISTENTE.
+        m2 = match_lines(lb, items, exact_first=True)
+        matched2, consistent2, _ = signatures(m2)
+        if consistent2:
+            m, matched, consistent = m2, matched2, True
+    glm_b = squash(glm_pages.get(pages[k + 1], ""))
+
+    def orphan(l):
+        """Línea sobrante que carga con una cifra del corte: sin descripción o cola del bloque (tail_like), o una descripción
+        que el 27B repitió más veces de las que GLM la imprimió (30637; 31420: «Vagabond…» con el 17.99 del DinoFire)."""
+        if tail_like(l):
+            return True
+        key = squash(l.get("desc"))[:30]
+        return bool(key) and glm_b.count(key) < sum(1 for x in lb if squash(x.get("desc"))[:30] == key)
     issues = []
     if consistent and not shifted:
-        for l in [x for x in lb + ob if id(x) not in m and tail_like(x) and x.get("amount") == p0]:
+        for l in [x for x in lb + ob if id(x) not in m and orphan(x) and x.get("amount") == p0]:
             lines.remove(l)
             log(f"    «{(l.get('desc') or '')[:30]}» ({l.get('kind', 'goods')}, {p0}) era la cifra del artículo partido, no una línea")
         if a_line is None:
@@ -544,7 +571,6 @@ def reconcile_block(lines, k, pages, seg, join, glm_pages, log):
     if shifted:
         last_price = prices[-1]
         rest = [l for l in lb + ob if id(l) not in m]
-        glm_b = squash(glm_pages.get(pages[k + 1], ""))
         # El bloque abierto al pie de B (su precio está en la página siguiente): en un corrimiento su línea carga con el
         # último precio de B (32177 p3: «100th Day… Truck» con el 17.49 del Root Beer). No es una línea sobrante: se queda
         # sin importe y el corte siguiente le dará el suyo.
@@ -552,12 +578,6 @@ def reconcile_block(lines, k, pages, seg, join, glm_pages, log):
         open_text_b = " ".join(r["text"] for r in open_b)
         next_open = [l for l in rest if open_b and l.get("kind", "goods") == "goods" and same_text(l.get("desc"), open_text_b)]
         rest = [l for l in rest if l not in next_open[:1]]
-
-        def orphan(l):
-            if tail_like(l):
-                return True
-            key = squash(l.get("desc"))[:30]
-            return bool(key) and glm_b.count(key) < sum(1 for x in lb if squash(x.get("desc"))[:30] == key)
         if (all(l.get("amount") == last_price and orphan(l) for l in rest)
                 and all(l.get("amount") == last_price for l in next_open[:1])):
             for l in matched:

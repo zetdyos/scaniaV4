@@ -13,17 +13,17 @@
 31794.pdf 1->2 real tope de cola 2 renglones
 32177.pdf 2->3 hoy corrimiento que cuadraba por casualidad (CLAUDE.md)
 32177.pdf 3->4 hoy
-32205.pdf 8->9 real Source Naturals PABA 54.99 (comprobado 2026-10-23)
+32205.pdf 8->9 real Source Naturals PABA 54.99 (comprobado 2026-10-23; ENTRE pedidos: el marcador del siguiente está en p9 bajo el precio)
 32473.pdf 3->4 real Hilitchi 20.99 (el 27B no devolvió el artículo; verdad)
 32819.pdf 2->3 hoy Name Tape (verdad: 2 líneas faltan en el salto)
 27692.pdf 1->2 real Calvin Klein polo Black 12.89; p2 corrida (comprobado 2026-10-23)
-31173.pdf 2->3 hoy
-TBA335178824474-TBA335047818852-TBA335065526351.pdf 1->2 hoy Ywdiml 23.99
-31305.pdf 1->2 hoy
-31305.pdf 2->3 hoy
-31420.pdf 1->2 hoy DinoFire 418.36 (misma captura que 32382)
-28832.pdf 4->5 hoy verdad: Banana Boat / LOWNOUR / Christmas Ornaments sin importe (no inspeccionado)
-28832.pdf 5->6 hoy
+31173.pdf 2->3 real Bifenthrin I/T 44.99 (comprobado 2026-10-23; GLM «I/T», PP-OCRv6 «1/T»: same_text sin exigir el arranque)
+TBA335178824474-TBA335047818852-TBA335065526351.pdf 1->2 real Ywdiml MAF Sensor 23.99 (comprobado 2026-10-23)
+31305.pdf 1->2 real Dog Teeth Cleaning Powder 19.38 arriba de p2 (ENTRE pedidos: la app imprime el pedido siguiente en la misma página; split_invoices no lo ve)
+31305.pdf 2->3 real BOSCH RP95 12.77 arriba de p3 (ENTRE pedidos, ídem)
+31420.pdf 1->2 real DinoFire 17.99 (comprobado 2026-10-23; misma captura que 32382; el 27B repitió «Vagabond» con el 17.99)
+28832.pdf 4->5 real Banana Boat 30.94 (comprobado 2026-10-23; el 27B corrió solo 3 líneas de p5: corrimiento parcial, revisión)
+28832.pdf 5->6 real LOWNOUR (B- 8.7inch) 25.99 (comprobado 2026-10-23)
 # Tablas con la descripción DEBAJO del código (21750)
 21750.pdf 1->2 real HIGH PERFORM. GLASS F-FLU (descripción bajo el código)
 21750.pdf 3->4 real
