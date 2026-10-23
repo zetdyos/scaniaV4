@@ -467,9 +467,19 @@ def join_text_rule(lines, k, log):
     log(f"  artículo partido por el salto de página {k + 1}->{k + 2}: «{a['desc'][:40]}» + importe {a['amount']} de la página siguiente")
 
 
-def _not_returned(open_text, p0, pages, k):
-    return (f"item printed at the foot of page {pages[k] + 1} («{open_text[:40]}», price {p0} at the top of page "
-            f"{pages[k] + 2}) was not returned by the model; review the items around the page break")
+def glm_quote(rows, glm_text, n=40):
+    """Texto de GLM para citar unos renglones en una incidencia: el primer renglón con correspondencia en GLM
+    (glm_fragment). El texto de PP-OCRv6 nunca sale a WTCP (32420: «口 FRAMaR … Rruch»). Sin correspondencia -> ""."""
+    words = (glm_text or "").split()
+    return next((g[:n] for r in rows for g in [glm_fragment(r["text"], words)] if g), "")
+
+
+def _not_returned(a_rows, p0, pages, k, glm_pages):
+    """Incidencia del artículo abierto que el 27B no devolvió (cita de GLM; sin correspondencia, sin cita)."""
+    quote = glm_quote(a_rows, glm_pages.get(pages[k], ""))
+    what = f"(«{quote}», price {p0}" if quote else f"(price {p0}"
+    return (f"item printed at the foot of page {pages[k] + 1} {what} at the top of page {pages[k] + 2}) was not returned "
+            "by the model; review the items around the page break")
 
 
 def reconcile_block(lines, k, pages, seg, join, glm_pages, log):
@@ -511,7 +521,7 @@ def reconcile_block(lines, k, pages, seg, join, glm_pages, log):
             lines.remove(l)
             log(f"    «{(l.get('desc') or '')[:30]}» ({l.get('kind', 'goods')}, {p0}) era la cifra del artículo partido, no una línea")
         if a_line is None:
-            issues.append(_not_returned(open_text, p0, pages, k))
+            issues.append(_not_returned(join["a_rows"], p0, pages, k, glm_pages))
             log(f"    el 27B no devolvió el artículo abierto «{open_text[:40]}»")
         else:
             retarget(a_line, p0)
@@ -537,13 +547,14 @@ def reconcile_block(lines, k, pages, seg, join, glm_pages, log):
                 lines.remove(l)
                 log(f"    «{(l.get('desc') or '')[:30]}» ({l.get('kind', 'goods')}, {last_price}) era la cifra sobrante del corrimiento, no una línea")
             if a_line is None:
-                issues.append(_not_returned(open_text, p0, pages, k))
+                issues.append(_not_returned(join["a_rows"], p0, pages, k, glm_pages))
             else:
                 retarget(a_line, p0)
                 log(f"    importe {p0} (impreso arriba de la página siguiente) para «{a_line['desc'][:40]}»")
             return issues
-    issues.append(f"items around the page break ({where}) could not be paired with the printed prices: «{open_text[:40]}» / "
-                  f"price {p0}; review them")
+    quote = glm_quote(join["a_rows"], glm_pages.get(pages[k], ""))
+    issues.append(f"items around the page break ({where}) could not be paired with the printed prices"
+                  + (f": «{quote}» / price {p0}" if quote else f" (price {p0} at the top of page {pages[k] + 2})") + "; review them")
     log(f"    sin firma clara del corte (líneas de B {len(lb)}, artículos {len(items)}, emparejadas {len(matched)}): sin cambios")
     return issues
 
@@ -692,8 +703,9 @@ def reconcile_table(lines, k, pages, seg, join, glm_pages, furn, log):
                next((f"descripción sin texto correspondiente en GLM-OCR («{l['desc'][:40]}», {l.get('amount')})" for l, d in pairs if d is None), ""))
     if why_not:
         log(f"  salto {where}: continuación «{orph_text}» sin realinear: {why_not}")
-        return [f"item description split by the page break ({where}): «{orph_text[:50]}» continues the last item of the "
-                "previous page; descriptions of the next page could not be re-aligned, review them"]
+        quote = orph_glm or glm_quote(join["b_rows"], glm_pages.get(pages[k + 1], ""), 50)
+        return [f"item description split by the page break ({where}): " + (f"«{quote[:50]}» continues" if quote else "a description row continues")
+                + " the last item of the previous page; descriptions of the next page could not be re-aligned, review them"]
     for l in phantom:
         lines.remove(l)
         log(f"  salto {where}: «{l['desc'][:40]}» sin importe era la continuación, no un artículo")
