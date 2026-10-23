@@ -763,6 +763,7 @@ def fix_breaks(lines, pdf, pages, glm_pages, log, *, tokens_of):
         return ["page breaks could not be checked (PP-OCRv6 unavailable); review the items around the page breaks"]
     issues = []
     style = doc_style(seg)
+    before = list(lines)
     for k in range(len(pages) - 1):
         if pages[k + 1] != pages[k] + 1:
             continue
@@ -775,4 +776,13 @@ def fix_breaks(lines, pdf, pages, glm_pages, log, *, tokens_of):
             issues += reconcile_row(lines, k, pages, join, log)
         else:
             issues += reconcile_table(lines, k, pages, seg, join, glm_pages, furn, log)
-    return issues
+    # Las líneas quitadas (cifra huérfana, fantasma, cola) no existen: una incidencia de lectura generada para ellas
+    # («quantity of item «ISO 32…» not returned by the model», 31053) no debe llegar a WTCP.
+    removed = [l for l in before if not any(l is x for x in lines)]
+    return issues, removed
+
+
+def drop_issues_of(issues, removed):
+    """Incidencias que citan la descripción («…[:40]») de una línea que el módulo quitó."""
+    keys = {f"«{(l.get('desc') or '')[:40]}»" for l in removed if (l.get("desc") or "").strip()}
+    return [i for i in issues if not any(k in i for k in keys)]

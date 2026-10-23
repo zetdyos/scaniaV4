@@ -1746,7 +1746,8 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
                          for i, regs in zip(pages, regions)}
             # Saltos de página: un solo mecanismo por geometría (saltos.py). ppocr_tokens se pasa tardío para que las
             # repeticiones sin GPU (herramientas) puedan sustituirlo.
-            issues += saltos.fix_breaks(lines, res["pdf"], pages, glm_pages, log, tokens_of=lambda p, i: ppocr_tokens(p, i))
+            more, removed = saltos.fix_breaks(lines, res["pdf"], pages, glm_pages, log, tokens_of=lambda p, i: ppocr_tokens(p, i))
+            issues = saltos.drop_issues_of(issues, removed) + more
     else:
         lines, source = [], "ninguna"
         issues.append("no shipment blocks and model extraction disabled")
