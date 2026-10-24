@@ -223,5 +223,10 @@ def convert_invoice(doc, dst, log, today=None, markdown=""):
 
 def convert_all(out, dst, log, markdown=""):
     for doc in out:
-        convert_invoice(doc, dst, log, markdown=markdown)
+        try:
+            convert_invoice(doc, dst, log, markdown=markdown)
+        except Exception as e:  # noqa: BLE001  una caché corrupta o una fecha rara no tumban el trabajo: la factura va a revisión
+            from facturas_json import mark_review
+            log(f"  factura {doc['id']}: conversión de moneda fallida ({type(e).__name__}: {e})")
+            mark_review(doc, f"currency conversion to {dst} failed ({type(e).__name__}); amounts left as printed, review against the paper")
     return out

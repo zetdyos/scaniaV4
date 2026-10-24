@@ -338,11 +338,12 @@ AUTH = [Security(require_key)]
 @app.get("/api/health", response_model=Health, tags=["sistema"], summary="Estado de los servidores de modelos", dependencies=AUTH)
 def health():
     out = []
-    for name, url in (("GLM-OCR", p1.DEFAULT_SERVER), ("Qwen3.6-27B", f2.QWEN27_SERVER), ("Qwen2.5-VL", f2.VL_SERVER)):
+    for name, url in (("GLM-OCR", p1.DEFAULT_SERVER), ("Qwen3.6-27B", f2.QWEN27_SERVER), ("Qwen2.5-VL", f2.VL_SERVER),
+                      ("PP-OCRv6", f2.PPOCR_SERVER)):  # PP-OCRv6 (geometría y cifras): sin él las facturas de varias páginas van a revisión
         ok, model = False, None
         try:
             ok = requests.get(f"{url}/health", timeout=3).status_code == 200
-            if ok:
+            if ok and name != "PP-OCRv6":
                 model = Path(requests.get(f"{url}/props", timeout=3).json().get("model_path", "")).name or None
         except requests.RequestException:
             pass

@@ -605,8 +605,8 @@ def server_has_vision(server):
     if server not in _VISION:
         try:
             _VISION[server] = bool(requests.get(f"{server}/props", timeout=10).json().get("modalities", {}).get("vision"))
-        except Exception:  # noqa: BLE001
-            _VISION[server] = False
+        except Exception:  # noqa: BLE001  servidor caído en ese momento: no se recuerda como «sin visión» para siempre
+            return False
     return _VISION[server]
 
 
@@ -1584,7 +1584,10 @@ def build_shipment_invoice(inv_id, res, inv, block, k, n, order_fields, order_to
         l["verified"] = ok
         l["evidence"] = line_evidence(l, "", set(), ok)
     pages_abs = [order_pages[i] for i in block["pages"]]
-    fields = dict(order_fields)
+    # Copia PROPIA de las listas del pedido: con dict() las facturas de los envíos compartían los mismos objetos
+    # (`duplicado`, `descuentos`, `other_charges`); un duplicado marcado en un envío aparecía en todos y la conversión
+    # de moneda multiplicaba dos veces los descuentos compartidos (auditoría 2026-10-23).
+    fields = {k: ([dict(x) if isinstance(x, dict) else x for x in v] if isinstance(v, list) else v) for k, v in order_fields.items()}
     fields.update({
         "paginas": [pages_abs[0] + 1, pages_abs[-1] + 1],
         "subtotal_articulos": block["subtotal"], "envio": block["envio"], "impuestos": block["impuestos"],
@@ -2545,9 +2548,18 @@ def build_all(res, use_llm=True, llm_server=QWEN27_SERVER, vl_server=VL_SERVER, 
     fps = order_fingerprints(out, res.get("markdown", ""))
     for i, a in enumerate(fps):
         for j, b in enumerate(fps):
-            if i != j and not (a["envios"] and b["envios"]) and same_order(a, b):
+            if i == j or (a["envios"] and b["envios"]):
+                continue
+            if same_order(a, b):
                 mark_duplicate(out[i], f"same order as invoice {b['id']} of this file (identical items and total; "
                                        "possible duplicate declaration)", Path(res["pdf"]).name, b["id"], "total")
+                break
+            # Misma referencia impresa y artículos en común dentro del MISMO archivo (el pedido repartido en varias hojas,
+            # cada una con sus tachones: 33833/33848 pero en un solo PDF): el mismo criterio que entre documentos
+            # (demo_api.mark_cross_document_duplicates); antes solo llevaba la nota «order reference repeated» como LECTURA.
+            if partial_same_order(a, b):
+                mark_duplicate(out[i], f"same order number {a['ref']} as invoice {b['id']} of this file, with item(s) "
+                                       "in common (possible partial duplicate declaration)", Path(res["pdf"]).name, b["id"], "parcial")
                 break
     return out
 
