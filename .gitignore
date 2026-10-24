@@ -9,6 +9,7 @@ __pycache__/
 /salida/
 /salida_md/
 /demo_jobs/
+/clasif_jobs/
 /logs/
 
 # API-Tokens de los clientes (secretos)

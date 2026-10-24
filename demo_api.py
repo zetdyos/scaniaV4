@@ -47,6 +47,7 @@ from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
 
+import clasificacion
 import divisas
 import facturas_json as f2
 import ocr_pipeline as p1
@@ -119,6 +120,7 @@ TAGS = [
     {"name": "trabajos", "description": "Subida de archivos y consulta de resultados. Un trabajo a la vez: los llama-server tienen un solo slot."},
     {"name": "archivos", "description": "PDF procesado y JSON de facturas de un trabajo."},
     {"name": "sistema", "description": "Salud de los servidores de modelos."},
+    {"name": "clasificación", "description": "Descripciones de producto -> códigos Schedule B de 10 dígitos (clasificador HS6 aparte, asíncrono)."},
 ]
 app = FastAPI(
     title="PDF Reder · OCR de facturas",
@@ -348,6 +350,7 @@ def health():
         except requests.RequestException:
             pass
         out.append(ModelHealth(name=name, url=url, ok=ok, model=model))
+    out.append(ModelHealth(name="Clasificador HS6", url=clasificacion.CLASIFICADOR_URL, ok=clasificacion.salud()))
     return Health(models_host=p1.MODELS_HOST, models=out,
                   jobs_running=sum(1 for j in jobs.values() if j["state"] == "running"),
                   jobs_queued=sum(1 for j in jobs.values() if j["state"] == "queued"))
@@ -480,6 +483,57 @@ def get_result(job_id: str):
         raise HTTPException(404, "resultado no disponible")
     return FileResponse(JOBS_DIR / job_id / "result.json", media_type="application/json",
                         filename=Path(j["pdf"]).stem + ".facturas.json")
+
+
+# ----------------------------------------------------------------------------- clasificación (contrato §8)
+
+class ClassifyItemIn(BaseModel):
+    ref: str = Field(..., description=f"Lo pone WTCP (hasta {clasificacion.MAX_REF} caracteres); se devuelve tal cual")
+    descripcion: str = Field(..., description="Descripción de la línea (obligatoria)")
+    cantidad: Optional[str] = None
+    precio_unitario: Optional[str] = None
+    divisa: Optional[str] = None
+
+
+class ClassifyIn(BaseModel):
+    pais_origen: Optional[str] = Field(None, description="ISO de 2 letras (contexto; hoy no cambia la clasificación)")
+    items: list[ClassifyItemIn] = Field(..., description=f"Hasta {clasificacion.MAX_ITEMS} líneas")
+
+
+class Sugerencia(BaseModel):
+    codigo: str = Field(description="Schedule B, 10 dígitos")
+    descripcion: str = ""
+    confianza: Optional[float] = Field(None, description="0 a 1 (score10 del clasificador)")
+    canal: str = "clasificador"
+    calibrado: bool = False
+
+
+class ClassifyItemOut(BaseModel):
+    ref: str
+    estado: Literal["sugerencia_segura", "dudosa", "no_clasificado"]
+    sugerencias: list[Sugerencia] = []
+
+
+class ClassifyOut(BaseModel):
+    version_catalogo: str = ""
+    items: list[ClassifyItemOut] = Field(description="Solo las líneas ya clasificadas; un ref que falta se vuelve a pedir")
+
+
+@app.post("/api/classify", response_model=ClassifyOut, tags=["clasificación"],
+          summary="Schedule B de un lote de descripciones (contrato §8)",
+          responses={400: {"description": "lote no aceptado"}, 503: {"description": "clasificador no disponible: reintentar"}})
+def classify(body: ClassifyIn, client: str = Security(require_key)):
+    """Devuelve en menos de 60 s las líneas ya clasificadas. Las descripciones nuevas se encolan en el clasificador
+    (de 20 s a varios minutos por línea) y se omiten de la respuesta: WTCP las vuelve a pedir en el próximo lote y
+    entonces salen de la caché al momento."""
+    if DRAIN_FILE.exists():
+        raise HTTPException(503, "server restarting: retry later", headers={"Retry-After": "120"})
+    try:
+        return clasificacion.clasificar([it.model_dump() for it in body.items], client)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from None
+    except clasificacion.ClasificadorError as e:
+        raise HTTPException(e.status if e.status != 404 else 503, e.detail) from None
 
 
 HTML = r"""<!doctype html>

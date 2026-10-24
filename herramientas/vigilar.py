@@ -9,7 +9,7 @@ last_busy_report = 0
 
 
 JOBS = str(__import__("pathlib").Path(__file__).resolve().parents[1] / "demo_jobs")
-DEPLOY = "20261023-1755"  # reenvío del lote del 2026-10-23 tras e8c3be3: se compara con la corrida anterior del mismo PDF
+DEPLOY = "20261023-2041"  # lote tras ed4e454 (auditoría del flujo): se compara con la corrida anterior del mismo PDF
 count = {"docs": 0, "facturas": 0, "revision": 0, "imagen": 0, "estimadas": 0, "sin_estimar": 0, "convertidas": 0, "duplicados": 0, "dup_limpios": 0}  # desde que arranca el vigilante
 count.update(json.loads(__import__("os").environ.get("VIGILAR_CONTADOR") or "{}"))  # seguir un recuento anterior
 
