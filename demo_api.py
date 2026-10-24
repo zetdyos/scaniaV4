@@ -35,7 +35,8 @@ import re
 import threading
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor
+import itertools
+import queue
 from pathlib import Path
 from typing import Any, Literal, Optional
 
@@ -190,9 +191,35 @@ class Health(BaseModel):
     models: list[ModelHealth]
     jobs_running: int
     jobs_queued: int
-executor = ThreadPoolExecutor(max_workers=1)
 jobs: dict = {}
 lock = threading.Lock()
+
+# ----------------------------------------------------------------------------- cola única contra los modelos
+# Análisis de archivos y clasificaciones usan el mismo Qwen3.6-27B (:8083, un turno): UNA cola y UN trabajador, nunca
+# dos peticiones a la vez (pedido del usuario 2026-10-24). Prioridad a los análisis: WTCP corta un análisis que tarda
+# más de 45 min (§3 del contrato) y un lote de 200 descripciones son ~80 min; las clasificaciones usan los huecos.
+# Dentro de cada prioridad, por orden de llegada.
+PRIO_ANALISIS, PRIO_CLASIFICACION = 0, 1
+COLA: "queue.PriorityQueue" = queue.PriorityQueue()
+_SEQ = itertools.count()
+
+
+def encolar(prio, fn, *args):
+    COLA.put((prio, next(_SEQ), fn, args))
+
+
+def _trabajador():
+    while True:
+        _prio, _n, fn, args = COLA.get()
+        try:
+            fn(*args)
+        except Exception as e:  # noqa: BLE001  una tarea rota no para la cola
+            print(f"cola: {fn.__name__} falló: {type(e).__name__}: {e}", flush=True)
+        finally:
+            COLA.task_done()
+
+
+threading.Thread(target=_trabajador, name="cola-modelos", daemon=True).start()
 
 
 def save_meta(job):
@@ -399,7 +426,7 @@ async def create_job(file: UploadFile = File(..., description="PDF, PNG, JPG/JPE
     with lock:
         jobs[job_id] = job
     save_meta(job)
-    executor.submit(process, job_id)
+    encolar(PRIO_ANALISIS, process, job_id)
     return {"id": job_id}
 
 
@@ -529,7 +556,8 @@ def classify(body: ClassifyIn, client: str = Security(require_key)):
     if DRAIN_FILE.exists():
         raise HTTPException(503, "server restarting: retry later", headers={"Retry-After": "120"})
     try:
-        return clasificacion.clasificar([it.model_dump() for it in body.items], client)
+        return clasificacion.clasificar([it.model_dump() for it in body.items], client,
+                                        lambda *a: encolar(PRIO_CLASIFICACION, clasificacion.procesar, *a, f2.modelos_lock))
     except ValueError as e:
         raise HTTPException(400, str(e)) from None
     except clasificacion.ClasificadorError as e:
