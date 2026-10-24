@@ -10,6 +10,7 @@ __pycache__/
 /salida_md/
 /demo_jobs/
 /clasif_jobs/
+/anthropic_key.txt
 /logs/
 
 # API-Tokens de los clientes (secretos)

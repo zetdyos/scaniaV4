@@ -51,6 +51,7 @@ from pydantic import BaseModel, Field
 import clasificacion
 import divisas
 import facturas_json as f2
+import fase4
 import ocr_pipeline as p1
 
 HERE = Path(__file__).resolve().parent
@@ -199,7 +200,8 @@ lock = threading.Lock()
 # dos peticiones a la vez (pedido del usuario 2026-10-24). Prioridad a los análisis: WTCP corta un análisis que tarda
 # más de 45 min (§3 del contrato) y un lote de 200 descripciones son ~80 min; las clasificaciones usan los huecos.
 # Dentro de cada prioridad, por orden de llegada.
-PRIO_ANALISIS, PRIO_CLASIFICACION = 0, 1
+PRIO_ANALISIS, PRIO_CORRECCION, PRIO_CLASIFICACION = 0, 1, 2  # una corrección llega al clasificador antes que las
+# clasificaciones que se vuelvan a pedir
 COLA: "queue.PriorityQueue" = queue.PriorityQueue()
 _SEQ = itertools.count()
 
@@ -330,6 +332,7 @@ def process(job_id):
         with f2.modelos_lock(log, on_wait=lambda: set_step(job, 2, "Esperando a los modelos (otro proceso los está usando)")):
             res = p1.run(str(d / job["pdf"]), log=log)
             out = f2.build_all(res, log=log)
+            fase4.aplicar(out, res, log)  # Claude solo para las facturas en revisión; sin clave (FASE4=off) no hace nada
         fps = mark_cross_document_duplicates(job, out, res["markdown"], log)  # con los importes impresos
         divisas.convert_all(out, job.get("moneda") or CLIENT_CURRENCY.get(job.get("client"), "USD"), log, res["markdown"])
         (d / "huellas.json").write_text(json.dumps(fps, ensure_ascii=False), encoding="utf-8")
@@ -546,6 +549,43 @@ class ClassifyOut(BaseModel):
     items: list[ClassifyItemOut] = Field(description="Solo las líneas ya clasificadas; un ref que falta se vuelve a pedir")
 
 
+def encolar_correcciones():
+    encolar(PRIO_CORRECCION, clasificacion.enviar_correcciones, f2.modelos_lock)
+
+
+class FeedbackItemIn(BaseModel):
+    ref: str = Field(..., description=f"El mismo ref de /api/classify (hasta {clasificacion.MAX_REF} caracteres)")
+    descripcion: str = Field(..., description="La descripción tal como se mandó a /api/classify (o la corregida)")
+    hs6: str = Field(..., description="HS6 elegido: 6 cifras, con o sin punto (4419.90)")
+
+
+class FeedbackIn(BaseModel):
+    items: list[FeedbackItemIn] = Field(..., description=f"Hasta {clasificacion.MAX_ITEMS} correcciones")
+
+
+class FeedbackItemOut(BaseModel):
+    ref: str
+    estado: Literal["registrado"]
+
+
+class FeedbackOut(BaseModel):
+    items: list[FeedbackItemOut]
+
+
+@app.post("/api/classify/feedback", response_model=FeedbackOut, tags=["clasificación"],
+          summary="Correcciones de HS6 hechas por una persona (se reenvían al clasificador)",
+          responses={400: {"description": "lote no aceptado"}, 503: {"description": "servidor reiniciándose: reintentar"}})
+def classify_feedback(body: FeedbackIn, client: str = Security(require_key)):
+    """Registra cada corrección (queda en disco hasta que el clasificador la acepta) y deja de responder desde la caché
+    esa descripción y las que no salieron como sugerencia_segura: la próxima petición vuelve al clasificador."""
+    if DRAIN_FILE.exists():
+        raise HTTPException(503, "server restarting: retry later", headers={"Retry-After": "120"})
+    try:
+        return clasificacion.corregir([it.model_dump() for it in body.items], encolar_correcciones)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from None
+
+
 @app.post("/api/classify", response_model=ClassifyOut, tags=["clasificación"],
           summary="Schedule B de un lote de descripciones (contrato §8)",
           responses={400: {"description": "lote no aceptado"}, 503: {"description": "clasificador no disponible: reintentar"}})
@@ -556,6 +596,7 @@ def classify(body: ClassifyIn, client: str = Security(require_key)):
     if DRAIN_FILE.exists():
         raise HTTPException(503, "server restarting: retry later", headers={"Retry-After": "120"})
     try:
+        clasificacion.pendientes_correcciones(encolar_correcciones)  # reintento de correcciones que quedaron pendientes
         return clasificacion.clasificar([it.model_dump() for it in body.items], client,
                                         lambda *a: encolar(PRIO_CLASIFICACION, clasificacion.procesar, *a, f2.modelos_lock))
     except ValueError as e:

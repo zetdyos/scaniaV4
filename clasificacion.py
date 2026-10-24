@@ -224,3 +224,84 @@ def clasificar(items, cliente, encolar, espera=None):
         except ClasificadorError:
             version = ""
     return {"version_catalogo": version, "items": salida}
+
+
+# ----------------------------------------------------------------------------- correcciones de HS6 (POST /api/classify/feedback)
+# SCANIA es intermediario: reenvía {line, hs6} al clasificador (POST /api/validate) y deja de responder desde su caché esa
+# descripción y las que no salieron como sugerencia_segura, para que la próxima petición vuelva al clasificador. No
+# guarda quién corrigió ni mide nada: eso es de WTCP y del clasificador (usuario, 2026-10-24). Cada corrección queda en
+# disco (`correcciones.json`) hasta que el clasificador la acepta: no se pierde aunque el clasificador esté caído.
+CORR_FILE = CLASIF_DIR / "correcciones.json"
+HS6_RE = re.compile(r"^\d{6}$")
+_CORR_EN_COLA = [False]
+
+
+def _validar_correcciones(items):
+    if not items:
+        raise ValueError("items is empty")
+    if len(items) > MAX_ITEMS:
+        raise ValueError(f"more than {MAX_ITEMS} items")
+    out = []
+    for i, it in enumerate(items):
+        ref, d = it.get("ref"), it.get("descripcion")
+        hs6 = re.sub(r"[.\s]", "", str(it.get("hs6") or ""))
+        if not isinstance(ref, str) or not ref or len(ref) > MAX_REF:
+            raise ValueError(f"items[{i}].ref must be text of 1 to {MAX_REF} characters")
+        if not isinstance(d, str) or not d.strip():
+            raise ValueError(f"items[{i}].descripcion is empty")
+        if not HS6_RE.match(hs6):
+            raise ValueError(f"items[{i}].hs6 must have 6 digits")
+        out.append((ref, d.strip(), hs6))
+    return out
+
+
+def corregir(items, encolar):
+    """Registra las correcciones, limpia la caché y pone el reenvío en la cola única. ValueError si la entrada no vale."""
+    filas = _validar_correcciones(items)
+    with _LOCK:
+        corr, cache = _leer(CORR_FILE), _leer(CACHE_FILE)
+        for _ref, d, hs6 in filas:
+            corr[f"{clave(d)}|{hs6}"] = {"line": d, "hs6": hs6}
+            cache.pop(clave(d), None)
+        for k in [k for k, v in cache.items() if v.get("estado") != "sugerencia_segura"]:
+            cache.pop(k)  # la próxima petición vuelve al clasificador, que ya conoce la corrección
+        _guardar(CORR_FILE, corr)
+        _guardar(CACHE_FILE, cache)
+    pendientes_correcciones(encolar)
+    return {"items": [{"ref": ref, "estado": "registrado"} for ref, _d, _h in filas]}
+
+
+def pendientes_correcciones(encolar):
+    """Pone en la cola única el reenvío de las correcciones pendientes, si hay y no está ya en cola."""
+    with _LOCK:
+        hay = bool(_leer(CORR_FILE))
+        if not hay or _CORR_EN_COLA[0]:
+            return
+        _CORR_EN_COLA[0] = True
+    encolar()
+
+
+def enviar_correcciones(modelos_lock):
+    """Tarea de la cola única: manda al clasificador las correcciones pendientes. Si el clasificador no responde, se
+    quedan para el próximo intento; si las rechaza (400: HS6 que no existe), se descartan con un aviso en el registro."""
+    try:
+        with _LOCK:
+            corr = _leer(CORR_FILE)
+        hechas = []
+        with modelos_lock():
+            for k, c in corr.items():
+                try:
+                    _pedir("POST", "/api/validate", json={"line": c["line"], "hs6": c["hs6"]})
+                    hechas.append(k)
+                except ClasificadorError as e:
+                    if e.status == 503:
+                        break  # caído: el resto se reintenta más tarde
+                    print(f"clasificación: corrección rechazada por el clasificador ({c['hs6']} «{c['line'][:40]}»): {e.detail}", flush=True)
+                    hechas.append(k)
+        with _LOCK:
+            corr = _leer(CORR_FILE)
+            for k in hechas:
+                corr.pop(k, None)
+            _guardar(CORR_FILE, corr)
+    finally:
+        _CORR_EN_COLA[0] = False
