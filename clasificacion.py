@@ -7,8 +7,9 @@ defecto http://localhost:8092; esquema en su /docs y /redoc), que usa el mismo Q
 El contrato pide «una llamada, una respuesta» en menos de 60 s, pero el clasificador tarda de 20 s a varios minutos por
 línea. El contrato ya prevé la salida: «un `ref` que falta en la respuesta queda sin código y se vuelve a pedir en el
 próximo lote». Por eso:
-- cada descripción (normalizada: espacios y mayúsculas) se clasifica UNA vez y su resultado queda en caché
-  (`clasif_jobs/cache.json`); una descripción ya clasificada se responde al momento;
+- cada descripción (normalizada: espacios y mayúsculas) se clasifica UNA vez por versión del clasificador y su
+  resultado queda en caché (`clasif_jobs/cache.json`, con la versión en `vc`); una descripción ya clasificada con la
+  versión actual se responde al momento; si el clasificador cambió de versión, se le vuelve a preguntar;
 - las nuevas van a la COLA ÚNICA de demo_api (un trabajador para análisis y clasificaciones, los análisis primero;
   pedido del usuario 2026-10-24: nunca dos peticiones a la vez contra el 27B): cada una es una tarea `procesar` que
   toma el bloqueo de los modelos y manda UNA línea al clasificador (`POST /api/lines`); `clasificar` espera hasta
@@ -75,6 +76,36 @@ def salud():
     return bool(h.get("embedding_server") and h.get("generation_server"))
 
 
+# Versión del clasificador: cada respuesta guardada lleva la versión con la que se obtuvo (`vc`) y solo se sirve si el
+# clasificador sigue en esa versión. Si cambia (2026-10-26: «revision_2»; WTCP recibió 1490 no_clasificado viejos al
+# reclasificar), la próxima petición de esa descripción vuelve al clasificador. Firma = catálogos + revisión de su
+# /api/health (`versions`); si el clasificador no responde se usa la última conocida, y si nunca se conoció se sirve la
+# caché tal cual (no se bloquea a WTCP por no saber la versión).
+CLAVES_VERSION = ("hs", "hts", "scheduleb", "rulings", "revision")
+_VER = {"v": None, "t": 0.0}
+
+
+def version_clasificador(fresca=False):
+    """Firma de la versión actual del clasificador (60 s de caché), o la última conocida si no responde, o None."""
+    if not fresca and _VER["v"] and time.time() - _VER["t"] < 60:
+        return _VER["v"]
+    try:
+        vs = _pedir("GET", "/api/health", timeout=5).get("versions") or {}
+    except ClasificadorError:
+        return _VER["v"]
+    _VER.update(v=firma(vs), t=time.time())
+    return _VER["v"]
+
+
+def firma(versions):
+    return json.dumps({k: versions.get(k) for k in CLAVES_VERSION if versions.get(k)}, sort_keys=True, ensure_ascii=False)
+
+
+def vigente(entrada, ver):
+    """La respuesta guardada vale para la versión `ver` del clasificador (con `ver` desconocida, vale)."""
+    return bool(entrada) and (ver is None or entrada.get("vc") == ver)
+
+
 def clave(descripcion):
     return " ".join(descripcion.split()).lower()
 
@@ -138,8 +169,9 @@ def procesar(k, texto, cliente, modelos_lock):
     de los modelos tomado (también espera al CLI) y guarda el resultado en la caché. Un error o un plazo vencido suma un
     intento: la próxima llamada de WTCP la vuelve a encolar; tras MAX_INTENTOS queda no_clasificado."""
     try:
+        ver = version_clasificador()
         with _LOCK:
-            if k in _leer(CACHE_FILE):
+            if vigente(_leer(CACHE_FILE).get(k), ver):
                 return
         with modelos_lock():
             r = _pedir("POST", "/api/lines", json={"line": texto, "client_ref": f"SCANIA {cliente}", "mode": "brief"})
@@ -155,7 +187,7 @@ def procesar(k, texto, cliente, modelos_lock):
         with _LOCK:
             cache, pend = _leer(CACHE_FILE), _leer(PEND_FILE)
             if it.get("status") == "done":
-                cache[k] = dict(resultado(it), ts=time.time())
+                cache[k] = dict(resultado(it), ts=time.time(), vc=version_clasificador(fresca=True))
                 pend.pop(k, None)
             else:
                 _fallo(k, pend, cache, it.get("error") or f"classifier status {it.get('status') or 'timeout'}")
@@ -191,13 +223,18 @@ def clasificar(items, cliente, encolar, espera=None):
     espera = ESPERA if espera is None else espera
     fin = time.time() + espera
     claves = {clave(d): d for _, d in pares}
+    ver = version_clasificador()
+
+    def lista(c):  # respuesta guardada y de la versión actual del clasificador
+        return vigente(c, ver)
+
     with _LOCK:
         cache = _leer(CACHE_FILE)
-    if any(k not in cache for k in claves) and not salud():
+    if any(not lista(cache.get(k)) for k in claves) and not salud():
         raise ClasificadorError(503, "classifier unavailable")  # §8.3: WTCP reintenta más tarde
     with _LOCK:
         cache, pend = _leer(CACHE_FILE), _leer(PEND_FILE)
-        nuevas = [k for k in claves if k not in cache and k not in _EN_COLA]
+        nuevas = [k for k in claves if not lista(cache.get(k)) and k not in _EN_COLA]
         for k in nuevas:
             _EN_COLA.add(k)
             pend.setdefault(k, {})["texto"] = claves[k]
@@ -208,13 +245,13 @@ def clasificar(items, cliente, encolar, espera=None):
     while True:
         with _LOCK:
             cache = _leer(CACHE_FILE)
-        if all(k in cache for k in claves) or time.time() >= fin:
+        if all(lista(cache.get(k)) for k in claves) or time.time() >= fin:
             break
         time.sleep(min(2.0, max(0.0, fin - time.time())))
     salida, version = [], ""
     for ref, d in pares:
         c = cache.get(clave(d))
-        if c is None:
+        if not lista(c):
             continue  # todavía en la cola o en el clasificador: se omite y WTCP la vuelve a pedir (§8.2)
         version = version or c.get("version_catalogo") or ""
         salida.append({"ref": ref, "estado": c["estado"], "sugerencias": c["sugerencias"]})
