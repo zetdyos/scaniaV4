@@ -1,26 +1,28 @@
-"""Clasificación de descripciones de producto para WTCP: `POST /api/classify` (contrato §8, pedido por WTCP el 2026-10-22;
-implementado el 2026-10-23 a pedido del usuario).
+"""Clasificación de descripciones de producto para WTCP: `POST /api/classify` (contrato §8) y correcciones de HS6
+(`POST /api/classify/feedback`).
 
-SCANIA no clasifica: es una pasarela hacia el clasificador HS6 + Schedule B (servicio aparte, `CLASIFICADOR_URL`, por
-defecto http://localhost:8092; esquema en su /docs y /redoc), que usa el mismo Qwen3.6-27B (:8083) que la fase 2.
+En clasificación SCANIA es SOLO UN INTERMEDIARIO (usuario, 2026-10-27: «NO caché en cuanto a clasificación, eres solo un
+proxy»): no guarda respuestas, no decide si una respuesta vieja vale, no clasifica. Toda petición de WTCP va al
+clasificador HS6 + Schedule B (servicio aparte, `CLASIFICADOR_URL`, por defecto http://localhost:8092; esquema en su /docs
+y /redoc), que usa el mismo Qwen3.6-27B (:8083) que la fase 2.
 
-El contrato pide «una llamada, una respuesta» en menos de 60 s, pero el clasificador tarda de 20 s a varios minutos por
-línea. El contrato ya prevé la salida: «un `ref` que falta en la respuesta queda sin código y se vuelve a pedir en el
-próximo lote». Por eso:
-- cada descripción (normalizada: espacios y mayúsculas) se clasifica UNA vez por versión del clasificador y su
-  resultado queda en caché (`clasif_jobs/cache.json`, con la versión en `vc`); una descripción ya clasificada con la
-  versión actual se responde al momento; si el clasificador cambió de versión, se le vuelve a preguntar;
-- las nuevas van a la COLA ÚNICA de demo_api (un trabajador para análisis y clasificaciones, los análisis primero;
-  pedido del usuario 2026-10-24: nunca dos peticiones a la vez contra el 27B): cada una es una tarea `procesar` que
-  toma el bloqueo de los modelos y manda UNA línea al clasificador (`POST /api/lines`); `clasificar` espera hasta
-  `ESPERA` segundos y lo que no terminó se omite (WTCP lo vuelve a pedir; pendientes en `clasif_jobs/pendientes.json`);
-- clasificador caído -> 503 (§8.3) sin contar intentos; una línea que el clasificador no pudo procesar (error o más de
-  `TIEMPO_MAX_LINEA`) se reintenta en la próxima llamada, y tras `MAX_INTENTOS` queda `no_clasificado`.
+El contrato pide «una llamada, una respuesta» en menos de 60 s y el clasificador tarda de 20 s a minutos por línea. El
+contrato ya prevé la salida (§8.2): «un `ref` que falta en la respuesta queda sin código y se vuelve a pedir en el próximo
+lote». Por eso:
+- cada descripción pedida va a la COLA ÚNICA de demo_api (un trabajador para análisis y clasificaciones, los análisis
+  primero: nunca dos peticiones a la vez contra el 27B, pedido del usuario 2026-10-24); la tarea `procesar` toma el
+  bloqueo de los modelos y manda UNA línea al clasificador (`POST /api/lines`);
+- SCANIA solo anota qué línea del clasificador corresponde a cada descripción mientras está EN CURSO
+  (`clasif_jobs/en_curso.json`): si WTCP la vuelve a pedir antes de que termine, no se manda otra vez; el resultado lo
+  guarda el clasificador y SCANIA lo lee de allí (`GET /api/lines/{id}`);
+- `clasificar` espera hasta `ESPERA` s; lo terminado se entrega y se OLVIDA (la próxima petición de esa descripción es
+  una clasificación nueva); lo que no terminó se omite y WTCP lo vuelve a pedir;
+- clasificador caído -> 503 (§8.3); una línea que el clasificador no pudo procesar se manda de nuevo en la próxima
+  petición, y tras `MAX_INTENTOS` errores se entrega como `no_clasificado`.
 
-Estados (§8.2): `sugerencia_segura` si el código de 10 dígitos supera el umbral del clasificador (`advance10` y sin
-`needs_review`: WTCP lo pone sin revisión); `dudosa` si hay código pero no supera el umbral o el clasificador pide
-confirmación; `no_clasificado` si no decidió un código de 10 dígitos (bloqueado, fuera de candidatos…). Nunca se
-inventa un código: la sugerencia es siempre la del clasificador, con su `score10` como `confianza`."""
+Estados (§8.2): `sugerencia_segura` si el clasificador supera su umbral para el código de 10 dígitos (`advance10` y sin
+`needs_review` ni `requires_confirmation`: WTCP lo pone sin revisión); `dudosa` si hay código pero no supera el umbral;
+`no_clasificado` si no decidió un código de 10 dígitos. La sugerencia es siempre la del clasificador, con su `score10`."""
 import json
 import os
 import re
@@ -32,15 +34,17 @@ import requests
 
 HERE = Path(__file__).resolve().parent
 CLASIF_DIR = HERE / "clasif_jobs"
-CACHE_FILE = CLASIF_DIR / "cache.json"
-PEND_FILE = CLASIF_DIR / "pendientes.json"
+EN_CURSO_FILE = CLASIF_DIR / "en_curso.json"
 CLASIFICADOR_URL = (os.environ.get("CLASIFICADOR_URL") or "http://localhost:8092").rstrip("/")
 MAX_ITEMS = 200
 MAX_REF = 50
 MAX_LARGO = 2000
 ESPERA = float(os.environ.get("CLASIF_ESPERA", "40"))  # WTCP espera hasta 60 s por llamada (§8.3)
 MAX_INTENTOS = 3
+TIEMPO_MAX_LINEA = float(os.environ.get("CLASIF_TIEMPO_MAX", "1200"))  # 20 min: el clasificador puede atender antes su interfaz
+OLVIDAR_DIAS = 7  # una línea en curso que WTCP no vuelve a pedir en una semana se olvida
 _LOCK = threading.Lock()
+_EN_COLA: set = set()  # claves con una tarea viva en la cola única (en memoria: tras un reinicio se vuelven a encolar)
 
 
 class ClasificadorError(Exception):
@@ -67,43 +71,17 @@ def _pedir(metodo, ruta, **kw):
     return r.json()
 
 
-def salud():
-    """True si el clasificador responde y sus servidores de modelos están arriba."""
+def _salud():
+    """/api/health del clasificador si responde y sus servidores de modelos están arriba; None si no."""
     try:
         h = _pedir("GET", "/api/health", timeout=5)
     except ClasificadorError:
-        return False
-    return bool(h.get("embedding_server") and h.get("generation_server"))
+        return None
+    return h if h.get("embedding_server") and h.get("generation_server") else None
 
 
-# Versión del clasificador: cada respuesta guardada lleva la versión con la que se obtuvo (`vc`) y solo se sirve si el
-# clasificador sigue en esa versión. Si cambia (2026-10-26: «revision_2»; WTCP recibió 1490 no_clasificado viejos al
-# reclasificar), la próxima petición de esa descripción vuelve al clasificador. Firma = catálogos + revisión de su
-# /api/health (`versions`); si el clasificador no responde se usa la última conocida, y si nunca se conoció se sirve la
-# caché tal cual (no se bloquea a WTCP por no saber la versión).
-CLAVES_VERSION = ("hs", "hts", "scheduleb", "rulings", "revision")
-_VER = {"v": None, "t": 0.0}
-
-
-def version_clasificador(fresca=False):
-    """Firma de la versión actual del clasificador (60 s de caché), o la última conocida si no responde, o None."""
-    if not fresca and _VER["v"] and time.time() - _VER["t"] < 60:
-        return _VER["v"]
-    try:
-        vs = _pedir("GET", "/api/health", timeout=5).get("versions") or {}
-    except ClasificadorError:
-        return _VER["v"]
-    _VER.update(v=firma(vs), t=time.time())
-    return _VER["v"]
-
-
-def firma(versions):
-    return json.dumps({k: versions.get(k) for k in CLAVES_VERSION if versions.get(k)}, sort_keys=True, ensure_ascii=False)
-
-
-def vigente(entrada, ver):
-    """La respuesta guardada vale para la versión `ver` del clasificador (con `ver` desconocida, vale)."""
-    return bool(entrada) and (ver is None or entrada.get("vc") == ver)
+def salud():
+    return _salud() is not None
 
 
 def clave(descripcion):
@@ -127,18 +105,16 @@ def _guardar(p, data):
 def resultado(it):
     """Línea terminada del clasificador -> {estado, sugerencias, version_catalogo} (§8.2)."""
     code10 = re.sub(r"\D", "", it.get("code10") or it.get("code10_fmt") or "")
-    meta = it.get("meta") or {}
-    version = meta.get("scheduleb") or ""
+    version = (it.get("meta") or {}).get("scheduleb") or ""
     if len(code10) != 10:
-        return {"estado": "no_clasificado", "sugerencias": [], "version_catalogo": version,
-                "motivo": it.get("review_reason") or it.get("decision_status") or ""}
+        return {"estado": "no_clasificado", "sugerencias": [], "version_catalogo": version}
     segura = bool(it.get("advance10")) and not it.get("needs_review") and not it.get("requires_confirmation")
     score = it.get("score10")
     return {"estado": "sugerencia_segura" if segura else "dudosa",
             "sugerencias": [{"codigo": code10, "descripcion": it.get("code10_desc") or "",
                              "confianza": float(score) if score is not None else None,
                              "canal": "clasificador", "calibrado": False}],
-            "version_catalogo": version, "motivo": "" if segura else (it.get("review_reason") or "")}
+            "version_catalogo": version}
 
 
 def _validar(items):
@@ -160,114 +136,105 @@ def _validar(items):
     return out
 
 
-_EN_COLA: set = set()  # claves con una tarea viva en la cola única de demo_api (en memoria: tras un reinicio se re-encolan)
-TIEMPO_MAX_LINEA = float(os.environ.get("CLASIF_TIEMPO_MAX", "1200"))  # 20 min: el clasificador puede atender antes su interfaz
-
-
 def procesar(k, texto, cliente, modelos_lock):
-    """Tarea de la cola única (un trabajador para análisis y clasificaciones): clasifica UNA descripción con el bloqueo
-    de los modelos tomado (también espera al CLI) y guarda el resultado en la caché. Un error o un plazo vencido suma un
-    intento: la próxima llamada de WTCP la vuelve a encolar; tras MAX_INTENTOS queda no_clasificado."""
+    """Tarea de la cola única: manda UNA descripción al clasificador con el bloqueo de los modelos tomado (también espera
+    al CLI) y espera a que la termine, para no tener dos líneas a la vez contra el 27B. No guarda el resultado: lo guarda
+    el clasificador y `clasificar` lo lee por el número de línea. Clasificador caído: la línea queda sin enviar y se
+    vuelve a encolar en la próxima petición."""
     try:
-        ver = version_clasificador()
-        with _LOCK:
-            if vigente(_leer(CACHE_FILE).get(k), ver):
-                return
         with modelos_lock():
+            with _LOCK:
+                en = _leer(EN_CURSO_FILE)
+                if k not in en or en[k].get("line_id"):
+                    return  # ya entregada u otra tarea ya la mandó
             r = _pedir("POST", "/api/lines", json={"line": texto, "client_ref": f"SCANIA {cliente}", "mode": "brief"})
-            url = r.get("status_url") or f"{CLASIFICADOR_URL}/api/lines/{r['line_id']}"
-            ruta = url[len(CLASIFICADOR_URL):] if url.startswith(CLASIFICADOR_URL) else f"/api/lines/{r['line_id']}"
+            with _LOCK:
+                en = _leer(EN_CURSO_FILE)
+                if k in en:
+                    en[k]["line_id"] = r["line_id"]
+                    _guardar(EN_CURSO_FILE, en)
             fin = time.time() + TIEMPO_MAX_LINEA
-            it = {}
             while time.time() < fin:
-                it = _pedir("GET", ruta, params={"include": "summary"})
+                it = _pedir("GET", f"/api/lines/{r['line_id']}", params={"include": "summary"})
                 if it.get("status") in ("done", "error", "cancelled"):
                     break
                 time.sleep(2)
-        with _LOCK:
-            cache, pend = _leer(CACHE_FILE), _leer(PEND_FILE)
-            if it.get("status") == "done":
-                cache[k] = dict(resultado(it), ts=time.time(), vc=version_clasificador(fresca=True))
-                pend.pop(k, None)
-            else:
-                _fallo(k, pend, cache, it.get("error") or f"classifier status {it.get('status') or 'timeout'}")
-            _guardar(CACHE_FILE, cache)
-            _guardar(PEND_FILE, pend)
-    except ClasificadorError as e:
-        if e.status == 503:  # clasificador caído: no es culpa de la línea, se reintenta en la próxima llamada sin contar
-            return
-        with _LOCK:
-            cache, pend = _leer(CACHE_FILE), _leer(PEND_FILE)
-            _fallo(k, pend, cache, e.detail)
-            _guardar(CACHE_FILE, cache)
-            _guardar(PEND_FILE, pend)
+    except ClasificadorError:
+        pass  # sin line_id: se vuelve a encolar en la próxima petición de WTCP
     finally:
         _EN_COLA.discard(k)
 
 
-def _fallo(k, pend, cache, motivo):
-    p = pend.setdefault(k, {})
-    p["intentos"] = p.get("intentos", 0) + 1
-    p["ultimo_error"] = motivo
-    if p["intentos"] >= MAX_INTENTOS:
-        cache[k] = {"estado": "no_clasificado", "sugerencias": [], "version_catalogo": "", "motivo": motivo, "ts": time.time()}
-        pend.pop(k, None)
-
-
 def clasificar(items, cliente, encolar, espera=None):
-    """§8: items [{ref, descripcion, …}] -> {version_catalogo, items:[{ref, estado, sugerencias}]} con las líneas ya
-    clasificadas. Las nuevas se ponen en la cola única (`encolar(clave, texto, cliente)`, prioridad por debajo de los
-    análisis) y se espera hasta `espera` s; las que no terminan se omiten y WTCP las vuelve a pedir (§8.2).
-    ValueError si la entrada no vale."""
+    """§8: items [{ref, descripcion, …}] -> {version_catalogo, items:[{ref, estado, sugerencias}]} con las líneas que el
+    clasificador terminó. Lo que no terminó en `espera` s se omite y WTCP lo vuelve a pedir (§8.2). ValueError si la
+    entrada no vale; ClasificadorError(503) si el clasificador no está disponible."""
     pares = _validar(items)
     espera = ESPERA if espera is None else espera
     fin = time.time() + espera
     claves = {clave(d): d for _, d in pares}
-    ver = version_clasificador()
-
-    def lista(c):  # respuesta guardada y de la versión actual del clasificador
-        return vigente(c, ver)
-
-    with _LOCK:
-        cache = _leer(CACHE_FILE)
-    if any(not lista(cache.get(k)) for k in claves) and not salud():
+    h = _salud()
+    if h is None:
         raise ClasificadorError(503, "classifier unavailable")  # §8.3: WTCP reintenta más tarde
+    encolar_ya = []
     with _LOCK:
-        cache, pend = _leer(CACHE_FILE), _leer(PEND_FILE)
-        nuevas = [k for k in claves if not lista(cache.get(k)) and k not in _EN_COLA]
-        for k in nuevas:
-            _EN_COLA.add(k)
-            pend.setdefault(k, {})["texto"] = claves[k]
-        if nuevas:
-            _guardar(PEND_FILE, pend)
-    for k in nuevas:
+        en = _leer(EN_CURSO_FILE)
+        viejo = time.time() - OLVIDAR_DIAS * 86400
+        for k in [k for k, v in en.items() if v.get("desde", 0) < viejo and k not in claves]:
+            en.pop(k)
+        for k, d in claves.items():
+            if k not in en:
+                en[k] = {"texto": d, "line_id": None, "desde": time.time(), "errores": 0}
+            if not en[k].get("line_id") and k not in _EN_COLA:
+                _EN_COLA.add(k)
+                encolar_ya.append(k)
+        _guardar(EN_CURSO_FILE, en)
+    for k in encolar_ya:
         encolar(k, claves[k], cliente)
+    listos = {}
     while True:
         with _LOCK:
-            cache = _leer(CACHE_FILE)
-        if all(lista(cache.get(k)) for k in claves) or time.time() >= fin:
+            en = _leer(EN_CURSO_FILE)
+        for k in claves:
+            lid = (en.get(k) or {}).get("line_id")
+            if k in listos or not lid:
+                continue
+            try:
+                it = _pedir("GET", f"/api/lines/{lid}", params={"include": "summary"})
+            except ClasificadorError as e:
+                if e.status != 404:
+                    continue
+                it = {"status": "error", "error": "line lost by the classifier"}
+            if it.get("status") == "done":
+                listos[k] = resultado(it)
+            elif it.get("status") in ("error", "cancelled"):
+                with _LOCK:
+                    en = _leer(EN_CURSO_FILE)
+                    if k in en:
+                        en[k]["errores"] = en[k].get("errores", 0) + 1
+                        en[k]["line_id"] = None  # se vuelve a mandar en la próxima petición
+                        if en[k]["errores"] >= MAX_INTENTOS:
+                            listos[k] = {"estado": "no_clasificado", "sugerencias": [], "version_catalogo": ""}
+                        _guardar(EN_CURSO_FILE, en)
+        if len(listos) == len(claves) or time.time() >= fin:
             break
-        time.sleep(min(2.0, max(0.0, fin - time.time())))
-    salida, version = [], ""
-    for ref, d in pares:
-        c = cache.get(clave(d))
-        if not lista(c):
-            continue  # todavía en la cola o en el clasificador: se omite y WTCP la vuelve a pedir (§8.2)
-        version = version or c.get("version_catalogo") or ""
-        salida.append({"ref": ref, "estado": c["estado"], "sugerencias": c["sugerencias"]})
-    if not version:
-        try:
-            version = (_pedir("GET", "/api/health", timeout=5).get("versions") or {}).get("scheduleb") or ""
-        except ClasificadorError:
-            version = ""
+        time.sleep(min(3.0, max(0.0, fin - time.time())))
+    with _LOCK:  # lo entregado se olvida: la próxima petición de esa descripción es una clasificación nueva
+        en = _leer(EN_CURSO_FILE)
+        for k in listos:
+            en.pop(k, None)
+        _guardar(EN_CURSO_FILE, en)
+    salida = [{"ref": ref, "estado": listos[clave(d)]["estado"], "sugerencias": listos[clave(d)]["sugerencias"]}
+              for ref, d in pares if clave(d) in listos]
+    version = next((v["version_catalogo"] for v in listos.values() if v.get("version_catalogo")), "") \
+        or (h.get("versions") or {}).get("scheduleb") or ""
     return {"version_catalogo": version, "items": salida}
 
 
 # ----------------------------------------------------------------------------- correcciones de HS6 (POST /api/classify/feedback)
-# SCANIA es intermediario: reenvía {line, hs6} al clasificador (POST /api/validate) y deja de responder desde su caché esa
-# descripción y las que no salieron como sugerencia_segura, para que la próxima petición vuelva al clasificador. No
-# guarda quién corrigió ni mide nada: eso es de WTCP y del clasificador (usuario, 2026-10-24). Cada corrección queda en
-# disco (`correcciones.json`) hasta que el clasificador la acepta: no se pierde aunque el clasificador esté caído.
+# SCANIA es intermediario: reenvía {line, hs6} al clasificador (POST /api/validate) y nada más. No guarda quién corrigió
+# ni mide nada: eso es de WTCP y del clasificador (usuario, 2026-10-24). Cada corrección queda en disco
+# (`correcciones.json`) hasta que el clasificador la acepta: no se pierde aunque el clasificador esté caído.
 CORR_FILE = CLASIF_DIR / "correcciones.json"
 HS6_RE = re.compile(r"^\d{6}$")
 _CORR_EN_COLA = [False]
@@ -293,17 +260,13 @@ def _validar_correcciones(items):
 
 
 def corregir(items, encolar):
-    """Registra las correcciones, limpia la caché y pone el reenvío en la cola única. ValueError si la entrada no vale."""
+    """Registra las correcciones y pone su reenvío al clasificador en la cola única. ValueError si la entrada no vale."""
     filas = _validar_correcciones(items)
     with _LOCK:
-        corr, cache = _leer(CORR_FILE), _leer(CACHE_FILE)
+        corr = _leer(CORR_FILE)
         for _ref, d, hs6 in filas:
             corr[f"{clave(d)}|{hs6}"] = {"line": d, "hs6": hs6}
-            cache.pop(clave(d), None)
-        for k in [k for k, v in cache.items() if v.get("estado") != "sugerencia_segura"]:
-            cache.pop(k)  # la próxima petición vuelve al clasificador, que ya conoce la corrección
         _guardar(CORR_FILE, corr)
-        _guardar(CACHE_FILE, cache)
     pendientes_correcciones(encolar)
     return {"items": [{"ref": ref, "estado": "registrado"} for ref, _d, _h in filas]}
 

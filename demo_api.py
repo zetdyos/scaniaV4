@@ -576,8 +576,8 @@ class FeedbackOut(BaseModel):
           summary="Correcciones de HS6 hechas por una persona (se reenvían al clasificador)",
           responses={400: {"description": "lote no aceptado"}, 503: {"description": "servidor reiniciándose: reintentar"}})
 def classify_feedback(body: FeedbackIn, client: str = Security(require_key)):
-    """Registra cada corrección (queda en disco hasta que el clasificador la acepta) y deja de responder desde la caché
-    esa descripción y las que no salieron como sugerencia_segura: la próxima petición vuelve al clasificador."""
+    """Registra cada corrección (queda en disco hasta que el clasificador la acepta) y la reenvía al clasificador
+    ({line, hs6}). SCANIA es solo intermediario."""
     if DRAIN_FILE.exists():
         raise HTTPException(503, "server restarting: retry later", headers={"Retry-After": "120"})
     try:
@@ -590,9 +590,8 @@ def classify_feedback(body: FeedbackIn, client: str = Security(require_key)):
           summary="Schedule B de un lote de descripciones (contrato §8)",
           responses={400: {"description": "lote no aceptado"}, 503: {"description": "clasificador no disponible: reintentar"}})
 def classify(body: ClassifyIn, client: str = Security(require_key)):
-    """Devuelve en menos de 60 s las líneas ya clasificadas. Las descripciones nuevas se encolan en el clasificador
-    (de 20 s a varios minutos por línea) y se omiten de la respuesta: WTCP las vuelve a pedir en el próximo lote y
-    entonces salen de la caché al momento."""
+    """Intermediario: cada descripción va al clasificador (cola única, una línea a la vez). Devuelve en menos de 60 s
+    las que el clasificador terminó; las demás se omiten y WTCP las vuelve a pedir (§8.2). Lo entregado no se guarda."""
     if DRAIN_FILE.exists():
         raise HTTPException(503, "server restarting: retry later", headers={"Retry-After": "120"})
     try:
