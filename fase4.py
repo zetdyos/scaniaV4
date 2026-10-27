@@ -20,7 +20,7 @@ Si todo se cumple, la factura sale SIN revisión con esas líneas (`ocr.origen_l
 Configuración en `scania_config.json` -> `fase4` (se lee en cada factura, sin reiniciar): `activa` (true/false: el
 interruptor; con false no se llama nunca, haya o no clave), `modelo` (por defecto claude-sonnet-5-5, el probado el
 2026-10-23) y `precios_usd_por_millon` (precio de lista de la Claude API). La clave va en ANTHROPIC_API_KEY o en
-anthropic_key.txt (fuera de git); activa sin clave = apagada, con aviso en el registro. Para pruebas, la variable
+anthropic_key.txt (fuera de git), o en el archivo de `archivo_clave`; activa sin clave = apagada, con aviso en el registro. Para pruebas, la variable
 FASE4=cli usa el CLI de Claude Code en lugar de la API.
 
 Coste: el de la Claude API, no el nuestro. Con la API, las fichas de entrada y salida que ella devuelve (`usage`) x el
@@ -54,9 +54,16 @@ TIMEOUT = 300
 
 
 def _clave():
+    """Clave de la Claude API: ANTHROPIC_API_KEY, o el archivo de scania_config.json -> fase4.archivo_clave, o
+    anthropic_key.txt del repo (fuera de git). Nunca se escribe en ningún registro."""
     k = (os.environ.get("ANTHROPIC_API_KEY") or "").strip()
-    if not k and KEY_FILE.exists():
-        k = KEY_FILE.read_text(encoding="utf-8").strip()
+    for f in (config().get("archivo_clave"), KEY_FILE):
+        if k:
+            break
+        try:
+            k = Path(f).read_text(encoding="utf-8").strip() if f and Path(f).exists() else ""
+        except OSError:
+            k = ""
     return k
 
 
