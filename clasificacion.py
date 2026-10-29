@@ -13,7 +13,8 @@ lote». Por eso:
   primero: nunca dos peticiones a la vez contra el 27B, pedido del usuario 2026-10-24); la tarea `procesar` toma el
   bloqueo de los modelos y manda UNA línea al clasificador (`POST /api/lines`);
 - SCANIA solo anota qué línea del clasificador corresponde a cada descripción mientras está EN CURSO
-  (`clasif_jobs/en_curso.json`): si WTCP la vuelve a pedir antes de que termine, no se manda otra vez; el resultado lo
+  (`clasif_jobs/en_curso.json`, por cliente: lo que pidió un WTCP se entrega solo a ese WTCP; al clasificador va solo la
+  descripción, nunca quién la pidió): si WTCP la vuelve a pedir antes de que termine, no se manda otra vez; el resultado lo
   guarda el clasificador y SCANIA lo lee de allí (`GET /api/lines/{id}`);
 - `clasificar` espera hasta `ESPERA` s; lo terminado se entrega y se OLVIDA (la próxima petición de esa descripción es
   una clasificación nueva); lo que no terminó se omite y WTCP lo vuelve a pedir;
@@ -136,7 +137,12 @@ def _validar(items):
     return out
 
 
-def procesar(k, texto, cliente, modelos_lock):
+def clave_cliente(cliente, descripcion):
+    """Clave de una descripción EN CURSO: por cliente (cada WTCP recibe solo lo que pidió; usuario, 2026-10-28)."""
+    return f"{cliente}|{clave(descripcion)}"
+
+
+def procesar(k, texto, modelos_lock):
     """Tarea de la cola única: manda UNA descripción al clasificador con el bloqueo de los modelos tomado (también espera
     al CLI) y espera a que la termine, para no tener dos líneas a la vez contra el 27B. No guarda el resultado: lo guarda
     el clasificador y `clasificar` lo lee por el número de línea. Clasificador caído: la línea queda sin enviar y se
@@ -147,7 +153,8 @@ def procesar(k, texto, cliente, modelos_lock):
                 en = _leer(EN_CURSO_FILE)
                 if k not in en or en[k].get("line_id"):
                     return  # ya entregada u otra tarea ya la mandó
-            r = _pedir("POST", "/api/lines", json={"line": texto, "client_ref": f"SCANIA {cliente}", "mode": "brief"})
+            # Solo la descripción: el clasificador no sabe de clientes (datos mínimos entre servicios).
+            r = _pedir("POST", "/api/lines", json={"line": texto, "mode": "brief"})
             with _LOCK:
                 en = _leer(EN_CURSO_FILE)
                 if k in en:
@@ -172,7 +179,7 @@ def clasificar(items, cliente, encolar, espera=None):
     pares = _validar(items)
     espera = ESPERA if espera is None else espera
     fin = time.time() + espera
-    claves = {clave(d): d for _, d in pares}
+    claves = {clave_cliente(cliente, d): d for _, d in pares}
     h = _salud()
     if h is None:
         raise ClasificadorError(503, "classifier unavailable")  # §8.3: WTCP reintenta más tarde
@@ -183,6 +190,8 @@ def clasificar(items, cliente, encolar, espera=None):
         for k in [k for k, v in en.items() if v.get("desde", 0) < viejo and k not in claves]:
             en.pop(k)
         for k, d in claves.items():
+            if k not in en and clave(d) in en and "|" not in clave(d):
+                en[k] = en.pop(clave(d))  # en curso desde antes de las claves por cliente (un solo WTCP): pasa a quien la pide
             if k not in en:
                 en[k] = {"texto": d, "line_id": None, "desde": time.time(), "errores": 0}
             if not en[k].get("line_id") and k not in _EN_COLA:
@@ -190,7 +199,7 @@ def clasificar(items, cliente, encolar, espera=None):
                 encolar_ya.append(k)
         _guardar(EN_CURSO_FILE, en)
     for k in encolar_ya:
-        encolar(k, claves[k], cliente)
+        encolar(k, claves[k])
     listos = {}
     while True:
         with _LOCK:
@@ -224,8 +233,8 @@ def clasificar(items, cliente, encolar, espera=None):
         for k in listos:
             en.pop(k, None)
         _guardar(EN_CURSO_FILE, en)
-    salida = [{"ref": ref, "estado": listos[clave(d)]["estado"], "sugerencias": listos[clave(d)]["sugerencias"]}
-              for ref, d in pares if clave(d) in listos]
+    salida = [{"ref": ref, "estado": listos[k]["estado"], "sugerencias": listos[k]["sugerencias"]}
+              for ref, d in pares if (k := clave_cliente(cliente, d)) in listos]
     version = next((v["version_catalogo"] for v in listos.values() if v.get("version_catalogo")), "") \
         or (h.get("versions") or {}).get("scheduleb") or ""
     return {"version_catalogo": version, "items": salida}
