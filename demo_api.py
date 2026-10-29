@@ -70,16 +70,18 @@ API_KEYS_FILE = Path(os.environ.get("SCANIA_API_KEYS_FILE") or HERE / "api_keys.
 # duplicados entre documentos se buscan solo entre los suyos y la cola lo atiende por turnos (usuario, 2026-10-28: dos
 # WTCP de clientes distintos no se pueden mezclar). Dos tokens con el mismo `cliente` son el mismo cliente. Sin `cliente`
 # el token es un cliente solo. Formas viejas aceptadas: {"nombre": "token"}; sin `moneda`, USD.
-# El dueño de un trabajo se deduce del NOMBRE del token que lo subió (`client` en meta.json): al guardar el ClientCode
-# de un token, su historial pasa a ese cliente sin tocar los trabajos.
+# El dueño de un trabajo es el ClientCode guardado en su meta.json al subirlo (`cliente`): renombrar o quitar la entrada
+# del token no deja huérfano su historial. Trabajos sin `cliente` (sin ClientCode al subirlos): el del NOMBRE del token
+# que lo subió (`client`).
 LOCAL = "local"  # la demo desde 127.0.0.1: ve todos los trabajos (es el operador de la máquina)
-_KEYS_RAW: dict = json.loads(API_KEYS_FILE.read_text(encoding="utf-8")) if API_KEYS_FILE.exists() else {}
+# utf-8-sig: el archivo se edita a mano en Windows y PowerShell 5.1 lo guarda con BOM (con utf-8 la API no arrancaría)
+_KEYS_RAW: dict = json.loads(API_KEYS_FILE.read_text(encoding="utf-8-sig")) if API_KEYS_FILE.exists() else {}
 TOKENS: dict[str, dict] = {n: {"token": v["token"] if isinstance(v, dict) else v,
                                "moneda": ((v.get("moneda") if isinstance(v, dict) else None) or "USD").upper(),
                                "cliente": str((v.get("cliente") if isinstance(v, dict) else None) or "").strip()}
                            for n, v in _KEYS_RAW.items()}
 _tokens = [t["token"] for t in TOKENS.values()]
-if LOCAL in TOKENS or len(set(_tokens)) != len(_tokens) or not all(_tokens):
+if LOCAL in TOKENS or len(set(_tokens)) != len(_tokens) or not all(isinstance(t, str) and t for t in _tokens):
     raise SystemExit(f"{API_KEYS_FILE}: cada nombre necesita un token ÚNICO (y '{LOCAL}' está reservado)")
 TOKEN_CURRENCY: dict[str, str] = {n: t["moneda"] for n, t in TOKENS.items()}
 TOKEN_CURRENCY[LOCAL] = (os.environ.get("DEMO_MONEDA") or "USD").upper()
@@ -106,10 +108,12 @@ def client_id(name: Optional[str]) -> Optional[str]:
 
 
 def token_name(key: Optional[str]) -> Optional[str]:
-    """Nombre del token (p. ej. 'wtcp-produccion') o None. Comparación en tiempo constante."""
+    """Nombre del token (p. ej. 'wtcp-produccion') o None. Comparación en tiempo constante, en bytes (con str,
+    compare_digest lanza TypeError ante un carácter no ASCII: 500 en vez de 401)."""
     if not key:
         return None
-    return next((n for n, t in TOKENS.items() if hmac.compare_digest(key, t["token"])), None)
+    k = key.encode("utf-8")
+    return next((n for n, t in TOKENS.items() if hmac.compare_digest(k, t["token"].encode("utf-8"))), None)
 
 
 def check_client_code(name: str, code: Optional[str]) -> None:
@@ -249,8 +253,9 @@ lock = threading.Lock()
 
 # ----------------------------------------------------------------------------- cola única contra los modelos
 # Análisis de archivos y clasificaciones usan el mismo Qwen3.6-27B (:8083, un turno): UNA cola y UN trabajador, nunca
-# dos peticiones a la vez (pedido del usuario 2026-10-24). Prioridad a los análisis: WTCP corta un análisis que tarda
-# más de 45 min (§3 del contrato) y un lote de 200 descripciones son ~80 min; las clasificaciones usan los huecos.
+# dos peticiones a la vez (pedido del usuario 2026-10-24). Prioridad a los análisis (un lote de 200 descripciones son
+# ~80 min); las clasificaciones usan los huecos. WTCP espera cada análisis lo que haga falta: solo vuelve a subir con
+# error INTERNAL, 404 o a pedido de una persona (contrato, respuesta de WTCP del 2026-10-23).
 # Dentro de cada prioridad, POR TURNOS ENTRE CLIENTES (usuario, 2026-10-28: con dos WTCP, uno que sube mucho -o el mismo
 # archivo en bucle, 34160-A/B- no deja esperando al otro) y, para cada cliente, por orden de llegada.
 PRIO_ANALISIS, PRIO_CORRECCION, PRIO_CLASIFICACION = 0, 1, 2  # una corrección llega al clasificador antes que las
@@ -336,8 +341,9 @@ def load_jobs():
 
 
 def owner(job: dict) -> Optional[str]:
-    """Cliente dueño del trabajo: el del token que lo subió (None si ese token ya no existe)."""
-    return client_id(job.get("client"))
+    """Cliente dueño del trabajo: su ClientCode guardado al subirlo; sin él, el del token que lo subió (None si ese token
+    ya no existe)."""
+    return f"cc:{job['cliente']}" if job.get("cliente") else client_id(job.get("client"))
 
 
 def owns(job: dict, name: str) -> bool:
@@ -470,7 +476,9 @@ def process(job_id):
 
 
 def public(j):
-    return {k: v for k, v in j.items() if k != "log"}
+    out = dict(j)  # copia en C: el trabajador añade claves al trabajo en curso mientras se lista
+    out.pop("log", None)
+    return out
 
 
 @app.get("/", response_class=HTMLResponse, include_in_schema=False)
@@ -497,9 +505,10 @@ def health():
             pass
         out.append(ModelHealth(name=name, url=url, ok=ok, model=model))
     out.append(ModelHealth(name="Clasificador HS6", url=clasificacion.CLASIFICADOR_URL, ok=clasificacion.salud()))
+    todos = list(jobs.values())  # copia: una subida concurrente cambia `jobs` (RuntimeError -> 500)
     return Health(models_host=p1.MODELS_HOST, models=out,
-                  jobs_running=sum(1 for j in jobs.values() if j["state"] == "running"),
-                  jobs_queued=sum(1 for j in jobs.values() if j["state"] == "queued"))
+                  jobs_running=sum(1 for j in todos if j["state"] == "running"),
+                  jobs_queued=sum(1 for j in todos if j["state"] == "queued"))
 
 
 @app.post("/api/jobs", response_model=JobCreated, status_code=201, tags=["trabajos"], summary="Subir un archivo y encolarlo",
@@ -540,7 +549,7 @@ async def create_job(file: UploadFile = File(..., description="PDF, PNG, JPG/JPE
         pdf = Path(name).stem + ".pdf"
         (d / pdf).write_bytes(pdf_bytes)
     job = {"id": job_id, "pdf": pdf, "original": name, "client": client,
-           "moneda": TOKEN_CURRENCY.get(client, "USD"), "state": "queued", "progress": 0,
+           "cliente": (TOKENS.get(client) or {}).get("cliente", ""), "moneda": TOKEN_CURRENCY.get(client, "USD"), "state": "queued", "progress": 0,
            "step": "En cola", "log": [f"subido por {client}: {name}"], "created": time.time()}
     with lock:
         jobs[job_id] = job
@@ -566,7 +575,7 @@ def job_status(job_id: str, client: str, full: bool = False) -> dict:
         orden = [args[0] for fn, args in COLA.orden(PRIO_ANALISIS) if fn is process]
         if job_id in orden:
             data["queue_position"], data["queue_total"] = orden.index(job_id) + 1, len(orden)
-    running = next((x for x in jobs.values() if x["state"] == "running" and x["id"] != job_id), None)
+    running = next((x for x in list(jobs.values()) if x["state"] == "running" and x["id"] != job_id), None)
     data["running_now"] = ({"pdf": running["pdf"] if owns(running, client) else "", "progress": running["progress"],
                             "step": running.get("step", "") if owns(running, client) else ""} if running else None)
     if full and j["state"] == "done":
@@ -607,8 +616,8 @@ async def ws_job(ws: WebSocket, job_id: str):
         while True:
             st = job_status(job_id, client)
             snap = (st["state"], st["progress"], st["step"], len(st["log"]), st.get("queue_position"), (st.get("running_now") or {}).get("progress"))
-            if snap != last:
-                await ws.send_json(st)
+            if snap != last:  # los mismos campos que GET /api/jobs/{id} (sin client, cliente, moneda, original)
+                await ws.send_json(JobDetail.model_validate(st).model_dump(mode="json", exclude_none=True))
                 last = snap
             if st["state"] in ("done", "error"):
                 break

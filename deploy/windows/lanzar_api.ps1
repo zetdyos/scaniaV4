@@ -5,13 +5,16 @@
 #     alias de WindowsApps y acabaria en otro interprete sin las dependencias).
 #   * cwd = raiz del repo: demo_api.py importa ocr_pipeline/facturas_json y escribe demo_jobs\.
 #
-#   * -Redeploy: reinicio sin cortar trabajos. Crea .no_aceptar (POST /api/jobs responde 503 y WTCP
-#     reintenta mas tarde), espera a que no haya trabajos en curso ni en cola, para el proceso que
-#     escucha, arranca el nuevo, espera /api/health y borra .no_aceptar.
+#   * -Redeploy: reinicio sin cortar trabajos. Primero comprueba que el codigo nuevo y api_keys.json
+#     cargan (importa demo_api en un proceso aparte: solo lee); si no, sale SIN tocar la API en marcha
+#     (un api_keys.json roto la dejaria caida para TODOS los clientes). Luego crea .no_aceptar
+#     (POST /api/jobs responde 503 y WTCP reintenta mas tarde), espera a que no haya trabajos en curso
+#     ni en cola, para el proceso que escucha, arranca el nuevo, espera /api/health y borra .no_aceptar.
+#   * -Comprobar: solo esa comprobacion (p. ej. tras editar api_keys.json para un cliente nuevo).
 #
-# Uso:  powershell -NoProfile -ExecutionPolicy Bypass -File deploy\windows\lanzar_api.ps1 [-Force | -Redeploy]
+# Uso:  powershell -NoProfile -ExecutionPolicy Bypass -File deploy\windows\lanzar_api.ps1 [-Force | -Redeploy | -Comprobar]
 
-param([switch]$Force, [switch]$Redeploy)
+param([switch]$Force, [switch]$Redeploy, [switch]$Comprobar)
 
 $ErrorActionPreference = 'Stop'
 
@@ -25,6 +28,25 @@ if (-not (Test-Path $Pythonw)) {
   exit 2
 }
 if (-not (Test-Path $LogDir)) { New-Item -ItemType Directory -Path $LogDir -Force | Out-Null }
+
+if ($Redeploy -or $Comprobar) {
+  $Python = Join-Path $Root '.venv\Scripts\python.exe'
+  $env:PYTHONIOENCODING = 'utf-8'
+  $prev = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  Push-Location $Root
+  $salida = & $Python -c "import demo_api; print('carga OK:', len(demo_api.TOKENS), 'tokens,', len(demo_api.jobs), 'trabajos')" 2>&1
+  $codigo = $LASTEXITCODE
+  Pop-Location
+  $ErrorActionPreference = $prev
+  if ($codigo -ne 0) {
+    Write-Output (($salida | ForEach-Object { "$_" }) -join "`n")
+    Write-Output "Comprobacion FALLIDA (codigo nuevo o api_keys.json): la API en marcha NO se toca."
+    exit 1
+  }
+  Write-Output (($salida | Where-Object { $_ -is [string] }) -join "`n")
+  if ($Comprobar) { exit 0 }
+}
 
 $Drain = Join-Path $Root '.no_aceptar'
 if ($Redeploy) {
