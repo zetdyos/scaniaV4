@@ -15,7 +15,13 @@ propone líneas y cabecera. El modelo propone, el código comprueba (regla 4 de 
   - artículos + envío + impuestos + otros cargos − descuentos = total impreso (y = subtotal impreso si lo hay), al céntimo;
   - el modelo dice que la factura está completa.
 Si todo se cumple, la factura sale SIN revisión con esas líneas (`ocr.origen_lineas = "claude"`; lo que había antes en
-`ocr.fase4`). Si no, sigue en revisión y el `mismatch` añade la explicación del modelo, marcada como no verificada.
+`ocr.fase4`). Si no, y Claude devolvió líneas, la factura sigue en revisión (LECTURA) CON las líneas de Claude: la lectura
+se paga y se aprovecha (decisión del usuario 2026-10-29, 33477: 0 líneas a WTCP aunque Claude leyó las 5). Cada línea
+lleva su evidencia (lo que ningún OCR respalda, «modelo», y la línea sin verificar); la cabecera solo toma cifras
+impresas; el `mismatch` dice qué no se confirmó y la explicación del modelo; la lectura anterior entera queda en
+`ocr.fase4.antes` (`lineas_antes`, `cabecera`). Nunca peor que lo que había: si la lectura anterior tiene más líneas con
+importe o más líneas verificadas, se queda ella y la de Claude va entera a `ocr.fase4.lineas_claude` (con sus `fallos`).
+Sin líneas de Claude, la factura sigue como estaba con su explicación.
 
 Configuración en `scania_config.json` -> `fase4` (se lee en cada factura, sin reiniciar): `activa` (true/false: el
 interruptor; con false no se llama nunca, haya o no clave), `modelo` (por defecto claude-sonnet-5-5, el probado el
@@ -334,34 +340,86 @@ def resolver(doc, res, log, llamar=None):
     leido = Leido(res, paginas, texto, log)
     fallos, lineas, cab, listas = comprobar(p, leido)
     explicacion = str(p.get("explicacion") or "").strip()
-    if fallos:
+    if fallos and not lineas:  # sin líneas de Claude no hay nada que aprovechar: la factura sigue como estaba
         log(f"  fase 4: factura {doc['id']} sigue en revisión: " + "; ".join(fallos[:4]))
         if explicacion:
             note = f"AI reading (unverified): {explicacion}"
             doc["mismatch"] = "; ".join(filter(None, [doc["mismatch"], note]))
             doc["ocr"]["incidencias"].append(note)
         return False
+    # Se paga por la lectura de Claude: se aprovecha siempre. Validada entera -> sin revisión. Si no, la factura sigue en
+    # revisión pero CON las líneas de Claude, cada una con su evidencia (lo que ningún OCR respalda va como «modelo» y la
+    # línea no queda verificada, regla 4). 33477: el 27B no vio los precios (solo en regiones de texto) y salían 0 líneas.
     divisa = next((l.get("divisa") for l in doc["lineas"] if l.get("divisa")), "") or "USD"
     o = doc["ocr"]
     o["fase4"] = {"modelo": modelo(), "antes": {"motivo_revision": doc["motivo_revision"], "mismatch": doc["mismatch"],
                                              "total": doc["total"], "lineas": len(doc["lineas"])}}
+    if fallos:
+        o["fase4"]["antes"].update(total_is_printed=doc["total_is_printed"], lineas_antes=doc["lineas"],
+                                   cabecera={k: o.get(k) for k in ("subtotal_articulos", "envio", "impuestos",
+                                                                    "descuentos", "other_charges")})
+    estimadas = {p1.squash(l["descripcion"])[:30]: l["estimacion"] for l in doc["lineas"]
+                 if l.get("line_kind") == "goods" and l.get("estimacion")}
     nuevas = []
     for i, l in enumerate(lineas):
-        ev = {"descripcion": "leido", "importe_linea": "leido", "precio_unitario": "leido" if l["unit"] else "",
-              "cantidad": "leido" if f2.qty_printed(l["qty"], leido.sq, p1.squash(l["desc"])[:20])
-              else "aritmetica" if l["qty"] > 1 else "asumido"}
-        ocr = {"precio_unitario": l["unit"] or f"{Decimal(l['amount']) / l['qty']:.2f}", "cantidad_impresa": ev["cantidad"] == "leido",
+        key = p1.squash(l["desc"])[:20]
+        amt = Decimal(l["amount"]) if l["amount"] else None
+        printed_amt = l["amount"] in leido.importes if l["amount"] else False
+        qty_ev = ("leido" if f2.qty_printed(l["qty"], leido.sq, key)
+                  else "aritmetica" if l["qty"] > 1 and l["unit"] and amt is not None and l["qty"] * Decimal(l["unit"]) == amt
+                  else "asumido" if l["qty"] == 1 else "modelo")
+        ev = {"descripcion": "leido" if leido.descripcion(l["desc"]) else "modelo",
+              "importe_linea": ("leido" if printed_amt else "modelo") if l["amount"] else "",
+              "precio_unitario": "leido" if l["unit"] else "", "cantidad": qty_ev}
+        ocr = {"precio_unitario": l["unit"] or (f"{amt / l['qty']:.2f}" if amt is not None else ""),
+               "cantidad_impresa": qty_ev == "leido",
                "vendedor": "", "seguimiento": "", "estado_envio": "", "condicion": "", "pagina": paginas[0],
-               "origen": "claude", "verificado": True, "evidencia": ev}
+               "origen": "claude",
+               "verificado": ev["descripcion"] == "leido" and ev["importe_linea"] == "leido" and qty_ev != "modelo",
+               "evidencia": ev}
         line = f2.goods_line(i, {"desc": l["desc"], "qty": l["qty"], "amount": l["amount"]}, divisa, ocr)
-        line["estimacion"] = None
+        # fase 3: una línea que sigue sin importe conserva la estimación que tenía la misma descripción
+        line["estimacion"] = None if (l["amount"] or not fallos) else estimadas.get(p1.squash(l["desc"])[:30])
         nuevas.append(line)
+    if fallos:
+        # Nunca peor que lo que ya había: si la lectura anterior tiene más líneas con importe o más verificadas (34086:
+        # 100 líneas, Claude 28; 34160-A: 43, Claude 7), se queda, y la lectura de Claude va entera en ocr.fase4.
+        viejas = [l for l in doc["lineas"] if l.get("line_kind") == "goods"]
+        cuenta = lambda ls: (sum(1 for l in ls if l["importe_linea"]), sum(1 for l in ls if l["ocr"].get("verificado")))  # noqa: E731
+        if any(n < v for n, v in zip(cuenta(nuevas), cuenta(viejas))):
+            o["fase4"] = {"modelo": modelo(), "lineas_claude": nuevas, "fallos": fallos}
+            note = f"AI reading (unverified): {explicacion}" if explicacion else ""
+            if note:
+                doc["mismatch"] = "; ".join(filter(None, [doc["mismatch"], note]))
+                o["incidencias"].append(note)
+            log(f"  fase 4: factura {doc['id']} sigue en revisión con su lectura anterior ({len(viejas)} líneas; Claude "
+                f"{len(nuevas)}, en ocr.fase4): " + "; ".join(fallos[:4]))
+            return False
     doc["lineas"] = nuevas
+    o["origen_lineas"] = "claude"
+    if fallos:
+        impreso = lambda v: v is not None and v != 0 and f"{v}" in leido.importes  # noqa: E731
+        o["subtotal_articulos"] = (f"{sum(Decimal(l['amount']) for l in lineas)}" if all(l["amount"] for l in lineas)
+                                   else "")
+        o["envio"] = f"{cab['envio']}" if impreso(cab["envio"]) else ""
+        imps = [c for c in listas["impuestos"] if c["importe"] in leido.importes]
+        o["impuestos"] = f"{sum(Decimal(c['importe']) for c in imps)}" if imps else ""
+        o["descuentos"] = [c for c in listas["descuentos"] if c["importe"] in leido.importes]
+        o["other_charges"] = [c for c in listas["otros_cargos"] if c["importe"] in leido.importes]
+        if impreso(cab["total"]):
+            doc.update(total=f"{cab['total']}", total_is_printed=True)
+        notas = ["item lines read by the AI model (Claude), not confirmed: " + "; ".join(fallos)]
+        if explicacion:
+            notas.append(f"AI reading (unverified): {explicacion}")
+        o["incidencias"] = notas
+        doc.update(motivo_revision="LECTURA", mismatch="; ".join(notas))
+        log(f"  fase 4: factura {doc['id']} sigue en revisión con las {len(nuevas)} líneas de Claude: "
+            + "; ".join(fallos[:4]))
+        return False
     o["subtotal_articulos"] = f"{sum(Decimal(l['amount']) for l in lineas)}"
     o["envio"] = f"{cab['envio']}" if cab["envio"] is not None else ""
     o["impuestos"] = f"{sum(Decimal(c['importe']) for c in listas['impuestos'])}" if listas["impuestos"] else ""
     o["descuentos"], o["other_charges"] = listas["descuentos"], listas["otros_cargos"]
-    o["origen_lineas"] = "claude"
     o["incidencias"] = []
     doc.update(motivo_revision="", mismatch="", total=f"{cab['total']}", total_is_printed=True)
     log(f"  fase 4: factura {doc['id']} resuelta por Claude ({len(nuevas)} líneas, total {doc['total']}): sin revisión")
