@@ -16,11 +16,14 @@ C:/Share/CONTRATO-WTCP.md (carpeta compartida con WTCP).
 
 Acceso: todas las rutas /api/... y el WebSocket exigen un API-Token en la cabecera X-API-Key
 (401 si falta o no es válido). Los tokens viven en api_keys.json ({"nombre": {"token": "...", "moneda": "USD",
-"id": "..."}}, fuera de git; otra ruta con SCANIA_API_KEYS_FILE). `id` identifica al cliente de forma única: cada
-cliente ve SOLO sus trabajos (los de otro responden 404, como si no existieran), los duplicados entre documentos se
-buscan solo entre los suyos y la cola atiende a los clientes por turnos. La moneda del cliente (por defecto USD) es la
-de todos los importes de su resultado (divisas.py). Desde 127.0.0.1 no se pide token: es la propia demo (ve todos los
-trabajos; moneda DEMO_MONEDA, por defecto USD).
+"cliente": "<ClientCode>"}}, fuera de git; otra ruta con SCANIA_API_KEYS_FILE). `cliente` es el
+[Application].[ClientCode] de WTCP (contrato, propuesta del 2026-10-29): cada cliente ve SOLO sus trabajos (los de otro
+responden 404, como si no existieran), los duplicados entre documentos se buscan solo entre los suyos y la cola atiende
+a los clientes por turnos; dos tokens con el mismo `cliente` son el mismo cliente. WTCP manda además la cabecera
+X-Client-Code: si falta o no coincide con el `cliente` del token, 403. Un token sin `cliente` es un
+cliente solo (su cabecera X-Client-Code se anota en la consola para guardarla, no da acceso a nada). La moneda del token
+(por defecto USD) es la de todos los importes de su resultado (divisas.py). Desde 127.0.0.1 no se pide token: es la
+propia demo (ve todos los trabajos; moneda DEMO_MONEDA, por defecto USD).
 /docs, /redoc y /openapi.json son públicos (solo esquemas, sin datos).
 
 Puerto por defecto 8091 (variable DEMO_PORT). Arranque:
@@ -62,51 +65,83 @@ JOBS_DIR.mkdir(exist_ok=True)
 # ----------------------------------------------------------------------------- acceso (API-Token)
 
 API_KEYS_FILE = Path(os.environ.get("SCANIA_API_KEYS_FILE") or HERE / "api_keys.json")
-# Cada cliente (una instancia de WTCP): {"nombre": {"token": "...", "moneda": "USD", "id": "..."}}. `id` es el
-# identificador ÚNICO del cliente: cada cliente ve solo sus trabajos y sus resultados, y los duplicados entre documentos
-# se buscan solo entre los suyos (usuario, 2026-10-28: dos WTCP de clientes distintos no se pueden mezclar). Formas
-# viejas aceptadas: {"nombre": "token"} y sin `id` (id = nombre); sin `moneda`, USD.
+# Cada token: {"nombre": {"token": "...", "moneda": "USD", "cliente": "<ClientCode de WTCP>"}}. El cliente es el
+# [Application].[ClientCode] de WTCP (usuario, 2026-10-29): cada cliente ve solo sus trabajos y sus resultados, los
+# duplicados entre documentos se buscan solo entre los suyos y la cola lo atiende por turnos (usuario, 2026-10-28: dos
+# WTCP de clientes distintos no se pueden mezclar). Dos tokens con el mismo `cliente` son el mismo cliente. Sin `cliente`
+# el token es un cliente solo. Formas viejas aceptadas: {"nombre": "token"}; sin `moneda`, USD.
+# El dueño de un trabajo se deduce del NOMBRE del token que lo subió (`client` en meta.json): al guardar el ClientCode
+# de un token, su historial pasa a ese cliente sin tocar los trabajos.
 LOCAL = "local"  # la demo desde 127.0.0.1: ve todos los trabajos (es el operador de la máquina)
 _KEYS_RAW: dict = json.loads(API_KEYS_FILE.read_text(encoding="utf-8")) if API_KEYS_FILE.exists() else {}
-CLIENTS: dict[str, dict] = {n: {"token": v["token"] if isinstance(v, dict) else v,
-                                "moneda": ((v.get("moneda") if isinstance(v, dict) else None) or "USD").upper(),
-                                "id": str((v.get("id") if isinstance(v, dict) else None) or n)}
-                            for n, v in _KEYS_RAW.items()}
-_ids = [c["id"] for c in CLIENTS.values()]
-_tokens = [c["token"] for c in CLIENTS.values()]
-if len(set(_ids)) != len(_ids) or LOCAL in _ids or len(set(_tokens)) != len(_tokens) or not all(_tokens):
-    raise SystemExit(f"{API_KEYS_FILE}: cada cliente necesita un token y un id ÚNICOS (y '{LOCAL}' está reservado)")
-CLIENT_ID_OF_NAME: dict[str, str] = {n: c["id"] for n, c in CLIENTS.items()}
-CLIENT_CURRENCY: dict[str, str] = {c["id"]: c["moneda"] for c in CLIENTS.values()}
-CLIENT_CURRENCY[LOCAL] = (os.environ.get("DEMO_MONEDA") or "USD").upper()
+TOKENS: dict[str, dict] = {n: {"token": v["token"] if isinstance(v, dict) else v,
+                               "moneda": ((v.get("moneda") if isinstance(v, dict) else None) or "USD").upper(),
+                               "cliente": str((v.get("cliente") if isinstance(v, dict) else None) or "").strip()}
+                           for n, v in _KEYS_RAW.items()}
+_tokens = [t["token"] for t in TOKENS.values()]
+if LOCAL in TOKENS or len(set(_tokens)) != len(_tokens) or not all(_tokens):
+    raise SystemExit(f"{API_KEYS_FILE}: cada nombre necesita un token ÚNICO (y '{LOCAL}' está reservado)")
+TOKEN_CURRENCY: dict[str, str] = {n: t["moneda"] for n, t in TOKENS.items()}
+TOKEN_CURRENCY[LOCAL] = (os.environ.get("DEMO_MONEDA") or "USD").upper()
 LOCAL_HOSTS = {"127.0.0.1", "::1", "localhost"}
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False, description="API-Token del cliente")
+client_code_header = APIKeyHeader(name="X-Client-Code", auto_error=False,
+                                  description="[Application].[ClientCode] de WTCP; debe ser el del API-Token")
+_AVISADOS: set = set()
 
 
 def is_local(host: Optional[str]) -> bool:
     return host in LOCAL_HOSTS
 
 
-def client_of_key(key: Optional[str]) -> Optional[str]:
-    """Id del cliente dueño del token, o None. Comparación en tiempo constante."""
+def client_id(name: Optional[str]) -> Optional[str]:
+    """Cliente de un nombre de token: 'cc:<ClientCode>', 'tok:<nombre>' sin ClientCode, 'local' para la demo, None si el
+    token ya no existe (sus trabajos solo los ve la demo). Nunca sale de SCANIA."""
+    if name == LOCAL:
+        return LOCAL
+    t = TOKENS.get(name or "")
+    if not t:
+        return None
+    return f"cc:{t['cliente']}" if t["cliente"] else f"tok:{name}"
+
+
+def token_name(key: Optional[str]) -> Optional[str]:
+    """Nombre del token (p. ej. 'wtcp-produccion') o None. Comparación en tiempo constante."""
     if not key:
         return None
-    return next((c["id"] for c in CLIENTS.values() if hmac.compare_digest(key, c["token"])), None)
+    return next((n for n, t in TOKENS.items() if hmac.compare_digest(key, t["token"])), None)
 
 
-def require_key(request: Request, key: Optional[str] = Security(api_key_header)) -> str:
-    """Dependencia de todas las rutas /api: devuelve el id del cliente que llama ('local' para la demo)."""
+def check_client_code(name: str, code: Optional[str]) -> None:
+    """X-Client-Code frente al ClientCode guardado del token: distinto o ausente → 403 (obligatoria desde el 2026-10-29,
+    WTCP confirmó en el contrato que la manda en todas las llamadas). Token sin ClientCode guardado: la cabecera no da
+    acceso a nada; se anota una vez en la consola para guardarla."""
+    code = (code or "").strip()
+    guardado = TOKENS[name]["cliente"]
+    if guardado and not code:
+        raise HTTPException(403, "missing client code (X-Client-Code header)")
+    if not code:
+        return
+    if not guardado:
+        if (name, code) not in _AVISADOS:
+            _AVISADOS.add((name, code))
+            print(f"aviso: el token {name} manda X-Client-Code {code!r} y no tiene 'cliente' en {API_KEYS_FILE.name}",
+                  flush=True)
+        return
+    if not hmac.compare_digest(code.encode("utf-8"), guardado.encode("utf-8")):
+        raise HTTPException(403, "client code does not match the API-Token")
+
+
+def require_key(request: Request, key: Optional[str] = Security(api_key_header),
+                code: Optional[str] = Security(client_code_header)) -> str:
+    """Dependencia de todas las rutas /api: devuelve el nombre del token que llama ('local' para la demo)."""
     if is_local(request.client.host if request.client else None):
         return LOCAL
-    cid = client_of_key(key)
-    if not cid:
+    name = token_name(key)
+    if not name:
         raise HTTPException(401, "missing or invalid API token (X-API-Key header)")
-    return cid
-
-
-def client_name(cid: Optional[str]) -> str:
-    """Nombre del cliente para el registro (nunca sale de SCANIA)."""
-    return next((n for n, c in CLIENTS.items() if c["id"] == cid), cid or "?")
+    check_client_code(name, code)
+    return name
 
 
 # ----------------------------------------------------------------------------- entrada
@@ -297,21 +332,24 @@ def load_jobs():
                 job.update(state="error", error="interrupted by a server restart", step="Error")
             if job["state"] == "error" and not job.get("error_code"):
                 job["error_code"] = "INTERNAL"  # trabajos anteriores a error_code o interrumpidos: se reintentan
-            if not job.get("cliente_id"):  # trabajos anteriores al id de cliente: el id del nombre con que se subieron
-                c = job.get("client")
-                job["cliente_id"] = LOCAL if c == LOCAL else CLIENT_ID_OF_NAME.get(c)  # sin dueño conocido: solo la demo
             jobs[job["id"]] = job
 
 
-def owns(job: dict, cid: str) -> bool:
-    """¿Puede el cliente `cid` ver este trabajo? Cada cliente solo los suyos; la demo local, todos."""
-    return cid == LOCAL or (job.get("cliente_id") is not None and job.get("cliente_id") == cid)
+def owner(job: dict) -> Optional[str]:
+    """Cliente dueño del trabajo: el del token que lo subió (None si ese token ya no existe)."""
+    return client_id(job.get("client"))
 
 
-def job_of(job_id: str, cid: str) -> dict:
+def owns(job: dict, name: str) -> bool:
+    """¿Puede el token `name` ver este trabajo? Cada cliente solo los suyos; la demo local, todos."""
+    cid = client_id(name)
+    return cid == LOCAL or (cid is not None and owner(job) == cid)
+
+
+def job_of(job_id: str, name: str) -> dict:
     """El trabajo si es del cliente; si no existe o es de otro, el mismo 404 (no se revela que existe)."""
     j = jobs.get(job_id)
-    if not j or not owns(j, cid):
+    if not j or not owns(j, name):
         raise HTTPException(404, "trabajo no encontrado")
     return j
 
@@ -359,7 +397,7 @@ def mark_cross_document_duplicates(job, out, markdown, log):
     latest = {}
     for j in list(jobs.values()):
         if (j["id"] != job["id"] and j.get("state") == "done" and j.get("pdf") != job["pdf"]
-                and j.get("cliente_id") is not None and j.get("cliente_id") == job.get("cliente_id")):
+                and owner(j) is not None and owner(j) == owner(job)):
             latest[j["pdf"]] = j["id"]
     for pdf, jid in latest.items():
         try:
@@ -412,7 +450,7 @@ def process(job_id):
             out = f2.build_all(res, log=log)
             fase4.aplicar(out, res, log)  # Claude solo para las facturas en revisión; sin clave (FASE4=off) no hace nada
         fps = mark_cross_document_duplicates(job, out, res["markdown"], log)  # con los importes impresos
-        divisas.convert_all(out, job.get("moneda") or CLIENT_CURRENCY.get(job.get("cliente_id"), "USD"), log, res["markdown"])
+        divisas.convert_all(out, job.get("moneda") or TOKEN_CURRENCY.get(job.get("client"), "USD"), log, res["markdown"])
         (d / "huellas.json").write_text(json.dumps(fps, ensure_ascii=False), encoding="utf-8")
         (d / "result.json").write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
         # Respuestas crudas de los modelos y regiones de la fase 1: para medir cambios y calibrar sin volver a llamarlos.
@@ -501,13 +539,13 @@ async def create_job(file: UploadFile = File(..., description="PDF, PNG, JPG/JPE
     if pdf_bytes is not None:  # la fase 1 recibe siempre un PDF
         pdf = Path(name).stem + ".pdf"
         (d / pdf).write_bytes(pdf_bytes)
-    job = {"id": job_id, "pdf": pdf, "original": name, "client": client_name(client), "cliente_id": client,
-           "moneda": CLIENT_CURRENCY.get(client, "USD"), "state": "queued", "progress": 0,
-           "step": "En cola", "log": [f"subido por {client_name(client)}: {name}"], "created": time.time()}
+    job = {"id": job_id, "pdf": pdf, "original": name, "client": client,
+           "moneda": TOKEN_CURRENCY.get(client, "USD"), "state": "queued", "progress": 0,
+           "step": "En cola", "log": [f"subido por {client}: {name}"], "created": time.time()}
     with lock:
         jobs[job_id] = job
     save_meta(job)
-    encolar(PRIO_ANALISIS, client, process, job_id)
+    encolar(PRIO_ANALISIS, client_id(client), process, job_id)
     return {"id": job_id}
 
 
@@ -549,10 +587,16 @@ async def ws_job(ws: WebSocket, job_id: str):
     """Progreso en tiempo real: envía el estado (sin el resultado) cada medio segundo mientras el
     trabajo está en cola o en ejecución, un último mensaje al terminar y cierra. Exige X-API-Key
     salvo desde 127.0.0.1 (sin token: cierra con el código 1008, violación de política)."""
-    client = LOCAL if is_local(ws.client.host if ws.client else None) else client_of_key(ws.headers.get("x-api-key"))
+    client = LOCAL if is_local(ws.client.host if ws.client else None) else token_name(ws.headers.get("x-api-key"))
     if not client:
         await ws.close(code=1008, reason="missing or invalid API token")
         return
+    if client != LOCAL:
+        try:
+            check_client_code(client, ws.headers.get("x-client-code"))
+        except HTTPException:
+            await ws.close(code=1008, reason="client code does not match the API-Token")
+            return
     await ws.accept()
     if job_id not in jobs or not owns(jobs[job_id], client):
         await ws.send_json({"error": "trabajo no encontrado"})
@@ -672,8 +716,9 @@ def classify(body: ClassifyIn, client: str = Security(require_key)):
         raise HTTPException(503, "server restarting: retry later", headers={"Retry-After": "120"})
     try:
         clasificacion.pendientes_correcciones(encolar_correcciones)  # reintento de correcciones que quedaron pendientes
-        return clasificacion.clasificar([it.model_dump() for it in body.items], client,
-                                        lambda *a: encolar(PRIO_CLASIFICACION, client, clasificacion.procesar, *a,
+        cid = client_id(client)  # por cliente: cada uno recibe solo lo que pidió (el clasificador no lo sabe)
+        return clasificacion.clasificar([it.model_dump() for it in body.items], cid,
+                                        lambda *a: encolar(PRIO_CLASIFICACION, cid, clasificacion.procesar, *a,
                                                            f2.modelos_lock))
     except ValueError as e:
         raise HTTPException(400, str(e)) from None
