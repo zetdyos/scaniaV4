@@ -13,7 +13,12 @@ propone líneas y cabecera. El modelo propone, el código comprueba (regla 4 de 
   - cantidad: entera ≥ 1; si es > 1, cantidad × precio unitario impreso = importe, o la cantidad está impresa junto
     a la descripción;
   - artículos + envío + impuestos + otros cargos − descuentos = total impreso (y = subtotal impreso si lo hay), al céntimo;
-  - el modelo dice que la factura está completa.
+  - el modelo dice que la factura está completa y que en esas páginas no hay OTRO documento que dejó fuera (`fuera`);
+  - NUNCA SE PIERDE UNA CIFRA IMPRESA: toda línea de la lectura anterior (fases 1-2) cuyo importe está impreso sigue en
+    alguna línea de Claude, importe por importe. 34293 (2026-10-29): el PDF traía el pedido de G2 Wireless (22540.00, 13
+    líneas que el 27B leyó bien) y la factura de Suresh (15500.00); Claude devolvió solo Suresh, cuadraba, y WTCP la
+    recibió SIN revisión sin los 22540. Lo mismo en 33692 (tres proveedores fuera). Con cualquiera de las dos cosas la
+    factura queda en revisión y el `mismatch` nombra lo que falta.
 Si todo se cumple, la factura sale SIN revisión con esas líneas (`ocr.origen_lineas = "claude"`; lo que había antes en
 `ocr.fase4`). Si no, y Claude devolvió líneas, la factura sigue en revisión (LECTURA) CON las líneas de Claude: la lectura
 se paga y se aprovecha (decisión del usuario 2026-10-29, 33477: 0 líneas a WTCP aunque Claude leyó las 5). Cada línea
@@ -34,6 +39,7 @@ precio de lista del modelo; con el CLI de pruebas, estimado con las mismas regla
 ceil(alto/28) fichas, máximo 4784 por imagen; texto ~ caracteres/4; salida: las fichas que informa el CLI). Va al
 registro del trabajo por factura y por documento, y a modelos.json (MODEL_RAW["claude"][].coste_api_usd)."""
 import base64
+import collections
 import json
 import os
 import re
@@ -125,13 +131,16 @@ Rules:
 - impuestos: one entry per printed tax amount (e.g. county tax and state tax separately), exactly as printed.
 - completa = false if the item list is not complete on these pages (a page is missing, items cut off, illegible
   amounts) so that the printed totals cannot be reproduced from the items.
+- fuera: if these pages ALSO contain another document that you did not include in lineas (another seller's invoice, a
+  separate order or sales order, a receipt), name each one with its printed total in ONE short English phrase (e.g.
+  "G2 Wireless sales order 14074, total 22540.00"), joined by "; ". "" if the pages hold only this invoice.
 - explicacion: ONE short English sentence for a human reviewer saying what is wrong or missing on the paper (e.g. "page 1
   of 3 is missing: 101.98 of items are not in the file"), or "" if the invoice is complete and adds up.
 
 Answer ONLY with this JSON (no text before or after):
 {"lineas": [{"descripcion": "", "cantidad": 1, "precio_unitario": "", "importe": ""}],
  "subtotal": "", "envio": "", "impuestos": [{"concepto": "", "importe": ""}], "descuentos": [{"concepto": "", "importe": ""}],
- "otros_cargos": [{"concepto": "", "importe": ""}], "total": "", "completa": true, "explicacion": ""}
+ "otros_cargos": [{"concepto": "", "importe": ""}], "total": "", "completa": true, "fuera": "", "explicacion": ""}
 Use "" for values that are not printed.
 
 OCR text of these pages:
@@ -205,6 +214,9 @@ def comprobar(p, leido):
     fallos, lineas = [], []
     if not p.get("completa"):
         fallos.append("the model says the item list is not complete")
+    fuera = str(p.get("fuera") or "").strip()
+    if fuera:
+        fallos.append(f"the AI model reports other document(s) on these pages that it did not include: {fuera[:300]}")
     for l in p.get("lineas") or []:
         desc = str(l.get("descripcion") or "").strip()
         amt, unit = _cifra(l.get("importe")), _cifra(l.get("precio_unitario"))
@@ -262,6 +274,23 @@ def comprobar(p, leido):
         if cuenta != cab["total"]:
             fallos.append(f"items + charges - discounts = {cuenta}, printed total {cab['total']}")
     return fallos, lineas, cab, listas
+
+
+def perdidas(viejas, nuevas, impresos):
+    """Líneas `goods` de la lectura anterior con importe IMPRESO que ninguna línea de Claude conserva (por importe, una a
+    una: dos artículos a 375.00 necesitan dos líneas a 375.00). Una cifra impresa que desaparece nunca se acepta en
+    silencio (34293: 13 líneas de G2 Wireless, 22540.00)."""
+    libres = collections.Counter(l["amount"] for l in nuevas if l["amount"])
+    out = []
+    for l in viejas:
+        a = l.get("importe_linea") or ""
+        if l.get("line_kind") != "goods" or not a or a not in impresos:
+            continue
+        if libres[a] > 0:
+            libres[a] -= 1
+        else:
+            out.append(l)
+    return out
 
 
 # ----------------------------------------------------------------------------- aplicar a una factura
@@ -339,6 +368,15 @@ def resolver(doc, res, log, llamar=None):
         return False
     leido = Leido(res, paginas, texto, log)
     fallos, lineas, cab, listas = comprobar(p, leido)
+    # Nunca se pierde una cifra impresa: lo que la lectura anterior leyó con importe impreso tiene que seguir en las
+    # líneas de Claude (34293: el pedido de G2 Wireless, 22540.00, desapareció y la factura salió sin revisión).
+    fuera = perdidas(doc["lineas"], lineas, leido.importes)
+    if fuera:
+        suma = sum(Decimal(l["importe_linea"]) for l in fuera)
+        fallos.append(f"leaves out {len(fuera)} item line(s) with printed amounts (sum {suma}) found by the OCR reading: "
+                      + "; ".join(f"«{l['descripcion'][:40]}» {l['importe_linea']}" for l in fuera[:6])
+                      + ("; …" if len(fuera) > 6 else ""))
+    avisos = [f for f in fallos if f.startswith(("leaves out ", "the AI model reports other document"))]
     explicacion = str(p.get("explicacion") or "").strip()
     if fallos and not lineas:  # sin líneas de Claude no hay nada que aprovechar: la factura sigue como estaba
         log(f"  fase 4: factura {doc['id']} sigue en revisión: " + "; ".join(fallos[:4]))
@@ -352,12 +390,13 @@ def resolver(doc, res, log, llamar=None):
     # línea no queda verificada, regla 4). 33477: el 27B no vio los precios (solo en regiones de texto) y salían 0 líneas.
     divisa = next((l.get("divisa") for l in doc["lineas"] if l.get("divisa")), "") or "USD"
     o = doc["ocr"]
+    # La lectura anterior entera queda siempre en ocr.fase4.antes (también si Claude valida): 34293 solo conservó el
+    # número de líneas y hubo que ir a modelos.json para ver qué se había perdido.
     o["fase4"] = {"modelo": modelo(), "antes": {"motivo_revision": doc["motivo_revision"], "mismatch": doc["mismatch"],
-                                             "total": doc["total"], "lineas": len(doc["lineas"])}}
-    if fallos:
-        o["fase4"]["antes"].update(total_is_printed=doc["total_is_printed"], lineas_antes=doc["lineas"],
-                                   cabecera={k: o.get(k) for k in ("subtotal_articulos", "envio", "impuestos",
-                                                                    "descuentos", "other_charges")})
+                                             "total": doc["total"], "total_is_printed": doc["total_is_printed"],
+                                             "lineas": len(doc["lineas"]), "lineas_antes": doc["lineas"],
+                                             "cabecera": {k: o.get(k) for k in ("subtotal_articulos", "envio", "impuestos",
+                                                                                 "descuentos", "other_charges")}}}
     estimadas = {p1.squash(l["descripcion"])[:30]: l["estimacion"] for l in doc["lineas"]
                  if l.get("line_kind") == "goods" and l.get("estimacion")}
     nuevas = []
@@ -388,10 +427,13 @@ def resolver(doc, res, log, llamar=None):
         cuenta = lambda ls: (sum(1 for l in ls if l["importe_linea"]), sum(1 for l in ls if l["ocr"].get("verificado")))  # noqa: E731
         if any(n < v for n, v in zip(cuenta(nuevas), cuenta(viejas))):
             o["fase4"] = {"modelo": modelo(), "lineas_claude": nuevas, "fallos": fallos}
-            note = f"AI reading (unverified): {explicacion}" if explicacion else ""
-            if note:
-                doc["mismatch"] = "; ".join(filter(None, [doc["mismatch"], note]))
-                o["incidencias"].append(note)
+            # lo que el revisor tiene que saber aunque no se entreguen las líneas de Claude: qué dejó fuera y por qué
+            notas = [f"AI reading (Claude) {a}" for a in avisos]
+            if explicacion:
+                notas.append(f"AI reading (unverified): {explicacion}")
+            if notas:
+                doc["mismatch"] = "; ".join(filter(None, [doc["mismatch"]] + notas))
+                o["incidencias"].extend(notas)
             log(f"  fase 4: factura {doc['id']} sigue en revisión con su lectura anterior ({len(viejas)} líneas; Claude "
                 f"{len(nuevas)}, en ocr.fase4): " + "; ".join(fallos[:4]))
             return False
