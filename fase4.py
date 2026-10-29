@@ -279,12 +279,15 @@ def comprobar(p, leido):
 def perdidas(viejas, nuevas, impresos):
     """Líneas `goods` de la lectura anterior con importe IMPRESO que ninguna línea de Claude conserva (por importe, una a
     una: dos artículos a 375.00 necesitan dos líneas a 375.00). Una cifra impresa que desaparece nunca se acepta en
-    silencio (34293: 13 líneas de G2 Wireless, 22540.00)."""
+    silencio (34293: 13 líneas de G2 Wireless, 22540.00). No cuentan: importe 0.00 (sin valor: 34279, 31059, 33115) y la
+    cifra que sigue en una línea de Claude como precio unitario impreso de cantidad > 1 (el 27B dio el unitario como
+    importe y Claude lo corrigió: 32745 2 × 5.54 = 11.08, 33058 3 × 19.76 = 59.28)."""
     libres = collections.Counter(l["amount"] for l in nuevas if l["amount"])
+    libres.update(l["unit"] for l in nuevas if l["unit"] and l["qty"] > 1)
     out = []
     for l in viejas:
         a = l.get("importe_linea") or ""
-        if l.get("line_kind") != "goods" or not a or a not in impresos:
+        if l.get("line_kind") != "goods" or not a or a not in impresos or Decimal(a) == 0:
             continue
         if libres[a] > 0:
             libres[a] -= 1
