@@ -17,11 +17,11 @@ C:/Share/CONTRATO-WTCP.md (carpeta compartida con WTCP).
 Acceso: todas las rutas /api/... y el WebSocket exigen un API-Token en la cabecera X-API-Key
 (401 si falta o no es válido). Los tokens viven en api_keys.json ({"nombre": {"token": "...", "moneda": "USD",
 "cliente": "<ClientCode>"}}, fuera de git; otra ruta con SCANIA_API_KEYS_FILE). `cliente` es el
-[Application].[ClientCode] de WTCP (contrato, propuesta del 2026-10-29): cada cliente ve SOLO sus trabajos (los de otro
-responden 404, como si no existieran), los duplicados entre documentos se buscan solo entre los suyos y la cola atiende
-a los clientes por turnos; dos tokens con el mismo `cliente` son el mismo cliente. WTCP manda además la cabecera
-X-Client-Code: si falta o no coincide con el `cliente` del token, 403. Un token sin `cliente` es un
-cliente solo (su cabecera X-Client-Code se anota en la consola para guardarla, no da acceso a nada). La moneda del token
+[Application].[ClientCode] de WTCP (contrato, 2026-10-29) y es OBLIGATORIO en cada token: cada cliente ve SOLO sus
+trabajos (los de otro responden 404, como si no existieran) y los duplicados entre documentos se buscan solo entre los
+suyos; dos tokens con el mismo `cliente` son el mismo cliente. Todas las peticiones de todos los clientes van a UNA cola
+y se atienden en orden de llegada. WTCP manda además la cabecera X-Client-Code: si falta o no coincide con el `cliente`
+del token, 403. La moneda del token
 (por defecto USD) es la de todos los importes de su resultado (divisas.py). Desde 127.0.0.1 no se pide token: es la
 propia demo (ve todos los trabajos; moneda DEMO_MONEDA, por defecto USD).
 /docs, /redoc y /openapi.json son públicos (solo esquemas, sin datos).
@@ -66,22 +66,27 @@ JOBS_DIR.mkdir(exist_ok=True)
 
 API_KEYS_FILE = Path(os.environ.get("SCANIA_API_KEYS_FILE") or HERE / "api_keys.json")
 # Cada token: {"nombre": {"token": "...", "moneda": "USD", "cliente": "<ClientCode de WTCP>"}}. El cliente es el
-# [Application].[ClientCode] de WTCP (usuario, 2026-10-29): cada cliente ve solo sus trabajos y sus resultados, los
-# duplicados entre documentos se buscan solo entre los suyos y la cola lo atiende por turnos (usuario, 2026-10-28: dos
-# WTCP de clientes distintos no se pueden mezclar). Dos tokens con el mismo `cliente` son el mismo cliente. Sin `cliente`
-# el token es un cliente solo. Formas viejas aceptadas: {"nombre": "token"}; sin `moneda`, USD.
+# [Application].[ClientCode] de WTCP, obligatorio en cada token (usuario, 2026-10-29: «varios clientes diferenciados por
+# el código ... NO PUEDE HABER confusión entre ellos»): cada cliente ve solo sus trabajos y sus resultados y los
+# duplicados entre documentos se buscan solo entre los suyos. Dos tokens con el mismo `cliente` son el mismo cliente.
+# Sin `moneda`, USD. Un token sin `cliente` (o con la forma vieja {"nombre": "token"}) no deja arrancar la API.
 # El dueño de un trabajo es el ClientCode guardado en su meta.json al subirlo (`cliente`): renombrar o quitar la entrada
 # del token no deja huérfano su historial. Trabajos sin `cliente` (sin ClientCode al subirlos): el del NOMBRE del token
 # que lo subió (`client`).
 LOCAL = "local"  # la demo desde 127.0.0.1: ve todos los trabajos (es el operador de la máquina)
 # utf-8-sig: el archivo se edita a mano en Windows y PowerShell 5.1 lo guarda con BOM (con utf-8 la API no arrancaría)
 _KEYS_RAW: dict = json.loads(API_KEYS_FILE.read_text(encoding="utf-8-sig")) if API_KEYS_FILE.exists() else {}
-TOKENS: dict[str, dict] = {n: {"token": v["token"] if isinstance(v, dict) else v,
-                               "moneda": ((v.get("moneda") if isinstance(v, dict) else None) or "USD").upper(),
-                               "cliente": str((v.get("cliente") if isinstance(v, dict) else None) or "").strip()}
+_malos = [n for n, v in _KEYS_RAW.items()
+          if not (isinstance(v, dict) and isinstance(v.get("token"), str) and v["token"]
+                  and isinstance(v.get("cliente"), str) and v["cliente"].strip())]
+if _malos:
+    raise SystemExit(f"{API_KEYS_FILE}: {', '.join(_malos)}: cada token necesita {{\"token\": \"...\", \"cliente\": "
+                     "\"<ClientCode de WTCP>\"}} (moneda opcional, USD)")
+TOKENS: dict[str, dict] = {n: {"token": v["token"], "moneda": (v.get("moneda") or "USD").upper(),
+                               "cliente": v["cliente"].strip()}
                            for n, v in _KEYS_RAW.items()}
 _tokens = [t["token"] for t in TOKENS.values()]
-if LOCAL in TOKENS or len(set(_tokens)) != len(_tokens) or not all(isinstance(t, str) and t for t in _tokens):
+if LOCAL in TOKENS or len(set(_tokens)) != len(_tokens):
     raise SystemExit(f"{API_KEYS_FILE}: cada nombre necesita un token ÚNICO (y '{LOCAL}' está reservado)")
 TOKEN_CURRENCY: dict[str, str] = {n: t["moneda"] for n, t in TOKENS.items()}
 TOKEN_CURRENCY[LOCAL] = (os.environ.get("DEMO_MONEDA") or "USD").upper()
@@ -89,7 +94,14 @@ LOCAL_HOSTS = {"127.0.0.1", "::1", "localhost"}
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False, description="API-Token del cliente")
 client_code_header = APIKeyHeader(name="X-Client-Code", auto_error=False,
                                   description="[Application].[ClientCode] de WTCP; debe ser el del API-Token")
-_AVISADOS: set = set()
+
+
+def comprobar():
+    """lanzar_api.ps1 -Comprobar / -Redeploy: qué cliente y moneda tiene cada token (nunca el token), para revisar un
+    alta antes de desplegar."""
+    for n, t in sorted(TOKENS.items(), key=lambda x: (x[1]["cliente"], x[0])):
+        print(f"  token {n} -> ClientCode {t['cliente']} -> moneda {t['moneda']}")
+    print(f"carga OK: {len(TOKENS)} tokens, {len({t['cliente'] for t in TOKENS.values()})} clientes, {len(jobs)} trabajos")
 
 
 def is_local(host: Optional[str]) -> bool:
@@ -97,14 +109,12 @@ def is_local(host: Optional[str]) -> bool:
 
 
 def client_id(name: Optional[str]) -> Optional[str]:
-    """Cliente de un nombre de token: 'cc:<ClientCode>', 'tok:<nombre>' sin ClientCode, 'local' para la demo, None si el
-    token ya no existe (sus trabajos solo los ve la demo). Nunca sale de SCANIA."""
+    """Cliente de un nombre de token: 'cc:<ClientCode>', 'local' para la demo, None si el token ya no existe (sus
+    trabajos solo los ve la demo). Nunca sale de SCANIA."""
     if name == LOCAL:
         return LOCAL
     t = TOKENS.get(name or "")
-    if not t:
-        return None
-    return f"cc:{t['cliente']}" if t["cliente"] else f"tok:{name}"
+    return f"cc:{t['cliente']}" if t else None
 
 
 def token_name(key: Optional[str]) -> Optional[str]:
@@ -118,21 +128,11 @@ def token_name(key: Optional[str]) -> Optional[str]:
 
 def check_client_code(name: str, code: Optional[str]) -> None:
     """X-Client-Code frente al ClientCode guardado del token: distinto o ausente → 403 (obligatoria desde el 2026-10-29,
-    WTCP confirmó en el contrato que la manda en todas las llamadas). Token sin ClientCode guardado: la cabecera no da
-    acceso a nada; se anota una vez en la consola para guardarla."""
+    WTCP confirmó en el contrato que la manda en todas las llamadas)."""
     code = (code or "").strip()
-    guardado = TOKENS[name]["cliente"]
-    if guardado and not code:
-        raise HTTPException(403, "missing client code (X-Client-Code header)")
     if not code:
-        return
-    if not guardado:
-        if (name, code) not in _AVISADOS:
-            _AVISADOS.add((name, code))
-            print(f"aviso: el token {name} manda X-Client-Code {code!r} y no tiene 'cliente' en {API_KEYS_FILE.name}",
-                  flush=True)
-        return
-    if not hmac.compare_digest(code.encode("utf-8"), guardado.encode("utf-8")):
+        raise HTTPException(403, "missing client code (X-Client-Code header)")
+    if not hmac.compare_digest(code.encode("utf-8"), TOKENS[name]["cliente"].encode("utf-8")):
         raise HTTPException(403, "client code does not match the API-Token")
 
 
@@ -253,63 +253,42 @@ lock = threading.Lock()
 
 # ----------------------------------------------------------------------------- cola única contra los modelos
 # Análisis de archivos y clasificaciones usan el mismo Qwen3.6-27B (:8083, un turno): UNA cola y UN trabajador, nunca
-# dos peticiones a la vez (pedido del usuario 2026-10-24). Prioridad a los análisis (un lote de 200 descripciones son
-# ~80 min); las clasificaciones usan los huecos. WTCP espera cada análisis lo que haga falta: solo vuelve a subir con
-# error INTERNAL, 404 o a pedido de una persona (contrato, respuesta de WTCP del 2026-10-23).
-# Dentro de cada prioridad, POR TURNOS ENTRE CLIENTES (usuario, 2026-10-28: con dos WTCP, uno que sube mucho -o el mismo
-# archivo en bucle, 34160-A/B- no deja esperando al otro) y, para cada cliente, por orden de llegada.
-PRIO_ANALISIS, PRIO_CORRECCION, PRIO_CLASIFICACION = 0, 1, 2  # una corrección llega al clasificador antes que las
-# clasificaciones que se vuelvan a pedir
+# dos peticiones a la vez (pedido del usuario 2026-10-24: «que queue los request, ya sean para análisis o para
+# clasificación»). ORDEN DE LLEGADA para todo y para todos los clientes (usuario, 2026-10-29: «sus requests son encolados
+# en una misma cola para que sean respondidos en orden de llegada»): sin prioridades por tipo ni turnos por cliente.
+# Un análisis es una tarea; cada descripción de /api/classify, una tarea, encolada al llegar la primera petición que la
+# pide (las repeticiones de WTCP no la vuelven a encolar); el reenvío de correcciones, una tarea.
 
 
 class Cola:
-    """Cola única contra los modelos: la prioridad más baja primero; dentro de ella, un turno por cliente."""
+    """Cola única contra los modelos, FIFO."""
 
     def __init__(self):
         self._cv = threading.Condition()
-        self._tareas: dict[int, dict[str, collections.deque]] = {}
-        self._ultimo: dict[int, str] = {}  # último cliente atendido en cada prioridad
+        self._tareas: collections.deque = collections.deque()
 
-    def put(self, prio, cliente, fn, args):
+    def put(self, fn, args):
         with self._cv:
-            self._tareas.setdefault(prio, {}).setdefault(cliente or "", collections.deque()).append((fn, args))
+            self._tareas.append((fn, args))
             self._cv.notify()
-
-    def _turno(self, prio):
-        """Clientes con tareas en esta prioridad, empezando por el siguiente al último atendido."""
-        cl = sorted(c for c, q in self._tareas.get(prio, {}).items() if q)
-        ult = self._ultimo.get(prio)
-        i = next((n for n, c in enumerate(cl) if ult is None or c > ult), 0)
-        return cl[i:] + cl[:i]
 
     def get(self):
         with self._cv:
-            while True:
-                for prio in sorted(self._tareas):
-                    turno = self._turno(prio)
-                    if turno:
-                        self._ultimo[prio] = turno[0]
-                        return self._tareas[prio][turno[0]].popleft()
+            while not self._tareas:
                 self._cv.wait()
+            return self._tareas.popleft()
 
-    def orden(self, prio):
-        """Tareas de una prioridad en el orden en que se atenderán si no llega nada más (posición en la cola)."""
+    def orden(self):
+        """Tareas en el orden en que se atenderán (posición en la cola)."""
         with self._cv:
-            turno = self._turno(prio)
-            qs = {c: list(self._tareas[prio][c]) for c in turno}
-        out = []
-        while any(qs.values()):
-            for c in turno:
-                if qs[c]:
-                    out.append(qs[c].pop(0))
-        return out
+            return list(self._tareas)
 
 
 COLA = Cola()
 
 
-def encolar(prio, cliente, fn, *args):
-    COLA.put(prio, cliente, fn, args)
+def encolar(fn, *args):
+    COLA.put(fn, args)
 
 
 def _trabajador():
@@ -554,7 +533,7 @@ async def create_job(file: UploadFile = File(..., description="PDF, PNG, JPG/JPE
     with lock:
         jobs[job_id] = job
     save_meta(job)
-    encolar(PRIO_ANALISIS, client_id(client), process, job_id)
+    encolar(process, job_id)
     return {"id": job_id}
 
 
@@ -569,12 +548,14 @@ def job_status(job_id: str, client: str, full: bool = False) -> dict:
     j = job_of(job_id, client)
     data = dict(j)
     data["log"] = j.get("log", [])[-300:]
-    # Posición en la cola (en el orden en que se atenderá: por turnos entre clientes) y qué se está procesando ahora
-    # (un trabajo a la vez). De otro cliente solo se dice cuánto le falta, nunca qué archivo es.
+    # Posición en la cola (orden de llegada: cuenta TODO lo que va delante, archivos y descripciones por clasificar de
+    # todos los clientes) y qué se está procesando ahora (un trabajo a la vez). De otro cliente solo se dice cuánto le
+    # falta, nunca qué archivo es.
     if j["state"] == "queued":
-        orden = [args[0] for fn, args in COLA.orden(PRIO_ANALISIS) if fn is process]
-        if job_id in orden:
-            data["queue_position"], data["queue_total"] = orden.index(job_id) + 1, len(orden)
+        orden = COLA.orden()
+        pos = next((i for i, (fn, args) in enumerate(orden) if fn is process and args[0] == job_id), None)
+        if pos is not None:
+            data["queue_position"], data["queue_total"] = pos + 1, len(orden)
     running = next((x for x in list(jobs.values()) if x["state"] == "running" and x["id"] != job_id), None)
     data["running_now"] = ({"pdf": running["pdf"] if owns(running, client) else "", "progress": running["progress"],
                             "step": running.get("step", "") if owns(running, client) else ""} if running else None)
@@ -679,7 +660,7 @@ class ClassifyOut(BaseModel):
 
 
 def encolar_correcciones():
-    encolar(PRIO_CORRECCION, "", clasificacion.enviar_correcciones, f2.modelos_lock)  # sin cliente: son del clasificador
+    encolar(clasificacion.enviar_correcciones, f2.modelos_lock)
 
 
 class FeedbackItemIn(BaseModel):
@@ -727,7 +708,7 @@ def classify(body: ClassifyIn, client: str = Security(require_key)):
         clasificacion.pendientes_correcciones(encolar_correcciones)  # reintento de correcciones que quedaron pendientes
         cid = client_id(client)  # por cliente: cada uno recibe solo lo que pidió (el clasificador no lo sabe)
         return clasificacion.clasificar([it.model_dump() for it in body.items], cid,
-                                        lambda *a: encolar(PRIO_CLASIFICACION, cid, clasificacion.procesar, *a,
+                                        lambda *a: encolar(clasificacion.procesar, *a,
                                                            f2.modelos_lock))
     except ValueError as e:
         raise HTTPException(400, str(e)) from None

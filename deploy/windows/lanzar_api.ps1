@@ -35,7 +35,7 @@ if ($Redeploy -or $Comprobar) {
   $prev = $ErrorActionPreference
   $ErrorActionPreference = 'Continue'
   Push-Location $Root
-  $salida = & $Python -c "import demo_api; print('carga OK:', len(demo_api.TOKENS), 'tokens,', len(demo_api.jobs), 'trabajos')" 2>&1
+  $salida = & $Python -c "import demo_api; demo_api.comprobar()" 2>&1
   $codigo = $LASTEXITCODE
   Pop-Location
   $ErrorActionPreference = $prev

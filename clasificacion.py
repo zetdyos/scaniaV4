@@ -9,8 +9,9 @@ y /redoc), que usa el mismo Qwen3.6-27B (:8083) que la fase 2.
 El contrato pide «una llamada, una respuesta» en menos de 60 s y el clasificador tarda de 20 s a minutos por línea. El
 contrato ya prevé la salida (§8.2): «un `ref` que falta en la respuesta queda sin código y se vuelve a pedir en el próximo
 lote». Por eso:
-- cada descripción pedida va a la COLA ÚNICA de demo_api (un trabajador para análisis y clasificaciones, los análisis
-  primero: nunca dos peticiones a la vez contra el 27B, pedido del usuario 2026-10-24); la tarea `procesar` toma el
+- cada descripción pedida va a la COLA ÚNICA de demo_api (un trabajador para análisis y clasificaciones de todos los
+  clientes, en orden de llegada: nunca dos peticiones a la vez contra el 27B, pedido del usuario 2026-10-24 y
+  2026-10-29); la tarea `procesar` toma el
   bloqueo de los modelos y manda UNA línea al clasificador (`POST /api/lines`);
 - SCANIA solo anota qué línea del clasificador corresponde a cada descripción mientras está EN CURSO
   (`clasif_jobs/en_curso.json`, por cliente: lo que pidió un WTCP se entrega solo a ese WTCP; al clasificador va solo la
