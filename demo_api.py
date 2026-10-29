@@ -576,7 +576,8 @@ def get_job(job_id: str, full: int = 0, client: str = Security(require_key)):
 async def ws_job(ws: WebSocket, job_id: str):
     """Progreso en tiempo real: envía el estado (sin el resultado) cada medio segundo mientras el
     trabajo está en cola o en ejecución, un último mensaje al terminar y cierra. Exige X-API-Key
-    salvo desde 127.0.0.1 (sin token: cierra con el código 1008, violación de política)."""
+    salvo desde 127.0.0.1. Token o X-Client-Code inválidos: se cierra antes de aceptar, y por la red el cliente lo ve
+    como el saludo rechazado con HTTP 403 (el código 1008 solo lo ve el cliente de pruebas en proceso)."""
     client = LOCAL if is_local(ws.client.host if ws.client else None) else token_name(ws.headers.get("x-api-key"))
     if not client:
         await ws.close(code=1008, reason="missing or invalid API token")
