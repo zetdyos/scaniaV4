@@ -2543,25 +2543,34 @@ def build_all(res, use_llm=True, llm_server=QWEN27_SERVER, vl_server=VL_SERVER, 
         doc.pop("_cuadra", None)
         doc.pop("_unit_candidates", None)
         doc.pop("_ambiguo", None)
-    # El mismo pedido dos veces en el PDF sin referencia conocida (p. ej. la misma factura Shein escaneada dos
-    # veces): ver same_order. Los bloques de envío de un mismo pedido de Amazon son envíos distintos: no cuentan.
-    fps = order_fingerprints(out, res.get("markdown", ""))
+    mark_file_duplicates(out, res.get("markdown", ""), Path(res["pdf"]).name)
+    return out
+
+
+def mark_file_duplicates(out, markdown, documento):
+    """El mismo pedido dos veces en el PDF sin referencia conocida (p. ej. la misma factura Shein escaneada dos veces):
+    ver same_order. Los bloques de envío de un mismo pedido de Amazon son envíos distintos: no cuentan. Lo llama
+    build_all y, desde el 2026-10-29, fase4.aplicar cuando la Claude API separa un grupo en varias facturas (una factura
+    y la confirmación del mismo pedido con las mismas cifras se marcarían aquí). Una factura ya marcada no se vuelve a
+    marcar."""
+    fps = order_fingerprints(out, markdown)
     for i, a in enumerate(fps):
+        if out[i]["ocr"].get("duplicado"):
+            continue
         for j, b in enumerate(fps):
             if i == j or (a["envios"] and b["envios"]):
                 continue
             if same_order(a, b):
                 mark_duplicate(out[i], f"same order as invoice {b['id']} of this file (identical items and total; "
-                                       "possible duplicate declaration)", Path(res["pdf"]).name, b["id"], "total")
+                                       "possible duplicate declaration)", documento, b["id"], "total")
                 break
             # Misma referencia impresa y artículos en común dentro del MISMO archivo (el pedido repartido en varias hojas,
             # cada una con sus tachones: 33833/33848 pero en un solo PDF): el mismo criterio que entre documentos
             # (demo_api.mark_cross_document_duplicates); antes solo llevaba la nota «order reference repeated» como LECTURA.
             if partial_same_order(a, b):
                 mark_duplicate(out[i], f"same order number {a['ref']} as invoice {b['id']} of this file, with item(s) "
-                                       "in common (possible partial duplicate declaration)", Path(res["pdf"]).name, b["id"], "parcial")
+                                       "in common (possible partial duplicate declaration)", documento, b["id"], "parcial")
                 break
-    return out
 
 
 LOCK_PATH = Path(__file__).resolve().parent / ".modelos.lock"

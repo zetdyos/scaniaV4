@@ -3,7 +3,11 @@ en el contrato, «Propuesta de SCANIA del 2026-10-24»). En la clasificación SC
 
 Solo para las facturas que la fase 2 deja en revisión (motivo_revision distinto de "" y de DUPLICADO: un duplicado bien
 detectado ya es la respuesta correcta). La Claude API recibe las páginas de esa factura (imagen) y el texto de GLM-OCR, y
-propone líneas y cabecera. El modelo propone, el código comprueba (regla 4 de CLAUDE.md, «no inventar valores»):
+devuelve TODOS los documentos que hay en ellas (un archivo puede traer varias facturas y la fase 2 no siempre las
+separa: 34293 traía un pedido de G2 Wireless y una factura de Suresh; el prompt anterior pedía UNA factura y Claude
+elegía una). Cada documento se comprueba por separado; los que validan salen sin revisión como facturas propias (el
+primero en la factura del grupo, los demás nuevas al final del array) y los demás quedan juntos en la factura en
+revisión (`resolver`). El modelo propone, el código comprueba (regla 4 de CLAUDE.md, «no inventar valores»):
   - cada importe (líneas, precio unitario usado, envío, impuestos, descuentos, otros cargos, subtotal, total) está
     impreso: lo leyó GLM-OCR o PP-OCRv6 en esas páginas (los mismos lectores de cifras que la fase 2);
   - cada PALABRA de la descripción la leyó GLM-OCR o PP-OCRv6 (los dos son lectores: no generan texto), con una letra de
@@ -40,6 +44,7 @@ ceil(alto/28) fichas, máximo 4784 por imagen; texto ~ caracteres/4; salida: las
 registro del trabajo por factura y por documento, y a modelos.json (MODEL_RAW["claude"][].coste_api_usd)."""
 import base64
 import collections
+import copy
 import json
 import os
 import re
@@ -114,13 +119,22 @@ def fichas_imagen(png):
     return min(-(-w // 28) * -(-h // 28), MAX_FICHAS_IMAGEN)
 
 
-PROMPT = """You are reading ONE purchase invoice (or order summary) from scanned pages. The page images are the truth;
-the OCR text below is a helper and can be wrong (missing columns, shifted numbers).
+PROMPT = """You are reading scanned pages from a customs file. The pages may hold ONE OR SEVERAL documents: purchase
+invoices, order summaries or confirmations, sales orders, receipts, packing lists, serial-number lists, shipping labels.
+Return EVERY document you find, each one separately and in page order. Never merge two documents into one and never
+leave one out. The page images are the truth; the OCR text below is a helper and can be wrong (missing columns, shifted
+numbers).
 
-Rules:
-- Copy descriptions EXACTLY as printed (same words, same order); do not translate or summarize.
+For each document:
+- tipo: "invoice" for any invoice, order or receipt that prints item prices; "packing_list", "serial_numbers", "label" or
+  "other" for a document without item prices (a packing list or serial-number list that repeats the items of an invoice
+  on these pages is its own document with no lineas).
+- vendedor: the seller's name as printed. referencia: the printed order or invoice number ("" if none). fecha: the
+  printed order or invoice date exactly as printed ("" if none). paginas: [first, last] page of the document, counting
+  the pages given here from 1.
+- lineas: its items. Copy descriptions EXACTLY as printed (same words, same order); do not translate or summarize.
 - Amounts exactly as printed (digits only, dot decimal, no currency sign), e.g. "1234.50".
-- Handwritten numbers and notes are NOT part of the invoice: ignore them. Items crossed out BY HAND are not declared on
+- Handwritten numbers and notes are NOT part of the document: ignore them. Items crossed out BY HAND are not declared on
   this sheet: leave them out.
 - An item whose printed list price is struck through next to a lower price: use the lower (paid) price as the line
   amount and do not list that per-item saving as a discount.
@@ -130,28 +144,26 @@ Rules:
 - subtotal = the printed subtotal of the ITEMS ONLY; "" if the only printed subtotal also includes shipping, tax or
   other charges.
 - impuestos: one entry per printed tax amount (e.g. county tax and state tax separately), exactly as printed.
-- completa = false if the item list is not complete on these pages (a page is missing, items cut off, illegible
-  amounts) so that the printed totals cannot be reproduced from the items.
-- fuera: if these pages ALSO contain another document that you did not include in lineas (another seller's invoice, a
-  separate order or sales order, a receipt), name each one with its printed total in ONE short English phrase (e.g.
-  "G2 Wireless sales order 14074, total 22540.00"), joined by "; ". "" if the pages hold only this invoice.
-- explicacion: ONE short English sentence for a human reviewer saying what is wrong or missing on the paper (e.g. "page 1
-  of 3 is missing: 101.98 of items are not in the file"), or "" if the invoice is complete and adds up.
+- completa = false if this document's item list is not complete on these pages (a page is missing, items cut off,
+  illegible amounts) so that its printed totals cannot be reproduced from its items.
+- explicacion: ONE short English sentence for a human reviewer saying what is wrong or missing on the paper for this
+  document (e.g. "page 1 of 3 is missing: 101.98 of items are not in the file"), or "" if it is complete and adds up.
 
 Answer ONLY with this JSON (no text before or after):
-{"lineas": [{"descripcion": "", "cantidad": 1, "precio_unitario": "", "importe": ""}],
- "subtotal": "", "envio": "", "impuestos": [{"concepto": "", "importe": ""}], "descuentos": [{"concepto": "", "importe": ""}],
- "otros_cargos": [{"concepto": "", "importe": ""}], "total": "", "completa": true, "fuera": "", "explicacion": ""}
+{"documentos": [{"tipo": "invoice", "vendedor": "", "referencia": "", "fecha": "", "paginas": [1, 1],
+  "lineas": [{"descripcion": "", "cantidad": 1, "precio_unitario": "", "importe": ""}],
+  "subtotal": "", "envio": "", "impuestos": [{"concepto": "", "importe": ""}], "descuentos": [{"concepto": "", "importe": ""}],
+  "otros_cargos": [{"concepto": "", "importe": ""}], "total": "", "completa": true, "explicacion": ""}]}
 Use "" for values that are not printed.
 """
 PROMPT_TEXTO = "\nOCR text of these pages:\n"
 
 
 def _prompt(texto, pista=""):
-    """Prompt completo: instrucciones, la pista de qué documento leer (solo si la factura comparte páginas con otra del
+    """Prompt completo: instrucciones, la pista de qué documento extraer (solo si la factura comparte páginas con otra del
     mismo archivo: dos pedidos en la misma hoja, 34142) y el texto OCR."""
-    aviso = (f"\nIMPORTANT: these pages hold more than one order or invoice. Read ONLY the one whose printed order or "
-             f"invoice number is {pista}; list every other document on the pages in \"fuera\".\n") if pista else ""
+    aviso = (f"\nIMPORTANT: these pages hold more than one order or invoice. Return every document, but the one to "
+             f"extract for this reading is the one whose printed order or invoice number is {pista}.\n") if pista else ""
     return PROMPT + aviso + PROMPT_TEXTO + texto
 
 
@@ -204,7 +216,34 @@ def _llamar_cli(pngs, texto, pista=""):
 
 def _respuesta(txt):
     m = re.search(r"\{.*\}", txt or "", re.S)
-    return json.loads(m.group(0)) if m else None
+    try:
+        return json.loads(m.group(0)) if m else None
+    except ValueError:
+        return None
+
+
+def _documentos(p):
+    """Documentos de la respuesta: forma nueva {"documentos": [...]}; forma vieja (un solo objeto con `lineas`, las
+    respuestas guardadas hasta el 2026-10-29) = un documento."""
+    if not isinstance(p, dict):
+        return []
+    if isinstance(p.get("documentos"), list):
+        return [d for d in p["documentos"] if isinstance(d, dict)]
+    return [p] if "lineas" in p else []
+
+
+def _paginas_doc(d, paginas):
+    """Páginas absolutas [a, b] de un documento a partir de las relativas de Claude (1 = primera página enviada),
+    recortadas al grupo; sin dato válido, las del grupo."""
+    try:
+        a, b = int(d["paginas"][0]), int(d["paginas"][1])
+    except (KeyError, TypeError, ValueError, IndexError):
+        return list(paginas)
+    n = paginas[1] - paginas[0] + 1
+    a, b = max(1, min(a, n)), max(1, min(b, n))
+    if b < a:
+        a, b = b, a
+    return [paginas[0] + a - 1, paginas[0] + b - 1]
 
 
 # ----------------------------------------------------------------------------- comprobación
@@ -246,6 +285,10 @@ def comprobar(p, leido):
             fallos.append(f"description not in the OCR text: «{desc[:40]}»")
         if amt is None or f"{amt}" not in impresos:
             fallos.append(f"amount {amt} of «{desc[:30]}» is not printed")
+        elif amt == 0:
+            # La misma regla que la fase 2 (decisión del usuario): un artículo impreso a 0.00 puede ser gratis o no
+            # enviado (B/O) y el papel no lo dice. 34279: Claude unas veces omite esas líneas y otras las lista.
+            fallos.append(f"item «{desc[:30]}» printed with amount 0.00: free or not shipped, the paper does not say")
         if qty < 1:
             fallos.append(f"quantity of «{desc[:30]}» is not a whole number ≥ 1")
         elif qty > 1 and not ((unit is not None and f"{unit}" in impresos and amt is not None and qty * unit == amt)
@@ -373,65 +416,10 @@ def _sq_text(texto):
             + p1.squash(re.sub(r"\(?-?\s*(?:US)?\$\s*\d[\d,]*(?:\.\d{2})?\)?", " ", t)))
 
 
-def resolver(doc, res, log, llamar=None, pista=""):
-    """Intenta resolver UNA factura en revisión. Devuelve True si la dejó sin revisión. `pista`: número de pedido impreso
-    que Claude debe leer cuando la factura comparte páginas con otra (ver `aplicar`)."""
-    paginas = (doc.get("ocr") or {}).get("paginas") or [1, res.get("n_pages") or 1]
-    texto = _texto_factura(res, paginas)
-    llamar = llamar or (_llamar_api if modo() == "api" else _llamar_cli)
-    t0 = time.time()
-    try:
-        crudo, uso = llamar(_paginas_png(res["pdf"], paginas), _texto_factura(res, paginas, para_claude=True), pista)
-        p = _respuesta(crudo)
-    except Exception as e:  # noqa: BLE001  sin red, sin saldo, CLI ausente: la factura sigue como estaba
-        log(f"  fase 4: factura {doc['id']}: Claude no respondió ({type(e).__name__}: {str(e)[:120]})")
-        return False
-    coste = coste_api(uso.get("fichas_entrada", 0), uso.get("fichas_salida", 0))
-    f2.MODEL_RAW.setdefault("claude", []).append({"factura": doc["id"], "paginas": paginas, "modelo": modelo(),
-                                                  "pista": pista, "respuesta": crudo, "uso": uso,
-                                                  "coste_api_usd": coste, "segundos": round(time.time() - t0, 1)})
-    log(f"  fase 4: factura {doc['id']}: Claude API {modelo()}, {uso.get('fichas_entrada', 0)} fichas de entrada + "
-        f"{uso.get('fichas_salida', 0)} de salida = {coste if coste is not None else '?'} USD"
-        + (" (estimado)" if uso.get("estimado") else ""))
-    if uso.get("stop_reason") == "max_tokens":
-        log(f"  fase 4: factura {doc['id']}: respuesta CORTADA por max_tokens ({MAX_TOKENS}): la llamada no sirve")
-    if not isinstance(p, dict):
-        log(f"  fase 4: factura {doc['id']}: respuesta sin JSON")
-        return False
-    leido = Leido(res, paginas, texto, log)
-    fallos, lineas, cab, listas = comprobar(p, leido)
-    # Nunca se pierde una cifra impresa: lo que la lectura anterior leyó con importe impreso tiene que seguir en las
-    # líneas de Claude (34293: el pedido de G2 Wireless, 22540.00, desapareció y la factura salió sin revisión).
-    fuera = perdidas(doc["lineas"], lineas, leido.importes)
-    if fuera:
-        suma = sum(Decimal(l["importe_linea"]) for l in fuera)
-        fallos.append(f"leaves out {len(fuera)} item line(s) with printed amounts (sum {suma}) found by the OCR reading: "
-                      + "; ".join(f"«{l['descripcion'][:40]}» {l['importe_linea']}" for l in fuera[:6])
-                      + ("; …" if len(fuera) > 6 else ""))
-    avisos = [f for f in fallos if f.startswith(("leaves out ", "the AI model reports other document"))]
-    explicacion = str(p.get("explicacion") or "").strip()
-    if fallos and not lineas:  # sin líneas de Claude no hay nada que aprovechar: la factura sigue como estaba
-        log(f"  fase 4: factura {doc['id']} sigue en revisión: " + "; ".join(fallos[:4]))
-        if explicacion:
-            note = f"AI reading (unverified): {explicacion}"
-            doc["mismatch"] = "; ".join(filter(None, [doc["mismatch"], note]))
-            doc["ocr"]["incidencias"].append(note)
-        return False
-    # Se paga por la lectura de Claude: se aprovecha siempre. Validada entera -> sin revisión. Si no, la factura sigue en
-    # revisión pero CON las líneas de Claude, cada una con su evidencia (lo que ningún OCR respalda va como «modelo» y la
-    # línea no queda verificada, regla 4). 33477: el 27B no vio los precios (solo en regiones de texto) y salían 0 líneas.
-    divisa = next((l.get("divisa") for l in doc["lineas"] if l.get("divisa")), "") or "USD"
-    o = doc["ocr"]
-    # La lectura anterior entera queda siempre en ocr.fase4.antes (también si Claude valida): 34293 solo conservó el
-    # número de líneas y hubo que ir a modelos.json para ver qué se había perdido.
-    o["fase4"] = {"modelo": modelo(), "antes": {"motivo_revision": doc["motivo_revision"], "mismatch": doc["mismatch"],
-                                             "total": doc["total"], "total_is_printed": doc["total_is_printed"],
-                                             "lineas": len(doc["lineas"]), "lineas_antes": doc["lineas"],
-                                             "cabecera": {k: o.get(k) for k in ("subtotal_articulos", "envio", "impuestos",
-                                                                                 "descuentos", "other_charges")}}}
-    estimadas = {p1.squash(l["descripcion"])[:30]: l["estimacion"] for l in doc["lineas"]
-                 if l.get("line_kind") == "goods" and l.get("estimacion")}
-    nuevas = []
+def _lineas_json(lineas, leido, divisa, pagina, estimadas, en_revision):
+    """Líneas del esquema a partir de las normalizadas por `comprobar`, cada una con su evidencia (lo que ningún OCR
+    respalda va como «modelo» y la línea no queda verificada, regla 4 de CLAUDE.md)."""
+    out = []
     for i, l in enumerate(lineas):
         key = p1.squash(l["desc"])[:20]
         amt = Decimal(l["amount"]) if l["amount"] else None
@@ -444,60 +432,236 @@ def resolver(doc, res, log, llamar=None, pista=""):
               "precio_unitario": "leido" if l["unit"] else "", "cantidad": qty_ev}
         ocr = {"precio_unitario": l["unit"] or (f"{amt / l['qty']:.2f}" if amt is not None else ""),
                "cantidad_impresa": qty_ev == "leido",
-               "vendedor": "", "seguimiento": "", "estado_envio": "", "condicion": "", "pagina": paginas[0],
+               "vendedor": "", "seguimiento": "", "estado_envio": "", "condicion": "", "pagina": pagina,
                "origen": "claude",
                "verificado": ev["descripcion"] == "leido" and ev["importe_linea"] == "leido" and qty_ev != "modelo",
                "evidencia": ev}
         line = f2.goods_line(i, {"desc": l["desc"], "qty": l["qty"], "amount": l["amount"]}, divisa, ocr)
         # fase 3: una línea que sigue sin importe conserva la estimación que tenía la misma descripción
-        line["estimacion"] = None if (l["amount"] or not fallos) else estimadas.get(p1.squash(l["desc"])[:30])
-        nuevas.append(line)
-    if fallos:
-        # Nunca peor que lo que ya había: si la lectura anterior tiene más líneas con importe o más verificadas (34086:
-        # 100 líneas, Claude 28; 34160-A: 43, Claude 7), se queda, y la lectura de Claude va entera en ocr.fase4.
-        viejas = [l for l in doc["lineas"] if l.get("line_kind") == "goods"]
-        cuenta = lambda ls: (sum(1 for l in ls if l["importe_linea"]), sum(1 for l in ls if l["ocr"].get("verificado")))  # noqa: E731
-        if any(n < v for n, v in zip(cuenta(nuevas), cuenta(viejas))):
-            o["fase4"] = {"modelo": modelo(), "lineas_claude": nuevas, "fallos": fallos}
-            # lo que el revisor tiene que saber aunque no se entreguen las líneas de Claude: qué dejó fuera y por qué
-            notas = [f"AI reading (Claude) {a}" for a in avisos]
-            if explicacion:
-                notas.append(f"AI reading (unverified): {explicacion}")
-            if notas:
-                doc["mismatch"] = "; ".join(filter(None, [doc["mismatch"]] + notas))
-                o["incidencias"].extend(notas)
-            log(f"  fase 4: factura {doc['id']} sigue en revisión con su lectura anterior ({len(viejas)} líneas; Claude "
-                f"{len(nuevas)}, en ocr.fase4): " + "; ".join(fallos[:4]))
-            return False
-    doc["lineas"] = nuevas
-    o["origen_lineas"] = "claude"
-    if fallos:
-        impreso = lambda v: v is not None and v != 0 and f"{v}" in leido.importes  # noqa: E731
-        o["subtotal_articulos"] = (f"{sum(Decimal(l['amount']) for l in lineas)}" if all(l["amount"] for l in lineas)
-                                   else "")
-        o["envio"] = f"{cab['envio']}" if impreso(cab["envio"]) else ""
-        imps = [c for c in listas["impuestos"] if c["importe"] in leido.importes]
-        o["impuestos"] = f"{sum(Decimal(c['importe']) for c in imps)}" if imps else ""
-        o["descuentos"] = [c for c in listas["descuentos"] if c["importe"] in leido.importes]
-        o["other_charges"] = [c for c in listas["otros_cargos"] if c["importe"] in leido.importes]
-        if impreso(cab["total"]):
-            doc.update(total=f"{cab['total']}", total_is_printed=True)
-        notas = ["item lines read by the AI model (Claude), not confirmed: " + "; ".join(fallos)]
-        if explicacion:
-            notas.append(f"AI reading (unverified): {explicacion}")
-        o["incidencias"] = notas
-        doc.update(motivo_revision="LECTURA", mismatch="; ".join(notas))
-        log(f"  fase 4: factura {doc['id']} sigue en revisión con las {len(nuevas)} líneas de Claude: "
-            + "; ".join(fallos[:4]))
-        return False
+        line["estimacion"] = None if (l["amount"] or not en_revision) else estimadas.get(p1.squash(l["desc"])[:30])
+        out.append(line)
+    return out
+
+
+def _cabecera_aceptada(o, e):
+    """Cabecera de un documento validado (todas sus cifras están impresas y cuadran)."""
+    cab, listas, lineas = e["cab"], e["listas"], e["lineas"]
     o["subtotal_articulos"] = f"{sum(Decimal(l['amount']) for l in lineas)}"
     o["envio"] = f"{cab['envio']}" if cab["envio"] is not None else ""
     o["impuestos"] = f"{sum(Decimal(c['importe']) for c in listas['impuestos'])}" if listas["impuestos"] else ""
     o["descuentos"], o["other_charges"] = listas["descuentos"], listas["otros_cargos"]
-    o["incidencias"] = []
-    doc.update(motivo_revision="", mismatch="", total=f"{cab['total']}", total_is_printed=True)
-    log(f"  fase 4: factura {doc['id']} resuelta por Claude ({len(nuevas)} líneas, total {doc['total']}): sin revisión")
-    return True
+
+
+def _cabecera_revision(doc, pendientes, leido):
+    """Cabecera de la factura que queda en revisión: solo cifras impresas; con varios documentos pendientes no hay una
+    cabecera común (subtotal = suma de las líneas si todas tienen importe; lo demás vacío; el total queda como estaba)."""
+    o = doc["ocr"]
+    lineas = [l for e in pendientes for l in e["lineas"]]
+    o["subtotal_articulos"] = f"{sum(Decimal(l['amount']) for l in lineas)}" if lineas and all(l["amount"] for l in lineas) else ""
+    if len(pendientes) != 1:
+        o["envio"], o["impuestos"], o["descuentos"], o["other_charges"] = "", "", [], []
+        return
+    e = pendientes[0]
+    cab, listas = e["cab"], e["listas"]
+    impreso = lambda v: v is not None and v != 0 and f"{v}" in leido.importes  # noqa: E731
+    o["envio"] = f"{cab['envio']}" if impreso(cab["envio"]) else ""
+    imps = [c for c in listas["impuestos"] if c["importe"] in leido.importes]
+    o["impuestos"] = f"{sum(Decimal(c['importe']) for c in imps)}" if imps else ""
+    o["descuentos"] = [c for c in listas["descuentos"] if c["importe"] in leido.importes]
+    o["other_charges"] = [c for c in listas["otros_cargos"] if c["importe"] in leido.importes]
+    if impreso(cab["total"]):
+        doc.update(total=f"{cab['total']}", total_is_printed=True)
+
+
+ORDEN_TEXTO = ("fecha_pedido", "metodo_pago", "destinatario", "direccion_envio", "proveedor", "total_antes_impuestos")
+
+
+def _factura_nueva(base, e, nuevas, nuevo_id, k, n):
+    """Factura nueva (misma forma que las de la fase 2: copia del esqueleto de la factura del grupo) para un documento
+    validado que no es el primero del grupo. Los datos de cabecera de texto del grupo (fecha, pago, destinatario…) no
+    se heredan: pueden ser de otro documento; la fecha es la de Claude solo si está impresa."""
+    d = copy.deepcopy(base)
+    o = d["ocr"]
+    for key in ("duplicado", "envio_bloque", "pedido", "total_pedido"):
+        o.pop(key, None)
+    o.update({key: "" for key in ORDEN_TEXTO if key in o})
+    o.update(paginas=e["paginas"], envios=[], incidencias=[], origen_lineas="claude", fecha_pedido=e["fecha"],
+             fase4={"modelo": modelo(), "documento": [k, n], "tipo": e["tipo"], "vendedor": e["vendedor"]})
+    _cabecera_aceptada(o, e)
+    d.update(id=nuevo_id, estado="DONE", motivo_revision="", mismatch="", total=f"{e['cab']['total']}",
+             total_is_printed=True, referencia=e["referencia"], lineas=nuevas)
+    return d
+
+
+def _etiqueta(e, n):
+    return (f"document {e['k']} of {n}" + (f" ({e['vendedor']}" + (f", {e['referencia']}" if e["referencia"] else "") + ")"
+                                         if e["vendedor"] else "")) if n > 1 else ""
+
+
+def resolver(doc, res, log, llamar=None, pista="", out=None):
+    """Pasa UNA factura en revisión por la Claude API. Claude devuelve TODOS los documentos de sus páginas (un archivo
+    puede traer varias facturas; la fase 2 no siempre las separa: 34293, 33692, 33151, 34160-B); cada uno se comprueba
+    por separado con las reglas de siempre. Los que validan salen sin revisión: el primero en la propia factura y los
+    demás como facturas NUEVAS al final de `out` (los `id` de WTCP nunca cambian); los que no validan quedan juntos en
+    la factura, en LECTURA, con sus líneas y su evidencia (aceptación parcial, decisión del usuario 2026-10-29). Nada se
+    acepta si entre todos los documentos falta una cifra impresa de la lectura anterior. Devuelve cuántas facturas
+    quedaron sin revisión. `pista`: número impreso del documento a extraer cuando la factura comparte páginas con otra
+    (ver `aplicar`)."""
+    paginas = (doc.get("ocr") or {}).get("paginas") or [1, res.get("n_pages") or 1]
+    texto = _texto_factura(res, paginas)
+    llamar = llamar or (_llamar_api if modo() == "api" else _llamar_cli)
+    t0 = time.time()
+    try:
+        crudo, uso = llamar(_paginas_png(res["pdf"], paginas), _texto_factura(res, paginas, para_claude=True), pista)
+        p = _respuesta(crudo)
+    except Exception as e:  # noqa: BLE001  sin red, sin saldo, CLI ausente: la factura sigue como estaba
+        log(f"  fase 4: factura {doc['id']}: Claude no respondió ({type(e).__name__}: {str(e)[:120]})")
+        return 0
+    coste = coste_api(uso.get("fichas_entrada", 0), uso.get("fichas_salida", 0))
+    f2.MODEL_RAW.setdefault("claude", []).append({"factura": doc["id"], "paginas": paginas, "modelo": modelo(),
+                                                  "pista": pista, "respuesta": crudo, "uso": uso,
+                                                  "coste_api_usd": coste, "segundos": round(time.time() - t0, 1)})
+    log(f"  fase 4: factura {doc['id']}: Claude API {modelo()}, {uso.get('fichas_entrada', 0)} fichas de entrada + "
+        f"{uso.get('fichas_salida', 0)} de salida = {coste if coste is not None else '?'} USD"
+        + (" (estimado)" if uso.get("estimado") else ""))
+    if uso.get("stop_reason") == "max_tokens":
+        log(f"  fase 4: factura {doc['id']}: respuesta CORTADA por max_tokens ({MAX_TOKENS}): la llamada no sirve")
+    docs = _documentos(p)
+    if not docs:
+        log(f"  fase 4: factura {doc['id']}: respuesta sin JSON o sin documentos")
+        return 0
+    leido = Leido(res, paginas, texto, log)
+    if pista:  # páginas compartidas: solo el documento pedido; los demás son las facturas hermanas
+        docs = [d for d in docs if p1.squash(str(d.get("referencia") or "")) == p1.squash(pista)]
+        if not docs:
+            log(f"  fase 4: factura {doc['id']}: Claude no devolvió el documento {pista}: sigue como estaba")
+            return 0
+    n = len(docs)
+    evals = []
+    for k, d in enumerate(docs, 1):
+        fallos, lineas, cab, listas = comprobar(d, leido)
+        ref = str(d.get("referencia") or "").strip()
+        fecha = str(d.get("fecha") or "").strip()
+        evals.append({"k": k, "tipo": str(d.get("tipo") or ""), "vendedor": str(d.get("vendedor") or "").strip()[:80],
+                      "referencia": ref if ref and p1.squash(ref) and p1.squash(ref) in leido.sq else "",
+                      "fecha": fecha if fecha and fecha.lower() in texto.lower() else "",
+                      "paginas": _paginas_doc(d, paginas), "fallos": fallos, "lineas": lineas, "cab": cab,
+                      "listas": listas, "explicacion": str(d.get("explicacion") or "").strip(),
+                      "facturable": any(l["amount"] for l in lineas) or bool(cab["total"])})
+    # Puerta de cobertura: nunca se pierde una cifra impresa. Lo que la lectura anterior leyó con importe impreso tiene
+    # que seguir en la UNIÓN de las líneas de todos los documentos (34293: 22540.00 desaparecieron).
+    union = [l for e in evals for l in e["lineas"]]
+    fuera = perdidas(doc["lineas"], union, leido.importes)
+    cobertura = ""
+    if fuera:
+        suma = sum(Decimal(l["importe_linea"]) for l in fuera)
+        cobertura = (f"leaves out {len(fuera)} item line(s) with printed amounts (sum {suma}) found by the OCR reading: "
+                     + "; ".join(f"«{l['descripcion'][:40]}» {l['importe_linea']}" for l in fuera[:6])
+                     + ("; …" if len(fuera) > 6 else ""))
+    facturables = [e for e in evals if e["facturable"]]
+    aceptadas = [e for e in facturables if not e["fallos"] and not fuera]
+    if out is None and len(aceptadas) > 1:  # sin lista donde añadir facturas no se separa nada: todo a revisión
+        aceptadas = []
+    pendientes = [e for e in facturables if e not in aceptadas]
+    explicaciones = [f"AI reading (unverified): {_etiqueta(e, n) + ': ' if n > 1 else ''}{e['explicacion']}"
+                     for e in evals if e["explicacion"]]
+    o = doc["ocr"]
+    # La lectura anterior entera y el desglose por documento quedan siempre en ocr.fase4 (34293 solo conservó el número
+    # de líneas y hubo que ir a modelos.json para ver qué se había perdido).
+    o["fase4"] = {"modelo": modelo(),
+                  "antes": {"motivo_revision": doc["motivo_revision"], "mismatch": doc["mismatch"], "total": doc["total"],
+                            "total_is_printed": doc["total_is_printed"], "lineas": len(doc["lineas"]),
+                            "lineas_antes": doc["lineas"],
+                            "cabecera": {k: o.get(k) for k in ("subtotal_articulos", "envio", "impuestos", "descuentos",
+                                                               "other_charges")}},
+                  "documentos": [{"documento": e["k"], "tipo": e["tipo"], "vendedor": e["vendedor"],
+                                  "referencia": e["referencia"], "paginas": e["paginas"], "lineas": len(e["lineas"]),
+                                  "total": f"{e['cab']['total']}" if e["cab"]["total"] is not None else "",
+                                  "validada": e in aceptadas, "fallos": e["fallos"], "explicacion": e["explicacion"]}
+                                 for e in evals]}
+    if cobertura:
+        o["fase4"]["cobertura"] = cobertura
+    if not union or not facturables:  # nada que aprovechar: la factura sigue como estaba, con los avisos
+        notas = ([f"AI reading (Claude) {cobertura}"] if cobertura else []) + explicaciones
+        if notas:
+            doc["mismatch"] = "; ".join(filter(None, [doc["mismatch"]] + notas))
+            o["incidencias"].extend(notas)
+        log(f"  fase 4: factura {doc['id']} sigue en revisión: " + "; ".join(
+            f for e in evals for f in e["fallos"][:2]) + (f"; {cobertura}" if cobertura else ""))
+        return 0
+    divisa = next((l.get("divisa") for l in doc["lineas"] if l.get("divisa")), "") or "USD"
+    estimadas = {p1.squash(l["descripcion"])[:30]: l["estimacion"] for l in doc["lineas"]
+                 if l.get("line_kind") == "goods" and l.get("estimacion")}
+    for e in evals:
+        e["nuevas"] = _lineas_json(e["lineas"], leido, divisa, e["paginas"][0], estimadas, e not in aceptadas)
+    pend_lineas = [l for e in pendientes for l in e["nuevas"]]
+    for i, l in enumerate(pend_lineas):
+        l["seq"] = i
+    fallos_pend = [(_etiqueta(e, n) + ": " if n > 1 else "") + "; ".join(e["fallos"]) for e in pendientes]
+    if not aceptadas:
+        # Nunca peor que lo que ya había: si la lectura anterior tiene más líneas con importe o más verificadas (34086:
+        # 100 líneas, Claude 28; 34160-A: 43, Claude 7), se queda, y la lectura de Claude va entera en ocr.fase4.
+        viejas = [l for l in doc["lineas"] if l.get("line_kind") == "goods"]
+        cuenta = lambda ls: (sum(1 for l in ls if l["importe_linea"]), sum(1 for l in ls if l["ocr"].get("verificado")))  # noqa: E731
+        if any(a < v for a, v in zip(cuenta(pend_lineas), cuenta(viejas))):
+            o["fase4"].update(lineas_claude=pend_lineas, fallos=fallos_pend)
+            o["fase4"].pop("antes")
+            notas = ([f"AI reading (Claude) {cobertura}"] if cobertura else []) + explicaciones
+            if notas:
+                doc["mismatch"] = "; ".join(filter(None, [doc["mismatch"]] + notas))
+                o["incidencias"].extend(notas)
+            log(f"  fase 4: factura {doc['id']} sigue en revisión con su lectura anterior ({len(viejas)} líneas; Claude "
+                f"{len(pend_lineas)}, en ocr.fase4): " + "; ".join(fallos_pend)[:300])
+            return 0
+    if pendientes:
+        # La factura del grupo queda en LECTURA con los documentos no validados (se paga por la lectura de Claude: se
+        # aprovecha siempre; 33477: el 27B no vio los precios y salían 0 líneas), cada línea con su evidencia.
+        doc["lineas"] = pend_lineas
+        o["origen_lineas"] = "claude"
+        if len(pendientes) == 1 and len(facturables) == 1:
+            o["paginas"] = list(paginas)
+        elif len(pendientes) == 1:
+            o["paginas"] = pendientes[0]["paginas"]
+        if n > 1:  # la factura en revisión ya no es el grupo entero: la referencia y el total del grupo no le pertenecen
+            doc["referencia"] = pendientes[0]["referencia"] if len(pendientes) == 1 else ""
+            doc.update(total="", total_is_printed=False)
+            o.update({key: "" for key in ORDEN_TEXTO if key in o})
+            if len(pendientes) == 1:
+                o["fecha_pedido"] = pendientes[0]["fecha"]
+        _cabecera_revision(doc, pendientes, leido)
+        notas = ["item lines read by the AI model (Claude), not confirmed: " + " | ".join(fallos_pend)]
+        if cobertura:
+            notas.append(f"AI reading (Claude) {cobertura}")
+        notas += explicaciones
+        o["incidencias"] = notas
+        doc.update(motivo_revision="LECTURA", mismatch="; ".join(notas))
+        log(f"  fase 4: factura {doc['id']} sigue en revisión con las {len(pend_lineas)} líneas de Claude"
+            f"{f' ({len(pendientes)} de {n} documentos)' if n > 1 else ''}: " + "; ".join(fallos_pend)[:300])
+    nuevas_facturas = []
+    for j, e in enumerate(aceptadas):
+        if j == 0 and not pendientes:  # el primer documento validado ocupa la factura del grupo (mismo id)
+            doc["lineas"] = e["nuevas"]
+            o["origen_lineas"] = "claude"
+            o["incidencias"] = []
+            o["fase4"].update(documento=[e["k"], n], tipo=e["tipo"], vendedor=e["vendedor"])
+            if n > 1:
+                o["paginas"] = e["paginas"]
+                o.update({key: "" for key in ORDEN_TEXTO if key in o})
+                o["fecha_pedido"] = e["fecha"]
+            _cabecera_aceptada(o, e)
+            # con varios documentos, la referencia del grupo (la fase 2 tomó la de cualquiera de ellos: 34293 llevaba la
+            # de Suresh para el pedido de G2) no vale: la de ESTE documento, si está impresa
+            doc.update(motivo_revision="", mismatch="", total=f"{e['cab']['total']}", total_is_printed=True,
+                       referencia=(e["referencia"] if n > 1 else (doc.get("referencia") or e["referencia"])))
+            log(f"  fase 4: factura {doc['id']} resuelta por Claude ({len(e['nuevas'])} líneas, total {doc['total']}"
+                f"{', ' + _etiqueta(e, n) if n > 1 else ''}): sin revisión")
+        else:
+            nueva = _factura_nueva(doc, e, e["nuevas"], len(out) + len(nuevas_facturas), e["k"], n)
+            nuevas_facturas.append(nueva)
+            log(f"  fase 4: factura NUEVA {nueva['id']} ({_etiqueta(e, n)}, páginas {e['paginas']}): "
+                f"{len(e['nuevas'])} líneas, total {nueva['total']}, sin revisión")
+    out.extend(nuevas_facturas) if nuevas_facturas else None
+    return len(aceptadas)
 
 
 def _solapan(a, b):
@@ -516,7 +680,7 @@ def aplicar(out, res, log, llamar=None):
         return 0
     log(f"Fase 4 (Claude, {modo() if llamar is None else 'prueba'}): {len(candidatas)} factura(s) en revisión")
     antes = len(f2.MODEL_RAW.get("claude", []))
-    n = 0
+    n, n_out = 0, len(out)
     for d in candidatas:
         # Facturas que comparten páginas con otra del mismo archivo: Claude recibe la misma imagen para las dos y no sabe
         # cuál es cada una (34142: los dos envíos de un pedido de Amazon salieron con los mismos 3 artículos). Con número
@@ -530,7 +694,13 @@ def aplicar(out, res, log, llamar=None):
                     f"({'mismo pedido' if ref else 'sin número de pedido'}): no se manda a Claude")
                 continue
             pista = ref
-        n += resolver(d, res, log, llamar, pista)
+        n += resolver(d, res, log, llamar, pista, out)
+    if len(out) > n_out:
+        # Facturas nuevas: el mismo chequeo de duplicados dentro del archivo que hace build_all (una factura y la
+        # confirmación del mismo pedido con las mismas cifras se declararían dos veces).
+        f2.mark_file_duplicates(out, res.get("markdown", ""), Path(res["pdf"]).name)
+        log(f"Fase 4: {len(out) - n_out} factura(s) nueva(s) separada(s) por Claude (ids {n_out}..{len(out) - 1})")
     costes = [c.get("coste_api_usd") or 0 for c in f2.MODEL_RAW.get("claude", [])[antes:]]
-    log(f"Fase 4: {n} de {len(candidatas)} resuelta(s); coste Claude API del documento {sum(costes):.4f} USD")
+    log(f"Fase 4: {n} factura(s) sin revisión de {len(candidatas)} en revisión; coste Claude API del documento "
+        f"{sum(costes):.4f} USD")
     return n
