@@ -276,10 +276,13 @@ def comprobar(p, leido):
     for l in p.get("lineas") or []:
         desc = str(l.get("descripcion") or "").strip()
         amt, unit = _cifra(l.get("importe")), _cifra(l.get("precio_unitario"))
+        # Cantidad del modelo tal cual: sin dato -> 1 (asumida, como en la fase 2); un 0 se queda en 0 (34511: un artículo
+        # no servido, impreso con cantidad 0, salía como 1 x 0.00 porque `0 or 1` daba 1) y manda a revisión.
+        raw_qty = l.get("cantidad")
         try:
-            qty = int(Decimal(str(l.get("cantidad") or 1)))
+            qty = 1 if raw_qty is None or str(raw_qty).strip() == "" else int(Decimal(str(raw_qty)))
         except (InvalidOperation, ValueError):
-            qty = 0
+            qty = None
         key = p1.squash(desc)[:20]
         if not desc or not leido.descripcion(desc):
             fallos.append(f"description not in the OCR text: «{desc[:40]}»")
@@ -290,12 +293,15 @@ def comprobar(p, leido):
             # ser gratis o no enviado (B/O) y el papel no lo dice (34279: 7.75 -> 0.00; Claude unas veces omite esas
             # líneas y otras las lista). Una fila a 0.00 sin precio («Free Shipping Promotion», 33115) no frena.
             fallos.append(f"item «{desc[:30]}» printed with amount 0.00: free or not shipped, the paper does not say")
-        if qty < 1:
+        if qty == 0:
+            fallos.append(f"quantity of «{desc[:30]}» is 0 (not shipped?): check whether it is declared")
+        elif qty is None or qty < 1:
             fallos.append(f"quantity of «{desc[:30]}» is not a whole number ≥ 1")
         elif qty > 1 and not ((unit is not None and f"{unit}" in impresos and amt is not None and qty * unit == amt)
                               or f2.qty_printed(qty, sq_text, key)):
             fallos.append(f"quantity {qty} of «{desc[:30]}» is not backed by a printed unit price or quantity")
-        lineas.append({"desc": desc, "qty": max(qty, 1), "amount": f"{amt}" if amt is not None else "",
+        lineas.append({"desc": desc, "qty": qty if qty is not None and qty >= 0 else 1,
+                       "amount": f"{amt}" if amt is not None else "",
                        "unit": f"{unit}" if unit is not None and f"{unit}" in impresos else ""})
     if not lineas:
         fallos.append("no item lines")
@@ -431,7 +437,7 @@ def _lineas_json(lineas, leido, divisa, pagina, estimadas, en_revision):
         ev = {"descripcion": "leido" if leido.descripcion(l["desc"]) else "modelo",
               "importe_linea": ("leido" if printed_amt else "modelo") if l["amount"] else "",
               "precio_unitario": "leido" if l["unit"] else "", "cantidad": qty_ev}
-        ocr = {"precio_unitario": l["unit"] or (f"{amt / l['qty']:.2f}" if amt is not None else ""),
+        ocr = {"precio_unitario": l["unit"] or (f"{amt / l['qty']:.2f}" if amt is not None and l["qty"] else ""),
                "cantidad_impresa": qty_ev == "leido",
                "vendedor": "", "seguimiento": "", "estado_envio": "", "condicion": "", "pagina": pagina,
                "origen": "claude",
