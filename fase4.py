@@ -62,7 +62,8 @@ API_URL = "https://api.anthropic.com/v1/messages"
 CONFIG_FILE = HERE / "scania_config.json"
 MAX_FICHAS_IMAGEN = 4784  # tope de fichas por imagen de la API (alta resolución)
 MAX_LADO = 2400  # px del lado mayor de cada página (alta resolución de la API: hasta 2576)
-TIMEOUT = 300
+MAX_TOKENS = 24000  # salida: pensamiento + JSON (8000 se agotaron solo pensando en 34196)
+TIMEOUT = 900  # s; una salida larga sin streaming tarda minutos
 
 
 def _clave():
@@ -142,9 +143,16 @@ Answer ONLY with this JSON (no text before or after):
  "subtotal": "", "envio": "", "impuestos": [{"concepto": "", "importe": ""}], "descuentos": [{"concepto": "", "importe": ""}],
  "otros_cargos": [{"concepto": "", "importe": ""}], "total": "", "completa": true, "fuera": "", "explicacion": ""}
 Use "" for values that are not printed.
-
-OCR text of these pages:
 """
+PROMPT_TEXTO = "\nOCR text of these pages:\n"
+
+
+def _prompt(texto, pista=""):
+    """Prompt completo: instrucciones, la pista de qué documento leer (solo si la factura comparte páginas con otra del
+    mismo archivo: dos pedidos en la misma hoja, 34142) y el texto OCR."""
+    aviso = (f"\nIMPORTANT: these pages hold more than one order or invoice. Read ONLY the one whose printed order or "
+             f"invoice number is {pista}; list every other document on the pages in \"fuera\".\n") if pista else ""
+    return PROMPT + aviso + PROMPT_TEXTO + texto
 
 
 # ----------------------------------------------------------------------------- llamada al modelo
@@ -159,27 +167,31 @@ def _paginas_png(pdf, paginas):
     return out
 
 
-def _llamar_api(pngs, texto):
+def _llamar_api(pngs, texto, pista=""):
+    """Una petición a la Claude API (imágenes + texto). max_tokens cubre el pensamiento del modelo (Sonnet 5.5 piensa por
+    defecto y cuenta en la salida: 34196, 14 páginas y 208 líneas, gastó los 8000 de antes en pensar y no escribió nada,
+    0.32 USD tirados) y el JSON de una factura larga. El `stop_reason` vuelve en `uso` para saber si se cortó."""
     content = [{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": base64.b64encode(p).decode()}}
                for p in pngs]
-    content.append({"type": "text", "text": PROMPT + texto})
+    content.append({"type": "text", "text": _prompt(texto, pista)})
     r = requests.post(API_URL, timeout=TIMEOUT, headers={"x-api-key": _clave(), "anthropic-version": "2023-06-01",
                                                           "content-type": "application/json"},
-                      json={"model": modelo(), "max_tokens": 8000, "messages": [{"role": "user", "content": content}]})
+                      json={"model": modelo(), "max_tokens": MAX_TOKENS, "messages": [{"role": "user", "content": content}]})
     r.raise_for_status()
     d = r.json()
     u = d.get("usage", {})
     ent = u.get("input_tokens", 0) + u.get("cache_creation_input_tokens", 0) + u.get("cache_read_input_tokens", 0)
     return ("".join(b.get("text", "") for b in d.get("content", []) if b.get("type") == "text"),
-            {"fichas_entrada": ent, "fichas_salida": u.get("output_tokens", 0), "estimado": False})
+            {"fichas_entrada": ent, "fichas_salida": u.get("output_tokens", 0), "estimado": False,
+             "stop_reason": d.get("stop_reason")})
 
 
-def _llamar_cli(pngs, texto):
+def _llamar_cli(pngs, texto, pista=""):
     with tempfile.TemporaryDirectory(prefix="fase4_") as tmp:
         for k, p in enumerate(pngs, 1):
             (Path(tmp) / f"pagina{k}.png").write_bytes(p)
         prompt = (f"Read the page images pagina1.png..pagina{len(pngs)}.png in this folder with the Read tool, then follow "
-                  "these instructions.\n\n" + PROMPT + texto)
+                  "these instructions.\n\n" + _prompt(texto, pista))
         r = subprocess.run(["claude", "-p", "--model", modelo(), "--allowedTools", "Read", "--output-format", "json"],
                            input=prompt, capture_output=True, text=True, encoding="utf-8", cwd=tmp, timeout=TIMEOUT,
                            shell=os.name == "nt")
@@ -217,6 +229,11 @@ def comprobar(p, leido):
     fuera = str(p.get("fuera") or "").strip()
     if fuera:
         fallos.append(f"the AI model reports other document(s) on these pages that it did not include: {fuera[:300]}")
+    # El prompt pide `explicacion` vacía si la factura está completa y cuadra: cualquier texto es el modelo avisando de
+    # algo que una persona tiene que ver. De las 45 facturas resueltas hasta el 2026-10-29, las 7 con explicación eran
+    # archivos con varios documentos (34293: «…a separate G2 Wireless sales order (22540.00) that was not included»).
+    if str(p.get("explicacion") or "").strip():
+        fallos.append("the AI model reports a problem on the paper (see its explanation)")
     for l in p.get("lineas") or []:
         desc = str(l.get("descripcion") or "").strip()
         amt, unit = _cifra(l.get("importe")), _cifra(l.get("precio_unitario"))
@@ -298,8 +315,17 @@ def perdidas(viejas, nuevas, impresos):
 
 # ----------------------------------------------------------------------------- aplicar a una factura
 
-def _texto_factura(res, paginas):
-    return divisas.invoice_text(res["markdown"], paginas) or res["markdown"]
+def _texto_factura(res, paginas, para_claude=False):
+    """Texto de GLM-OCR de las páginas de la factura (página completa + tablas de regiones). A Claude va SIN la sección
+    «### Verificación de importes» de cada página: es un diagnóstico de SCANIA, no el papel (el 27B tampoco la recibe);
+    para `Leido` se usa entero (sus cifras ya están en las tablas, no se pierde nada)."""
+    md = res["markdown"]
+    if not para_claude:
+        return divisas.invoice_text(md, paginas) or md
+    parts = re.split(r"(?m)^## Página (\d+)\s*$", md)
+    a, b = paginas
+    paginas_md = [parts[i + 1] for i in range(1, len(parts) - 1, 2) if a <= int(parts[i]) <= b] or [md]
+    return "\n".join(p.split(f2.VERIF_HEADER)[0].rstrip() for p in paginas_md)
 
 
 class Leido:
@@ -347,25 +373,28 @@ def _sq_text(texto):
             + p1.squash(re.sub(r"\(?-?\s*(?:US)?\$\s*\d[\d,]*(?:\.\d{2})?\)?", " ", t)))
 
 
-def resolver(doc, res, log, llamar=None):
-    """Intenta resolver UNA factura en revisión. Devuelve True si la dejó sin revisión."""
+def resolver(doc, res, log, llamar=None, pista=""):
+    """Intenta resolver UNA factura en revisión. Devuelve True si la dejó sin revisión. `pista`: número de pedido impreso
+    que Claude debe leer cuando la factura comparte páginas con otra (ver `aplicar`)."""
     paginas = (doc.get("ocr") or {}).get("paginas") or [1, res.get("n_pages") or 1]
     texto = _texto_factura(res, paginas)
     llamar = llamar or (_llamar_api if modo() == "api" else _llamar_cli)
     t0 = time.time()
     try:
-        crudo, uso = llamar(_paginas_png(res["pdf"], paginas), texto)
+        crudo, uso = llamar(_paginas_png(res["pdf"], paginas), _texto_factura(res, paginas, para_claude=True), pista)
         p = _respuesta(crudo)
     except Exception as e:  # noqa: BLE001  sin red, sin saldo, CLI ausente: la factura sigue como estaba
         log(f"  fase 4: factura {doc['id']}: Claude no respondió ({type(e).__name__}: {str(e)[:120]})")
         return False
     coste = coste_api(uso.get("fichas_entrada", 0), uso.get("fichas_salida", 0))
     f2.MODEL_RAW.setdefault("claude", []).append({"factura": doc["id"], "paginas": paginas, "modelo": modelo(),
-                                                  "respuesta": crudo, "uso": uso, "coste_api_usd": coste,
-                                                  "segundos": round(time.time() - t0, 1)})
+                                                  "pista": pista, "respuesta": crudo, "uso": uso,
+                                                  "coste_api_usd": coste, "segundos": round(time.time() - t0, 1)})
     log(f"  fase 4: factura {doc['id']}: Claude API {modelo()}, {uso.get('fichas_entrada', 0)} fichas de entrada + "
         f"{uso.get('fichas_salida', 0)} de salida = {coste if coste is not None else '?'} USD"
         + (" (estimado)" if uso.get("estimado") else ""))
+    if uso.get("stop_reason") == "max_tokens":
+        log(f"  fase 4: factura {doc['id']}: respuesta CORTADA por max_tokens ({MAX_TOKENS}): la llamada no sirve")
     if not isinstance(p, dict):
         log(f"  fase 4: factura {doc['id']}: respuesta sin JSON")
         return False
@@ -471,6 +500,11 @@ def resolver(doc, res, log, llamar=None):
     return True
 
 
+def _solapan(a, b):
+    """¿Dos rangos de páginas [a1, a2] y [b1, b2] comparten alguna página?"""
+    return bool(a and b) and a[0] <= b[1] and b[0] <= a[1]
+
+
 def aplicar(out, res, log, llamar=None):
     """Recorre las facturas del documento y pasa por la Claude API las que están en revisión (no DUPLICADO)."""
     if llamar is None and modo() == "off":
@@ -482,7 +516,21 @@ def aplicar(out, res, log, llamar=None):
         return 0
     log(f"Fase 4 (Claude, {modo() if llamar is None else 'prueba'}): {len(candidatas)} factura(s) en revisión")
     antes = len(f2.MODEL_RAW.get("claude", []))
-    n = sum(1 for d in candidatas if resolver(d, res, log, llamar))
+    n = 0
+    for d in candidatas:
+        # Facturas que comparten páginas con otra del mismo archivo: Claude recibe la misma imagen para las dos y no sabe
+        # cuál es cada una (34142: los dos envíos de un pedido de Amazon salieron con los mismos 3 artículos). Con número
+        # de pedido impreso propio se le dice cuál leer; mismo número (envíos) o sin número, no se manda.
+        otras = [o for o in out if o is not d and _solapan(o.get("ocr", {}).get("paginas"), d.get("ocr", {}).get("paginas"))]
+        pista = ""
+        if otras:
+            ref = (d.get("referencia") or "").strip()
+            if not ref or any((o.get("referencia") or "").strip() == ref for o in otras):
+                log(f"  fase 4: factura {d['id']} comparte páginas con la factura {otras[0]['id']} "
+                    f"({'mismo pedido' if ref else 'sin número de pedido'}): no se manda a Claude")
+                continue
+            pista = ref
+        n += resolver(d, res, log, llamar, pista)
     costes = [c.get("coste_api_usd") or 0 for c in f2.MODEL_RAW.get("claude", [])[antes:]]
     log(f"Fase 4: {n} de {len(candidatas)} resuelta(s); coste Claude API del documento {sum(costes):.4f} USD")
     return n
