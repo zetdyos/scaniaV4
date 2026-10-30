@@ -285,9 +285,10 @@ def comprobar(p, leido):
             fallos.append(f"description not in the OCR text: «{desc[:40]}»")
         if amt is None or f"{amt}" not in impresos:
             fallos.append(f"amount {amt} of «{desc[:30]}» is not printed")
-        elif amt == 0:
-            # La misma regla que la fase 2 (decisión del usuario): un artículo impreso a 0.00 puede ser gratis o no
-            # enviado (B/O) y el papel no lo dice. 34279: Claude unas veces omite esas líneas y otras las lista.
+        elif amt == 0 and unit and f"{unit}" in impresos:
+            # La misma regla que la fase 2 (decisión del usuario): un artículo a 0.00 CON precio unitario impreso puede
+            # ser gratis o no enviado (B/O) y el papel no lo dice (34279: 7.75 -> 0.00; Claude unas veces omite esas
+            # líneas y otras las lista). Una fila a 0.00 sin precio («Free Shipping Promotion», 33115) no frena.
             fallos.append(f"item «{desc[:30]}» printed with amount 0.00: free or not shipped, the paper does not say")
         if qty < 1:
             fallos.append(f"quantity of «{desc[:30]}» is not a whole number ≥ 1")
