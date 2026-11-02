@@ -1658,6 +1658,20 @@ def ppocr_text(pdf, pages, log=None):
     return "\n".join(out)
 
 
+def pp_table_rows(pdf, pages):
+    """Renglones de PP-OCRv6 de esas páginas como filas de tabla (una celda por caja) para `qty_from_table`: cuando GLM
+    pierde las columnas de cantidad y precio y no hay tabla de regiones (34300, Home Depot: «… Pre-Lit 2 $52.96» en un
+    renglón de PP-OCRv6), la cantidad impresa en la misma fila que la descripción sigue contando como impresa. PP-OCRv6
+    es lector de cifras (decisión del usuario 2026-10-22; para la cantidad, 2026-11-02). [] si no está disponible."""
+    out = []
+    for p in pages:
+        try:
+            out += [[t for _, _, t in rw["toks"]] for rw in ppocr_rows(pdf, p)]
+        except Exception:  # noqa: BLE001  sin PP-OCRv6 la cantidad se comprueba como antes
+            return []
+    return out
+
+
 def ppocr_rows(pdf, page_idx, timeout=120):
     """Renglones de una página según PP-OCRv6: [{c (centro y), toks [(x0, x1, texto)], text, money, span, alpha_x}]."""
     key = (str(pdf), page_idx)
@@ -1893,6 +1907,7 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
         # «xN»/«Qty N» junto a la descripción o al inicio del renglón; si no, la evidencia la juzga (cantidad x precio
         # literal = importe -> «aritmetica»; si no, «modelo» -> revisión).
         rows = table_rows(md)
+        qty_rows = rows + pp_table_rows(res["pdf"], pages)  # la cantidad, también en los renglones de PP-OCRv6
         literal = lambda v: bool(v) and (v in ocr_amounts or v in ocr_units)
         # Alternativa «precio por unidad» (ver build_all): solo en la segunda pasada, y solo se acepta si la factura
         # entera termina SIN revisión (todo lo impreso cuadra exacto). La cantidad sigue siendo la del 27B.
@@ -1927,7 +1942,7 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
             # COMPRUEBA contra lo impreso, nunca la sustituye (decisión del usuario 2026-10-20: «los modelos están ahí
             # por una razón, no inventes tú»; 32226: «$39.29 x2», el 27B dio 2 y una regla del código lo pasó a 1).
             # Si no se puede respaldar, la evidencia de la cantidad queda «modelo» y la factura va a revisión.
-            q = qty_from_table(l, rows)
+            q = qty_from_table(l, qty_rows)
             if q is not None:
                 if q == l["qty"]:
                     l["qty_printed"] = True
@@ -2045,6 +2060,23 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
                 if d.get("importe") and float(d["importe"]) > 0 and d["importe"] in paid_amts:
                     issues.append(f"discount «{d['concepto'][:40]}» {d['importe']} is also listed as a payment "
                                   f"(gift card or store credit applied is not a discount)")
+            # Un pago impreso tal que total − pago = otro total impreso del resumen («Total 185.33, Gift Card Amount
+            # −80.02, Grand Total 105.31»: 33430 #8, 28472 #1). Lo impreso no distingue una gift card dentro del resumen
+            # (descuento, criterio del usuario 2026-10-23, 27600) de un pago o anticipo («Payment Amount», «Advance
+            # Amount»: 32854, 33134), y una lista de palabras no se acepta: revisión, la persona decide (usuario,
+            # 2026-11-02). Medido sobre el historial: 7 gift cards de Amazon salían sin revisión con el total sin restar.
+            totals_lit = {o["amount"] for o in others if o.get("kind") == "subtotal_or_total" and o.get("amount")
+                          and o["amount"] in ocr_amounts}
+            for o in others:
+                a = o.get("amount")
+                if o.get("kind") != "payment" or not a or a not in ocr_amounts or not float(a) or not total:
+                    continue
+                rest = next((t for t in totals_lit if t != total and abs(float(total) - abs(float(a)) - float(t)) < 0.005), None)
+                if rest is not None:
+                    issues.append(f"«{(o.get('desc') or '')[:40]}» {abs(float(a)):.2f} is printed inside the order summary "
+                                  f"between total {total} and {rest}: gift card (subtracts) or payment (does not) "
+                                  f"cannot be told from the print; declared total {total}")
+                    break
         else:
             fields["envio"], fields["impuestos"] = cands["envio"][0], cands["impuestos"][0]
             # Las líneas pueden cuadrar con el "Item(s) Subtotal" y aun así la cabecera no cerrar con el total

@@ -298,7 +298,8 @@ def comprobar(p, leido):
         elif qty is None or qty < 1:
             fallos.append(f"quantity of «{desc[:30]}» is not a whole number ≥ 1")
         elif qty > 1 and not ((unit is not None and f"{unit}" in impresos and amt is not None and qty * unit == amt)
-                              or f2.qty_printed(qty, sq_text, key)):
+                              or f2.qty_printed(qty, sq_text, key)
+                              or leido.cantidad(qty, desc, f"{amt}" if amt is not None else "")):
             fallos.append(f"quantity {qty} of «{desc[:30]}» is not backed by a printed unit price or quantity")
         lineas.append({"desc": desc, "qty": qty if qty is not None and qty >= 0 else 1,
                        "amount": f"{amt}" if amt is not None else "",
@@ -343,21 +344,37 @@ def comprobar(p, leido):
     return fallos, lineas, cab, listas
 
 
-def perdidas(viejas, nuevas, impresos):
+def perdidas(viejas, nuevas, impresos, leido=None):
     """Líneas `goods` de la lectura anterior con importe IMPRESO que ninguna línea de Claude conserva (por importe, una a
     una: dos artículos a 375.00 necesitan dos líneas a 375.00). Una cifra impresa que desaparece nunca se acepta en
     silencio (34293: 13 líneas de G2 Wireless, 22540.00). No cuentan: importe 0.00 (sin valor: 34279, 31059, 33115) y la
     cifra que sigue en una línea de Claude como precio unitario impreso de cantidad > 1 (el 27B dio el unitario como
-    importe y Claude lo corrigió: 32745 2 × 5.54 = 11.08, 33058 3 × 19.76 = 59.28)."""
+    importe y Claude lo corrigió: 32745 2 × 5.54 = 11.08, 33058 3 × 19.76 = 59.28). Tampoco la cifra que PP-OCRv6 NO
+    leyó cuando, para el mismo artículo (descripción, `saltos.same_text`), Claude da otra que PP-OCRv6 SÍ leyó y que se
+    diferencia en un solo carácter (la huella de una mala lectura): la cifra no está perdida, está leída de dos maneras
+    (34701, impresora matricial: GLM 196.90 en la página completa y 196.80 en la tabla de regiones, PP-OCRv6 y Claude
+    196.80; el total, 1286.94, GLM lo leyó 1886.94, y `comprobar` exige que las líneas de Claude cuadren con él)."""
+    import saltos
     libres = collections.Counter(l["amount"] for l in nuevas if l["amount"])
     libres.update(l["unit"] for l in nuevas if l["unit"] and l["qty"] > 1)
-    out = []
+    out, pendientes = [], []
     for l in viejas:
         a = l.get("importe_linea") or ""
         if l.get("line_kind") != "goods" or not a or a not in impresos or Decimal(a) == 0:
             continue
         if libres[a] > 0:
             libres[a] -= 1
+        else:
+            pendientes.append(l)
+    for l in pendientes:
+        a = l["importe_linea"]
+        otra = None
+        if leido is not None and leido.pp_importes and a not in leido.pp_importes:
+            otra = next((n for n in nuevas if n["amount"] and libres[n["amount"]] > 0 and n["amount"] in leido.pp_importes
+                         and len(n["amount"]) == len(a) and sum(x != y for x, y in zip(n["amount"], a)) == 1
+                         and saltos.same_text(n["desc"], l.get("descripcion") or "")), None)
+        if otra is not None:
+            libres[otra["amount"]] -= 1
         else:
             out.append(l)
     return out
@@ -383,18 +400,29 @@ class Leido:
     lectores (no generan texto): una cifra o una descripción que propone Claude cuenta como impresa si la leyó alguno."""
 
     def __init__(self, res, paginas, texto, log):
-        self.importes = f2.doc_amounts(texto) | f2.exact_cents(texto)
+        self.importes = self.glm_importes = f2.doc_amounts(texto) | f2.exact_cents(texto)
+        self.pp_importes, self.pp_rows = set(), []
         self.sq = _sq_text(texto)
         textos = [texto]
         try:
             pp = f2.ppocr_text(res["pdf"], list(range(paginas[0] - 1, paginas[1])), log)
-            self.importes |= f2.doc_amounts(pp) | f2.exact_cents(pp)
+            self.pp_importes = f2.doc_amounts(pp) | f2.exact_cents(pp) if pp else set()
+            self.importes = self.glm_importes | self.pp_importes
             self.sq += "|" + _sq_text(pp)
             textos.append(pp)
+            # renglones de PP-OCRv6 como filas de tabla: la cantidad impresa en la fila de la descripción (34300)
+            self.pp_rows = f2.pp_table_rows(res["pdf"], list(range(paginas[0] - 1, paginas[1]))) if pp else []
         except Exception:  # noqa: BLE001  sin PP-OCRv6 cuenta solo lo que leyó GLM
             pass
         import html
         self.palabras = {w for t in textos for w in _palabras(html.unescape(re.sub(r"<[^>]+>", " ", t)))}
+
+    def cantidad(self, qty, desc, amount):
+        """La cantidad impresa en la misma fila que la descripción en un renglón de PP-OCRv6 (`f2.qty_from_table`, la
+        comprobación de la fase 2 con las filas de tabla): GLM perdió las columnas Qty/Price y no hubo tabla de regiones
+        (34300, Home Depot: «… Pre-Lit 2 $52.96»)."""
+        return bool(self.pp_rows) and f2.qty_from_table({"desc": desc, "qty": qty, "unit": "", "amount": amount},
+                                                        self.pp_rows) == qty
 
     def descripcion(self, desc):
         """Cada palabra de la descripción la leyó un OCR (en el orden que sea: el código de pieza y el nombre pueden ir
@@ -431,7 +459,7 @@ def _lineas_json(lineas, leido, divisa, pagina, estimadas, en_revision):
         key = p1.squash(l["desc"])[:20]
         amt = Decimal(l["amount"]) if l["amount"] else None
         printed_amt = l["amount"] in leido.importes if l["amount"] else False
-        qty_ev = ("leido" if f2.qty_printed(l["qty"], leido.sq, key)
+        qty_ev = ("leido" if f2.qty_printed(l["qty"], leido.sq, key) or (l["qty"] > 1 and leido.cantidad(l["qty"], l["desc"], l["amount"]))
                   else "aritmetica" if l["qty"] > 1 and l["unit"] and amt is not None and l["qty"] * Decimal(l["unit"]) == amt
                   else "asumido" if l["qty"] == 1 else "modelo")
         ev = {"descripcion": "leido" if leido.descripcion(l["desc"]) else "modelo",
@@ -463,6 +491,12 @@ def _cabecera_revision(doc, pendientes, leido):
     """Cabecera de la factura que queda en revisión: solo cifras impresas; con varios documentos pendientes no hay una
     cabecera común (subtotal = suma de las líneas si todas tienen importe; lo demás vacío; el total queda como estaba)."""
     o = doc["ocr"]
+    if None in pendientes:  # con líneas de la lectura anterior (cobertura por páginas): subtotal de todas, nada más
+        ls = [l for l in doc["lineas"] if l.get("line_kind") == "goods"]
+        o["subtotal_articulos"] = (f"{sum(Decimal(l['importe_linea']) for l in ls)}"
+                                   if ls and all(l.get("importe_linea") for l in ls) else "")
+        o["envio"], o["impuestos"], o["descuentos"], o["other_charges"] = "", "", [], []
+        return
     lineas = [l for e in pendientes for l in e["lineas"]]
     o["subtotal_articulos"] = f"{sum(Decimal(l['amount']) for l in lineas)}" if lineas and all(l["amount"] for l in lineas) else ""
     if len(pendientes) != 1:
@@ -558,7 +592,7 @@ def resolver(doc, res, log, llamar=None, pista="", out=None):
     # Puerta de cobertura: nunca se pierde una cifra impresa. Lo que la lectura anterior leyó con importe impreso tiene
     # que seguir en la UNIÓN de las líneas de todos los documentos (34293: 22540.00 desaparecieron).
     union = [l for e in evals for l in e["lineas"]]
-    fuera = perdidas(doc["lineas"], union, leido.importes)
+    fuera = perdidas(doc["lineas"], union, leido.importes, leido)
     cobertura = ""
     if fuera:
         suma = sum(Decimal(l["importe_linea"]) for l in fuera)
@@ -566,10 +600,15 @@ def resolver(doc, res, log, llamar=None, pista="", out=None):
                      + "; ".join(f"«{l['descripcion'][:40]}» {l['importe_linea']}" for l in fuera[:6])
                      + ("; …" if len(fuera) > 6 else ""))
     facturables = [e for e in evals if e["facturable"]]
-    aceptadas = [e for e in facturables if not e["fallos"] and not fuera]
+    # Cobertura por páginas (decisión del usuario 2026-11-02; 31912: 7 facturas de ADI que validaban quedaban en revisión
+    # por los artículos tachados de un pedido de Amazon en otras páginas; 34160-B): un documento validado se acepta si
+    # ninguna cifra que falta cae en SUS páginas. Las líneas que faltan (`resto`) se quedan, con la lectura anterior, en
+    # la factura que va a revisión: nunca desaparece una cifra impresa.
+    aceptadas = [e for e in facturables if not e["fallos"] and not any(_en_paginas(l, e["paginas"]) for l in fuera)]
     if out is None and len(aceptadas) > 1:  # sin lista donde añadir facturas no se separa nada: todo a revisión
         aceptadas = []
     pendientes = [e for e in facturables if e not in aceptadas]
+    resto = [copy.deepcopy(l) for l in fuera] if aceptadas else []
     explicaciones = [f"AI reading (unverified): {_etiqueta(e, n) + ': ' if n > 1 else ''}{e['explicacion']}"
                      for e in evals if e["explicacion"]]
     o = doc["ocr"]
@@ -620,24 +659,37 @@ def resolver(doc, res, log, llamar=None, pista="", out=None):
             log(f"  fase 4: factura {doc['id']} sigue en revisión con su lectura anterior ({len(viejas)} líneas; Claude "
                 f"{len(pend_lineas)}, en ocr.fase4): " + "; ".join(fallos_pend)[:300])
             return 0
-    if pendientes:
+    if pendientes or resto:
         # La factura del grupo queda en LECTURA con los documentos no validados (se paga por la lectura de Claude: se
-        # aprovecha siempre; 33477: el 27B no vio los precios y salían 0 líneas), cada línea con su evidencia.
-        doc["lineas"] = pend_lineas
-        o["origen_lineas"] = "claude"
-        if len(pendientes) == 1 and len(facturables) == 1:
+        # aprovecha siempre; 33477: el 27B no vio los precios y salían 0 líneas), cada línea con su evidencia, y con las
+        # líneas de la lectura anterior que ningún documento aceptado cubre (`resto`).
+        doc["lineas"] = pend_lineas + resto
+        for i, l in enumerate(doc["lineas"]):
+            l["seq"] = i
+        if pend_lineas:
+            o["origen_lineas"] = "claude"
+        if resto:
+            pags = [p for e in pendientes for p in e["paginas"]] + [_pagina(l) for l in resto if _pagina(l)]
+            o["paginas"] = [min(pags), max(pags)] if pags else list(paginas)
+        elif len(pendientes) == 1 and len(facturables) == 1:
             o["paginas"] = list(paginas)
         elif len(pendientes) == 1:
             o["paginas"] = pendientes[0]["paginas"]
-        if n > 1:  # la factura en revisión ya no es el grupo entero: la referencia y el total del grupo no le pertenecen
-            doc["referencia"] = pendientes[0]["referencia"] if len(pendientes) == 1 else ""
+        if n > 1 or resto:  # la factura en revisión ya no es el grupo entero: la referencia y el total no le pertenecen
+            doc["referencia"] = pendientes[0]["referencia"] if len(pendientes) == 1 and not resto else ""
             doc.update(total="", total_is_printed=False)
             o.update({key: "" for key in ORDEN_TEXTO if key in o})
-            if len(pendientes) == 1:
+            if len(pendientes) == 1 and not resto:
                 o["fecha_pedido"] = pendientes[0]["fecha"]
-        _cabecera_revision(doc, pendientes, leido)
-        notas = ["item lines read by the AI model (Claude), not confirmed: " + " | ".join(fallos_pend)]
-        if cobertura:
+        _cabecera_revision(doc, pendientes if not resto else pendientes + [None], leido)
+        notas = (["item lines read by the AI model (Claude), not confirmed: " + " | ".join(fallos_pend)]
+                 if pendientes else [])
+        if resto:
+            notas.append(f"{len(resto)} item line(s) of the OCR reading with printed amounts are not in any document "
+                         f"the AI model (Claude) validated; kept here for review: "
+                         + "; ".join(f"«{l['descripcion'][:40]}» {l['importe_linea']}" for l in resto[:6])
+                         + ("; …" if len(resto) > 6 else ""))
+        elif cobertura:
             notas.append(f"AI reading (Claude) {cobertura}")
         notas += explicaciones
         o["incidencias"] = notas
@@ -646,7 +698,7 @@ def resolver(doc, res, log, llamar=None, pista="", out=None):
             f"{f' ({len(pendientes)} de {n} documentos)' if n > 1 else ''}: " + "; ".join(fallos_pend)[:300])
     nuevas_facturas = []
     for j, e in enumerate(aceptadas):
-        if j == 0 and not pendientes:  # el primer documento validado ocupa la factura del grupo (mismo id)
+        if j == 0 and not pendientes and not resto:  # el primer documento validado ocupa la factura del grupo (mismo id)
             doc["lineas"] = e["nuevas"]
             o["origen_lineas"] = "claude"
             o["incidencias"] = []
@@ -669,6 +721,20 @@ def resolver(doc, res, log, llamar=None, pista="", out=None):
                 f"{len(e['nuevas'])} líneas, total {nueva['total']}, sin revisión")
     out.extend(nuevas_facturas) if nuevas_facturas else None
     return len(aceptadas)
+
+
+def _pagina(l):
+    """Página (1 = primera del archivo) de una línea de la fase 2, o None."""
+    try:
+        return int((l.get("ocr") or {}).get("pagina"))
+    except (TypeError, ValueError):
+        return None
+
+
+def _en_paginas(l, paginas):
+    """¿La línea de la lectura anterior está en esas páginas [a, b]? Sin página conocida, sí (puede ser de cualquiera)."""
+    p = _pagina(l)
+    return p is None or paginas[0] <= p <= paginas[1]
 
 
 def _solapan(a, b):
