@@ -11,7 +11,13 @@ last_busy_report = 0
 JOBS = str(__import__("pathlib").Path(__file__).resolve().parents[1] / "demo_jobs")
 DEPLOY = "20261023-2041"  # lote tras ed4e454 (auditoría del flujo): se compara con la corrida anterior del mismo PDF
 count = {"docs": 0, "facturas": 0, "revision": 0, "imagen": 0, "estimadas": 0, "sin_estimar": 0, "convertidas": 0, "duplicados": 0, "dup_limpios": 0}  # desde que arranca el vigilante
-count.update(json.loads(__import__("os").environ.get("VIGILAR_CONTADOR") or "{}"))  # seguir un recuento anterior
+# El recuento se guarda en disco tras cada trabajo (fuera de git, junto a verdad/27b.jsonl): tras un reinicio de la sesión
+# o del PC, VIGILAR_CONTADOR=continuar sigue desde ahí; un JSON sigue ese recuento; sin la variable, desde cero.
+CONTADOR_FILE = __import__("pathlib").Path(__file__).resolve().parents[1] / "verdad" / "vigilante_contador.json"
+_seed = __import__("os").environ.get("VIGILAR_CONTADOR") or "{}"
+if _seed.strip() == "continuar":
+    _seed = json.dumps(json.loads(CONTADOR_FILE.read_text(encoding="utf-8"))["contador"]) if CONTADOR_FILE.exists() else "{}"
+count.update(json.loads(_seed))  # seguir un recuento anterior
 
 
 def summary(job_id):
@@ -129,6 +135,10 @@ while True:
                       f"{count['revision']} ({_pc(count['revision'], _f)}) | por imagen {count['imagen']} ({_pc(count['imagen'], _f)}) | "
                       f"fase 3: {count['estimadas']} de {_l3} línea(s) sin importe estimadas ({_pc(count['estimadas'], _l3)}) | "
                       f"moneda convertida {count['convertidas']} ({_pc(count['convertidas'], _f)})", flush=True)
+                try:
+                    CONTADOR_FILE.write_text(json.dumps({"guardado": time.strftime("%Y-%m-%d %H:%M:%S"), "contador": count}, ensure_ascii=False), encoding="utf-8")
+                except OSError as _e:
+                    print(f"{now}   (no se pudo guardar el contador: {_e})", flush=True)
             except Exception as e:  # noqa: BLE001
                 print(f"{now}   (contador: {e})", flush=True)
             if j.get("n_review"):
