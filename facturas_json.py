@@ -1526,9 +1526,12 @@ def parse_blocks(regions):
                     v = sq_amount(norm, pats)
                     if v:
                         cur[key] = v
-                # envío bonificado: renglón con importe en negativo igual al envío del bloque («Free Shipping: -USD 6.99»)
+                # envío bonificado: renglón con importe en negativo igual al envío del bloque («Free Shipping: -USD 6.99»).
+                # La cifra no tiene por qué cerrar la fila: en el diseño de dos columnas la tabla de regiones junta la
+                # dirección con el resumen («…freeshipping:-$6.99unitedstates…», 34629/34626); basta con que no siga
+                # otra cifra.
                 if (cur["envio"] and float(cur["envio"]) > 0 and not re.search(r"savings|discount|promotionapplied", norm)
-                        and re.search(r"[a-z]:?-(?:usd)?-?\$?" + re.escape(cur["envio"]) + r"$", norm)):
+                        and re.search(r"[a-z]:?-(?:usd)?-?\$?" + re.escape(cur["envio"]) + r"(?![\d.,])", norm)):
                     cur["envio_bonificado"] = cur["envio"]
                 if "totalforthisshipment" in norm:
                     t = p1.first_amount(norm.split("totalforthisshipment", 1)[1])
