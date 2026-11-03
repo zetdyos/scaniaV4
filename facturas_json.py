@@ -1624,6 +1624,7 @@ def build_shipment_invoice(inv_id, res, inv, block, k, n, order_fields, order_to
 # geometría en saltos.py (2026-10-23), que sustituyó a los cinco parches anteriores (join_split_items, fix_page_breaks,
 # fix_block_breaks, block_break, row_break). Servicio en el host de modelos (scania-mdl-ppocr, GPU1, :8089, ~1 s/página).
 PPOCR_SERVER = f"http://{p1.MODELS_HOST}:8089"
+PPOCR_ESPERA = float(os.environ.get("PPOCR_ESPERA", "90"))  # s de reintento si PP-OCRv6 se está reiniciando
 PPOCR_DPI = 200
 # Importe en un renglón de PP-OCR: con «$» admite 3-4 decimales ($9.9776); sin «$», 2 decimales y sufijo de moneda
 # opcional (46.79 US$, «USS» mal leído). Parte entera con o sin separador de miles (1,635.12 / 1635.12). Nunca
@@ -1639,7 +1640,21 @@ def ppocr_tokens(pdf, page_idx, timeout=120):
     if key not in _PPOCR_CACHE:
         with fitz.open(pdf) as doc:
             pix = doc[page_idx].get_pixmap(dpi=PPOCR_DPI, alpha=False)
-        r = requests.post(f"{PPOCR_SERVER}/ocr", data=pix.tobytes("png"), timeout=timeout)
+        # PP-OCRv6 se reinicia solo cuando su memoria de GPU llega al tope (app.py en .194, 2026-11-03): mientras
+        # arranca (~25 s) no acepta conexiones. Se reintenta hasta PPOCR_ESPERA s antes de darlo por caído, para que
+        # una factura no vaya a revisión solo por coincidir con ese reinicio.
+        fin = time.time() + PPOCR_ESPERA
+        while True:
+            try:
+                r = requests.post(f"{PPOCR_SERVER}/ocr", data=pix.tobytes("png"), timeout=timeout)
+                if r.status_code in (502, 503) and time.time() < fin:
+                    time.sleep(5)
+                    continue
+                break
+            except requests.ConnectionError:
+                if time.time() >= fin:
+                    raise
+                time.sleep(5)
         r.raise_for_status()
         j = r.json()
         _PPOCR_CACHE[key] = ([(b[0], b[1], b[2], b[3], t.strip()) for t, b in zip(j["texts"], j["boxes"]) if t.strip()],
