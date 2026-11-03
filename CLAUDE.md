@@ -139,7 +139,7 @@ Método (pedido por el usuario: "no arregles esto y rompas otra cosa"): cachear 
 
 ## Vigilancia de un lote de WTCP («arranca el vigilante»)
 
-`herramientas/vigilar.py` solo CUENTA (trabajos, facturas, a revisión, fase 3, moneda): no juzga nada. El auditor es Claude, y la vigilancia es esto, trabajo por trabajo, en cuanto cada uno termina:
+`herramientas/vigilar.py` solo CUENTA (trabajos, facturas, a revisión, fase 3, moneda y, desde el 2026-11-02, las clasificaciones: resumen cada 30 min y avisos al momento; el usuario: «no hay análisis de invoices, pero tienes que estar recibiendo clasificaciones»): no juzga nada. El auditor es Claude, y la vigilancia es esto, trabajo por trabajo, en cuanto cada uno termina:
 1. Arrancar `vigilar.py` con el contador de la corrida en cero (o sembrado con `VIGILAR_CONTADOR` si el usuario lo pide) y porcentajes siempre.
 2. Por cada trabajo terminado: `herramientas/auditar.py JOB` y mirar **cada página en imagen** (PNG en `verdad/png/JOB/`), comparando cada línea (descripción, cantidad, importe), cabecera y total con el papel. Nunca dar una factura por buena solo por el texto OCR o porque la suma cuadra (un corrimiento de precios conserva la suma: 27692).
 3. Informar por factura, sin que el usuario lo pida:

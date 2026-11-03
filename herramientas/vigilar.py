@@ -18,6 +18,125 @@ _seed = __import__("os").environ.get("VIGILAR_CONTADOR") or "{}"
 if _seed.strip() == "continuar":
     _seed = json.dumps(json.loads(CONTADOR_FILE.read_text(encoding="utf-8"))["contador"]) if CONTADOR_FILE.exists() else "{}"
 count.update(json.loads(_seed))  # seguir un recuento anterior
+for _k in ("clasif_llamadas", "clasif_no200", "clasif_entregadas", "clasif_segura", "clasif_dudosa", "clasif_no", "clasif_mandadas"):
+    count.setdefault(_k, 0)
+
+# ----------------------------------------------------------------------------- clasificaciones (2026-11-02)
+# WTCP pide clasificaciones aparte (POST /api/classify, contrato §8) y no son trabajos: no salen en /api/jobs. Se vigilan
+# leyendo, sin tocar nada: el registro de la API (llamadas y su código), clasif_jobs/en_curso.json (descripciones pedidas
+# y no entregadas: una clave que desaparece es una entregada) y el /api/health y /api/lines/{id} del clasificador :8092.
+REPO = __import__("pathlib").Path(__file__).resolve().parents[1]
+__import__("sys").path.insert(0, str(REPO))
+import re  # noqa: E402
+import clasificacion  # noqa: E402  solo para `resultado` (estado de una línea terminada) y las constantes
+API_LOG = REPO / "logs" / "api.out.log"
+EN_CURSO = REPO / "clasif_jobs" / "en_curso.json"
+CLASIF_CADA = float(__import__("os").environ.get("VIGILAR_CLASIF_CADA", "1800"))  # resumen cada 30 min
+CLASSIFY_RE = re.compile(r'"POST /api/classify(/feedback)? HTTP/[\d.]+" (\d{3})')
+
+
+def _ventana():
+    return {"llamadas": 0, "codigos": {}, "feedback": 0, "nuevas": 0, "mandadas": 0, "entregadas": 0,
+            "segura": 0, "dudosa": 0, "no": 0}
+
+
+cl = {"log_pos": None, "en": None, "linea": {}, "cargadas": None, "arriba": True, "vivo": True, "t": time.time(),
+      "ventana": _ventana()}
+
+
+def _clasif(now):
+    w = cl["ventana"]
+    # 1) llamadas de WTCP en el registro de la API (se reescribe en cada despliegue: si encoge, desde el principio)
+    try:
+        size = API_LOG.stat().st_size
+        if cl["log_pos"] is None:
+            cl["log_pos"] = size
+        if size < cl["log_pos"]:
+            cl["log_pos"] = 0
+        with open(API_LOG, "rb") as f:
+            f.seek(cl["log_pos"])
+            chunk = f.read().decode("utf-8", "replace")
+            cl["log_pos"] = f.tell()
+        for m in CLASSIFY_RE.finditer(chunk):
+            if m.group(1):
+                w["feedback"] += 1
+                continue
+            code = m.group(2)
+            w["llamadas"] += 1
+            count["clasif_llamadas"] += 1
+            w["codigos"][code] = w["codigos"].get(code, 0) + 1
+            if code != "200":
+                count["clasif_no200"] += 1
+                print(f"{now} CLASIFICACIÓN: POST /api/classify respondió {code} a WTCP", flush=True)
+    except OSError:
+        pass
+    # 2) descripciones en curso: nuevas y entregadas (con el estado que dio el clasificador)
+    try:
+        en = json.loads(EN_CURSO.read_text(encoding="utf-8")) if EN_CURSO.exists() else {}
+    except (OSError, ValueError):
+        en = cl["en"] or {}
+    for k, v in en.items():
+        if v.get("line_id"):
+            cl["linea"][k] = v["line_id"]
+    if cl["en"] is not None:
+        w["nuevas"] += sum(1 for k in en if k not in cl["en"])
+        for k, v in en.items():  # un error nuevo del clasificador en una línea
+            if v.get("errores", 0) > (cl["en"].get(k) or {}).get("errores", 0):
+                print(f"{now} CLASIFICACIÓN: error del clasificador ({v['errores']} de {clasificacion.MAX_INTENTOS}) "
+                      f"en «{v['texto'][:60]}»", flush=True)
+        for k in [k for k in cl["en"] if k not in en]:
+            w["entregadas"] += 1
+            count["clasif_entregadas"] += 1
+            est = "no"
+            lid = cl["linea"].pop(k, None)
+            if lid:
+                try:
+                    r = clasificacion.resultado(get(f"{clasificacion.CLASIFICADOR_URL}/api/lines/{lid}?include=summary", 8))
+                    est = {"sugerencia_segura": "segura", "dudosa": "dudosa"}.get(r["estado"], "no")
+                except Exception:  # noqa: BLE001
+                    est = "no"
+            w[est] += 1
+            count["clasif_" + est] += 1
+    cl["en"] = en
+    # 3) el clasificador: arriba, trabajador vivo, líneas cargadas (las que manda SCANIA y las de su propia interfaz)
+    try:
+        q = get(f"{clasificacion.CLASIFICADOR_URL}/api/health", 5).get("queue") or {}
+        if not cl["arriba"]:
+            print(f"{now} CLASIFICADOR :8092 responde de nuevo", flush=True)
+        cl["arriba"] = True
+        if bool(q.get("worker_alive")) != cl["vivo"]:
+            print(f"{now} CLASIFICADOR :8092 trabajador {'vivo de nuevo' if q.get('worker_alive') else 'PARADO'}", flush=True)
+        cl["vivo"] = bool(q.get("worker_alive"))
+        n = q.get("batches_loaded")
+        if n is not None:
+            if cl["cargadas"] is not None and n >= cl["cargadas"]:
+                w["mandadas"] += n - cl["cargadas"]
+                count["clasif_mandadas"] += n - cl["cargadas"]
+            cl["cargadas"] = n
+    except Exception as e:  # noqa: BLE001
+        if cl["arriba"]:
+            print(f"{now} CLASIFICADOR :8092 NO RESPONDE: {e}", flush=True)
+        cl["arriba"] = False
+    # 4) resumen cada CLASIF_CADA segundos
+    if time.time() - cl["t"] >= CLASIF_CADA:
+        mins = round((time.time() - cl["t"]) / 60)
+        con_linea = sum(1 for v in en.values() if v.get("line_id"))
+        con_error = sum(1 for v in en.values() if v.get("errores"))
+        cods = ", ".join(f"{c}: {n}" for c, n in sorted(w["codigos"].items())) or "-"
+        print(f"{now} CLASIFICACIÓN (últimos {mins} min): {w['llamadas']} llamadas de WTCP ({cods})"
+              + (f", {w['feedback']} correcciones" if w["feedback"] else "")
+              + f" | {w['nuevas']} descripciones nuevas pedidas, {w['mandadas']} mandadas al clasificador | "
+              f"{w['entregadas']} entregadas (segura {w['segura']}, dudosa {w['dudosa']}, no_clasificado {w['no']}) | "
+              f"en curso {len(en)} ({con_linea} en el clasificador o terminadas sin entregar, {con_error} con error) | "
+              f"acumulado: {count['clasif_llamadas']} llamadas, {count['clasif_entregadas']} entregadas "
+              f"(segura {count['clasif_segura']}, dudosa {count['clasif_dudosa']}, no_clasificado {count['clasif_no']})", flush=True)
+        try:
+            CONTADOR_FILE.write_text(json.dumps({"guardado": time.strftime("%Y-%m-%d %H:%M:%S"), "contador": count},
+                                                ensure_ascii=False), encoding="utf-8")
+        except OSError:
+            pass
+        cl["t"] = time.time()
+        cl["ventana"] = _ventana()
 
 
 def summary(job_id):
@@ -151,8 +270,11 @@ while True:
                     print(f"{now}   REVISAR {j['pdf']}: no se pudo leer el motivo ({e})", flush=True)
         elif st == "error":
             print(f"{now} ERROR {j['pdf']}: {j.get('error_code')} {j.get('error')}", flush=True)
+    _clasif(now)
     if first:
-        print(f"{now} vigilando: {len(running)} en curso ({', '.join(j['pdf'] for j in running)}), {len(queued)} en cola", flush=True)
+        print(f"{now} vigilando: {len(running)} en curso ({', '.join(j['pdf'] for j in running)}), {len(queued)} en cola; "
+              f"clasificaciones en curso {len(cl['en'] or {})}, clasificador {'arriba' if cl['arriba'] else 'NO RESPONDE'} "
+              f"(resumen cada {CLASIF_CADA / 60:.0f} min)", flush=True)
         first = False
     busy = []
     for name, port in SLOTS.items():
