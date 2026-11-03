@@ -18,6 +18,9 @@ _seed = __import__("os").environ.get("VIGILAR_CONTADOR") or "{}"
 if _seed.strip() == "continuar":
     _seed = json.dumps(json.loads(CONTADOR_FILE.read_text(encoding="utf-8"))["contador"]) if CONTADOR_FILE.exists() else "{}"
 count.update(json.loads(_seed))  # seguir un recuento anterior
+# Último trabajo contado (se guarda con el contador): al seguir un recuento, los trabajos que terminaron con el vigilante
+# parado (entre dos monitores) se procesan al arrancar en vez de darse por vistos (2026-11-03: 33680 y 34776 se perdieron).
+CATCH_UP = count.get("ultimo_job", "") if _seed.strip() not in ("", "{}") else None
 for _k in ("clasif_llamadas", "clasif_no200", "clasif_entregadas", "clasif_segura", "clasif_dudosa", "clasif_no", "clasif_mandadas"):
     count.setdefault(_k, 0)
 
@@ -187,7 +190,7 @@ while True:
     for j in jobs:
         prev = seen.get(j["id"])
         st = j["state"]
-        if first:
+        if first and not (CATCH_UP is not None and st in ("done", "error") and j["id"] > CATCH_UP):
             seen[j["id"]] = st
             continue
         if prev == st:
@@ -217,6 +220,7 @@ while True:
                 from pathlib import Path as _P
                 _r = json.loads((_P(JOBS) / j["id"] / "result.json").read_text(encoding="utf-8"))
                 count["docs"] += 1
+                count["ultimo_job"] = max(count.get("ultimo_job", ""), j["id"])
                 count["facturas"] += len(_r)
                 count["revision"] += sum(1 for _i in _r if _i["motivo_revision"])
                 # Duplicados: para WTCP van «A revisión - DUPLICADO»; para nosotros, un duplicado bien detectado es una
