@@ -25,7 +25,8 @@ HOST = "192.168.1.194"
 ESPERADO = {"text": 0, "glm-194": 1, "qwen-vl": 1, "ppocr": 1, "embed": 1, "rerank": 1}
 BUS = {"00000000:03:00.0": 0, "00000000:04:00.0": 1}
 PUERTOS = {"27B": 8083, "GLM-OCR": 8086, "Qwen2.5-VL": 8088, "PP-OCRv6": 8089}
-MIN_VRAM = {"qwen-vl": 200}  # dormido (--sleep-idle-seconds 30): ~300 MiB; los demás, cargados, mucho más
+MIN_VRAM = {"qwen-vl": 200, "ppocr": 300}  # VL dormido (--sleep-idle-seconds 30): ~300 MiB; PP-OCRv6 recién
+# arrancado 430-900 MiB (crece con el uso hasta su tope de 2560); los demás, cargados, mucho más
 fallos = []
 
 
