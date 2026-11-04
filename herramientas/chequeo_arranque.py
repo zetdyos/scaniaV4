@@ -108,7 +108,7 @@ def main(con_ssh):
         ok(False, "API :8091 responde", type(e).__name__)
     ok(not (HERE / ".no_aceptar").exists(), "sin la marca .no_aceptar (si está, la API da 503 a las subidas)")
     try:
-        q = json.loads(get("http://localhost:8092/api/health")[1]).get("queue") or {}
+        q = json.loads(get("http://127.0.0.1:8092/api/health")[1]).get("queue") or {}
         ok(bool(q.get("worker_alive")), "clasificador :8092 con trabajador vivo",
            f"lotes en curso {q.get('running_batches')}, pendientes {q.get('pending_items')}")
     except Exception as e:  # noqa: BLE001

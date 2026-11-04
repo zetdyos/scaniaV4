@@ -3,7 +3,7 @@
 
 En clasificación SCANIA es SOLO UN INTERMEDIARIO (usuario, 2026-10-27: «NO caché en cuanto a clasificación, eres solo un
 proxy»): no guarda respuestas, no decide si una respuesta vieja vale, no clasifica. Toda petición de WTCP va al
-clasificador HS6 + Schedule B (servicio aparte, `CLASIFICADOR_URL`, por defecto http://localhost:8092; esquema en su /docs
+clasificador HS6 + Schedule B (servicio aparte, `CLASIFICADOR_URL`, por defecto http://127.0.0.1:8092; esquema en su /docs
 y /redoc), que usa el mismo Qwen3.6-27B (:8083) que la fase 2.
 
 El contrato pide «una llamada, una respuesta» en menos de 60 s y el clasificador tarda de 20 s a minutos por línea. El
@@ -37,7 +37,10 @@ import requests
 HERE = Path(__file__).resolve().parent
 CLASIF_DIR = HERE / "clasif_jobs"
 EN_CURSO_FILE = CLASIF_DIR / "en_curso.json"
-CLASIFICADOR_URL = (os.environ.get("CLASIFICADOR_URL") or "http://localhost:8092").rstrip("/")
+# 127.0.0.1 y no «localhost» (2026-11-04): en este Windows «localhost» prueba antes IPv6 (::1), el clasificador solo
+# escucha en IPv4 y cada petición esperaba ~2 s antes de reintentar (medido: 2.04 s contra 0.009 s); con ~130 líneas en
+# curso una llamada de WTCP pasaba de 60 s y WTCP la daba por caída («SERVICE DOWN: timeout»).
+CLASIFICADOR_URL = (os.environ.get("CLASIFICADOR_URL") or "http://127.0.0.1:8092").rstrip("/")
 MAX_ITEMS = 200
 MAX_REF = 50
 MAX_LARGO = 2000
