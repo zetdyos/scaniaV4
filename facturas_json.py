@@ -2699,6 +2699,11 @@ def main():
             out = build_all(res, not args.no_llm, args.llm_server, args.vl_server, args.timeout, log)
         import divisas
         divisas.convert_all(out, args.moneda.upper(), log, res["markdown"])
+        try:  # idioma de cada factura (ocr.idioma), como en la API: solo un dato
+            import idioma
+            idioma.anotar(out, res)
+        except Exception as e:  # noqa: BLE001
+            log(f"  idioma: no se pudo detectar ({type(e).__name__}: {e})")
         if args.md_dir:
             Path(args.md_dir).mkdir(parents=True, exist_ok=True)
             (Path(args.md_dir) / f"{stem}.md").write_text(res["markdown"], encoding="utf-8")

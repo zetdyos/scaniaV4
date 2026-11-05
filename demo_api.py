@@ -57,6 +57,7 @@ import divisas
 import facturas_json as f2
 import fase4
 import gpus
+import idioma
 import ocr_pipeline as p1
 
 HERE = Path(__file__).resolve().parent
@@ -479,6 +480,10 @@ def _process_once(job, d, log):
         res = p1.run(str(d / job["pdf"]), log=log)
         out = f2.build_all(res, log=log)
         fase4.aplicar(out, res, log)  # Claude solo para las facturas en revisión; sin clave (FASE4=off) no hace nada
+    try:  # idioma de cada factura (ocr.idioma): solo un dato; un fallo aquí nunca tumba el trabajo
+        idioma.anotar(out, res)
+    except Exception as e:  # noqa: BLE001
+        log(f"  idioma: no se pudo detectar ({type(e).__name__}: {e})")
     fps = mark_cross_document_duplicates(job, out, res["markdown"], log)  # con los importes impresos
     divisas.convert_all(out, job.get("moneda") or TOKEN_CURRENCY.get(job.get("client"), "USD"), log, res["markdown"])
     (d / "huellas.json").write_text(json.dumps(fps, ensure_ascii=False), encoding="utf-8")
