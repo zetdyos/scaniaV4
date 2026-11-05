@@ -16,7 +16,7 @@ if (S / "saltos_head.py").exists():
     _ss = importlib.util.spec_from_file_location("saltos", S / "saltos_head.py")
     _sm = importlib.util.module_from_spec(_ss); sys.modules["saltos"] = _sm; _ss.loader.exec_module(_sm)
 spec = importlib.util.spec_from_file_location("facturas_json_head", S / "facturas_json_head.py")
-old = importlib.util.module_from_spec(spec); spec.loader.exec_module(old)
+old = importlib.util.module_from_spec(spec); sys.modules["facturas_json_head"] = old; spec.loader.exec_module(old)  # el código usa sys.modules[__name__] (fase 3)
 if _saltos_tree is not None:
     sys.modules["saltos"] = _saltos_tree
 

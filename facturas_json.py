@@ -247,26 +247,35 @@ INT_AMOUNT_RE = re.compile(r"(?:^|<t[dh][^>]*>|\|)[ \t]*(?:[A-Za-z][\w ()/.*-]*:
 def printed_readings(s):
     """Valores que admite una cifra tal como está impresa, según el separador que use el documento: "1.000" -> {1, 1000},
     "1,250" -> {1.25, 1250}, "1,234.56" -> {1234.56}, "0.5" -> {0.5}. Sin signo. Conjunto vacío si no hay cifras.
-    No elige entre ellos: eso lo decide el 27B con el contexto del documento; esto solo comprueba su respuesta."""
-    from decimal import Decimal
+    No elige entre ellos: eso lo decide el 27B con el contexto del documento; esto solo comprueba su respuesta.
+    Un trozo que no es UN número (dos cifras pegadas: «1,000.001,000.00», 35075, el 27B juntó dos columnas) no da
+    lectura: antes reventaba con decimal.InvalidOperation y el trabajo entero terminaba en INTERNAL."""
+    from decimal import Decimal, InvalidOperation
     out = set()
+
+    def add(txt):
+        try:
+            out.add(Decimal(txt))
+        except InvalidOperation:
+            pass
+
     s = str(s or "")  # con y sin el espacio como separador de miles ("1 234,56" | "3 EA 3")
     for tok in re.findall(r"\d(?:[\d.,'  ]*\d)?", s) + re.findall(r"\d(?:[\d.,']*\d)?", s):
         t = re.sub(r"['  ]", "", tok)
         seps = [c for c in t if c in ".,"]
         if not seps:
-            out.add(Decimal(t))
+            add(t)
         elif len(set(seps)) == 2:  # "1,234.56" / "1.234,56": el último separador es el decimal
             dec = t[max(t.rfind("."), t.rfind(","))]
-            out.add(Decimal(t.replace("." if dec == "," else ",", "").replace(",", ".")))
+            add(t.replace("." if dec == "," else ",", "").replace(",", "."))
         else:
             c, parts = seps[0], t.split(seps[0])
             if len(parts) > 2:  # "1,000,000": solo miles
-                out.add(Decimal("".join(parts)))
+                add("".join(parts))
             else:
-                out.add(Decimal(parts[0] + "." + parts[1]))
+                add(parts[0] + "." + parts[1])
                 if len(parts[1]) == 3:  # "1.000" / "1,250": también miles
-                    out.add(Decimal(parts[0] + parts[1]))
+                    add(parts[0] + parts[1])
     return out
 
 
@@ -277,12 +286,15 @@ def model_number(printed, value, what, issues):
     from decimal import Decimal, InvalidOperation
     s = str(printed or "").strip()
     reads = printed_readings(s)
-    if not reads:
-        return None
     try:
         v = abs(Decimal(str(value)))
     except (InvalidOperation, ValueError, TypeError):
         v = None
+    if not reads:
+        if re.search(r"\d", s):  # hay cifras pero ninguna es un número (35075): revisión con el valor del 27B
+            issues.append(f'{what} printed as "{s}" is not a single number; review against the paper')
+            return v
+        return None
     if v is not None and v in reads:
         return v
     issues.append(f'{what} printed as "{s}" but the model returned {value}; review against the paper')
