@@ -56,6 +56,7 @@ import clasificacion
 import divisas
 import facturas_json as f2
 import fase4
+import gpus
 import ocr_pipeline as p1
 
 HERE = Path(__file__).resolve().parent
@@ -291,9 +292,21 @@ def encolar(fn, *args):
     COLA.put(fn, args)
 
 
+def _esperar_gpus(fn, args):
+    """Caída de GPU en el host de modelos (gpus.py): la tarea espera a que vuelvan, y con ella la cola entera (orden de
+    llegada). Un análisis sigue en queued con el motivo en `step` (WTCP espera sin límite, §3 del contrato)."""
+    job = jobs.get(args[0]) if fn is process and args else None
+    gpus.esperar(gpus.ANALISIS if fn is process else gpus.CLASIFICACION,
+                 aviso=(lambda m: set_step(job, 1, f"Esperando a los modelos: {m}")) if job else None)
+
+
 def _trabajador():
     while True:
         fn, args = COLA.get()
+        try:
+            _esperar_gpus(fn, args)
+        except Exception as e:  # noqa: BLE001  la comprobación nunca para la cola
+            print(f"cola: comprobación de GPU falló: {type(e).__name__}: {e}", flush=True)
         try:
             fn(*args)
         except Exception as e:  # noqa: BLE001  una tarea rota no para la cola
@@ -429,29 +442,55 @@ def process(job_id):
             n = max(1, job.get("n_inv", 1))
             set_step(job, 80 + 18 * k / n, f"Estructurando factura {k + 1} de {n}")
 
-    try:
-        with f2.modelos_lock(log, on_wait=lambda: set_step(job, 2, "Esperando a los modelos (otro proceso los está usando)")):
-            res = p1.run(str(d / job["pdf"]), log=log)
-            out = f2.build_all(res, log=log)
-            fase4.aplicar(out, res, log)  # Claude solo para las facturas en revisión; sin clave (FASE4=off) no hace nada
-        fps = mark_cross_document_duplicates(job, out, res["markdown"], log)  # con los importes impresos
-        divisas.convert_all(out, job.get("moneda") or TOKEN_CURRENCY.get(job.get("client"), "USD"), log, res["markdown"])
-        (d / "huellas.json").write_text(json.dumps(fps, ensure_ascii=False), encoding="utf-8")
-        (d / "result.json").write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
-        # Respuestas crudas de los modelos y regiones de la fase 1: para medir cambios y calibrar sin volver a llamarlos.
-        (d / "modelos.json").write_text(json.dumps(dict(f2.MODEL_RAW, fase1_regiones=res.get("region_pages")),
-                                                   ensure_ascii=False, default=str), encoding="utf-8")
-        (d / "ocr.md").write_text(res["markdown"], encoding="utf-8")
-        (d / "ocr.html").write_text(mdlib.markdown(res["markdown"], extensions=["tables"]), encoding="utf-8")
-        job.update(state="done", progress=100, step="Listo", n_pages=res["n_pages"], n_invoices=len(out),
-                   n_lines=sum(len(i["lineas"]) for i in out), n_review=sum(1 for i in out if i["motivo_revision"]),
-                   n_verified=sum(1 for i in out for l in i["lineas"] if l["ocr"]["verificado"]))
-    except fitz.FileDataError as e:  # el archivo no se puede leer (la subida ya lo valida; por si acaso)
-        job.update(state="error", error=f"unreadable file: {e}", error_code="UNREADABLE", step="Error")
-    except Exception as e:  # noqa: BLE001  modelos caídos, red, errores internos: el cliente reintenta
-        job.update(state="error", error=f"{type(e).__name__}: {e}", error_code="INTERNAL", step="Error")
+    for intento in range(REPETICIONES_GPU + 1):
+        try:
+            _process_once(job, d, log)
+            break
+        except fitz.FileDataError as e:  # el archivo no se puede leer (la subida ya lo valida; por si acaso)
+            job.update(state="error", error=f"unreadable file: {e}", error_code="UNREADABLE", step="Error")
+            break
+        except Exception as e:  # noqa: BLE001  modelos caídos, red, errores internos: el cliente reintenta
+            listo, motivo = gpus.listos(gpus.ANALISIS, cache_s=0.0)
+            if listo or intento == REPETICIONES_GPU:  # sin caída de GPU: error del servidor como siempre
+                job.update(state="error", error=f"{type(e).__name__}: {e}", error_code="INTERNAL", step="Error")
+                break
+            # Caída de GPU a mitad del análisis (decisión del usuario 2026-11-04, «retener y repetir»): el trabajo sigue
+            # en running, espera a que vuelvan los modelos y se repite desde el principio (cachés limpias en build_all).
+            log(f"ATENCIÓN: el análisis falló a mitad ({type(e).__name__}: {e}); {motivo}. Se espera a que vuelvan los "
+                f"modelos y se repite desde el principio ({intento + 1} de {REPETICIONES_GPU}).")
+            espera = gpus.esperar(gpus.ANALISIS, aviso=lambda m: set_step(job, 2, f"Esperando a los modelos: {m}; "
+                                                                                    "el análisis se repetirá"))
+            log(f"modelos listos tras {espera} s: se repite el análisis")
+            job["repeticiones_gpu"] = intento + 1
+            job.pop("n_inv", None)
+            job["progress"] = 0
+            set_step(job, 2, "Repitiendo el análisis tras la caída de los modelos")
     job["seconds"] = round(time.time() - job["started"], 1)
     save_meta(job)
+
+
+# Veces que un análisis cortado por una caída de GPU se repite (tras esperar a que vuelvan los modelos).
+REPETICIONES_GPU = 2
+
+
+def _process_once(job, d, log):
+    """Un intento del análisis: fases 1-4, duplicados, moneda y archivos del trabajo."""
+    with f2.modelos_lock(log, on_wait=lambda: set_step(job, 2, "Esperando a los modelos (otro proceso los está usando)")):
+        res = p1.run(str(d / job["pdf"]), log=log)
+        out = f2.build_all(res, log=log)
+        fase4.aplicar(out, res, log)  # Claude solo para las facturas en revisión; sin clave (FASE4=off) no hace nada
+    fps = mark_cross_document_duplicates(job, out, res["markdown"], log)  # con los importes impresos
+    divisas.convert_all(out, job.get("moneda") or TOKEN_CURRENCY.get(job.get("client"), "USD"), log, res["markdown"])
+    (d / "huellas.json").write_text(json.dumps(fps, ensure_ascii=False), encoding="utf-8")
+    (d / "result.json").write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
+    # Respuestas crudas de los modelos y regiones de la fase 1: para medir cambios y calibrar sin volver a llamarlos.
+    (d / "modelos.json").write_text(json.dumps(dict(f2.MODEL_RAW, fase1_regiones=res.get("region_pages")),
+                                               ensure_ascii=False, default=str), encoding="utf-8")
+    (d / "ocr.md").write_text(res["markdown"], encoding="utf-8")
+    (d / "ocr.html").write_text(mdlib.markdown(res["markdown"], extensions=["tables"]), encoding="utf-8")
+    job.update(state="done", progress=100, step="Listo", n_pages=res["n_pages"], n_invoices=len(out),
+               n_lines=sum(len(i["lineas"]) for i in out), n_review=sum(1 for i in out if i["motivo_revision"]),
+               n_verified=sum(1 for i in out for l in i["lineas"] if l["ocr"]["verificado"]))
 
 
 def public(j):
@@ -482,6 +521,9 @@ def health():
                 model = Path(requests.get(f"{url}/props", timeout=3).json().get("model_path", "")).name or None
         except requests.RequestException:
             pass
+        # Con /health 200 pero sin su GPU (2026-11-02: tras perder la GPU0 los modelos volvieron en CPU) -> ok=false:
+        # WTCP no sube nada hasta que vuelvan (§1 del contrato). Sin datos del exportador, como antes.
+        ok = ok and not gpus.sin_gpu(name)
         out.append(ModelHealth(name=name, url=url, ok=ok, model=model))
     out.append(ModelHealth(name="Clasificador HS6", url=clasificacion.CLASIFICADOR_URL, ok=clasificacion.salud()))
     todos = list(jobs.values())  # copia: una subida concurrente cambia `jobs` (RuntimeError -> 500)

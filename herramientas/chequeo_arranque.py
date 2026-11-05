@@ -4,7 +4,7 @@ Nació el 2026-11-02: la GPU0 de .194 se cayó del bus (Xid 79), los llama-serve
 dando /health 200, y la métrica decía PP-OCRv6 en GPU0 porque el inventario del exportador estaba viejo. Se tardó una hora
 en verlo. Aquí está todo lo que hubo que mirar a mano, con lo que debe dar:
 
-  - .194: las dos GPU en las métricas; cada modelo con memoria gráfica (el VL puede estar dormido, ~300 MiB) y en su
+  - .194: las dos GPU en las métricas; con --ssh, la recuperación ante caída de GPU instalada y sin freno; cada modelo con memoria gráfica (el VL puede estar dormido, ~300 MiB) y en su
     tarjeta (con --ssh, la tarjeta real de nvidia-smi por bus PCI; sin ssh, la etiqueta del inventario del exportador);
     /health de 8083, 8086, 8088, 8089; el 27B con n_ctx 16384 y visión.
   - Este PC: API :8091 sana y sin la marca .no_aceptar; clasificador :8092 con su trabajador vivo; restos de tuberías de
@@ -75,6 +75,21 @@ def main(con_ssh):
                         reales[alias] = pid_bus.get(pid)
         except Exception as e:  # noqa: BLE001
             ok(False, "nvidia-smi por ssh", type(e).__name__)
+        # Recuperación ante caída de GPU (deploy/host-modelos/recuperacion, 2026-11-04): vigía activo, sin freno puesto, y
+        # cada modelo de SCANIA con su comprobación previa de tarjeta.
+        try:
+            r = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", f"techstudi@{HOST}",
+                                "systemctl is-active scania-gpu-vigia.timer; test -f /var/lib/scania-gpu-vigia/frenado &&"
+                                " echo FRENADO || echo SIN-FRENO; for u in text glm qwen-vl ppocr; do"
+                                " systemctl show -p ExecStartPre scania-mdl-$u | grep -q scania-gpu-presente && echo GUARDA-$u; done"],
+                               capture_output=True, text=True, timeout=30).stdout.split()
+            ok(r[:1] == ["active"], "vigía de GPU (scania-gpu-vigia.timer) activo", r[0] if r else "sin respuesta")
+            ok("SIN-FRENO" in r, "vigía de GPU sin freno (si lo hay: GPU caída tras un reinicio automático; ver "
+               "/var/log/scania-gpu-vigia.log)")
+            sin = [u for u in ("text", "glm", "qwen-vl", "ppocr") if f"GUARDA-{u}" not in r]
+            ok(not sin, "cada modelo arranca solo con su GPU (zz-gpu-presente.conf)", ", ".join(sin))
+        except Exception as e:  # noqa: BLE001
+            ok(False, "recuperación de GPU por ssh", type(e).__name__)
     for alias, gpu in ESPERADO.items():
         g, mib = vram.get(alias, (None, 0.0))
         ok(mib >= MIN_VRAM.get(alias, 1000), f"{alias}: con memoria gráfica (no en CPU)", f"{mib:.0f} MiB")

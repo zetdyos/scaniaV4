@@ -1,0 +1,8 @@
+[Unit]
+Description=SCANIA: vigía de las GPU (reinicio automático con freno si una tarjeta se cae)
+After=scania-gpu-tune.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/scania-gpu-vigia.sh
+TimeoutStartSec=300

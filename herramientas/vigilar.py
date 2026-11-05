@@ -32,6 +32,7 @@ REPO = __import__("pathlib").Path(__file__).resolve().parents[1]
 __import__("sys").path.insert(0, str(REPO))
 import re  # noqa: E402
 import clasificacion  # noqa: E402  solo para `resultado` (estado de una línea terminada) y las constantes
+import gpus  # noqa: E402  caída de GPU en .194 (la misma comprobación con la que la API retiene la cola)
 API_LOG = REPO / "logs" / "api.out.log"
 EN_CURSO = REPO / "clasif_jobs" / "en_curso.json"
 CLASIF_CADA = float(__import__("os").environ.get("VIGILAR_CLASIF_CADA", "1800"))  # resumen cada 30 min
@@ -293,6 +294,13 @@ while True:
     if ok != globals().get("ppocr_ok", True):
         print(f"{now} PP-OCRv6 :8089 {'RESPONDE de nuevo' if ok else 'NO RESPONDE (sin comprobación de saltos de página)'}", flush=True)
     globals()["ppocr_ok"] = ok
+    if time.time() - globals().get("gpu_t", 0) >= 30:  # caída de GPU: aviso al empezar y al terminar
+        g_ok, g_motivo = gpus.listos(cache_s=0.0)
+        if g_ok != globals().get("gpu_ok", True):
+            print(f"{now} " + ("GPU: los modelos vuelven a estar en sus GPU; la API retoma la cola" if g_ok else
+                               f"ALERTA GPU: {g_motivo}; la API retiene la cola (y repite el trabajo cortado) y .194 se "
+                               "reinicia solo con freno"), flush=True)
+        globals().update(gpu_ok=g_ok, gpu_t=time.time())
     if len(busy) > 1:
         print(f"{now} ALERTA: varios modelos procesando a la vez: {busy}", flush=True)
     time.sleep(3)

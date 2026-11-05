@@ -1,0 +1,2 @@
+# Guiones y unidades para Linux (.194): siempre LF, aunque core.autocrlf=true en este Windows.
+deploy/host-modelos/recuperacion/* text eol=lf
