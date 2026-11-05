@@ -87,11 +87,16 @@ API-Token en la cabecera `X-API-Key`; sin él responden `401`. La página demo `
 Los tokens viven en `api_keys.json` en la raíz del repo (**fuera de git**; otra ruta con `SCANIA_API_KEYS_FILE`):
 
 ```json
-{"wtcp-prueba": "<token>", "wtcp-produccion": "<token>"}
+{"wtcp-prueba":     {"token": "<token>", "moneda": "USD", "cliente": "CURANT"},
+ "wtcp-produccion": {"token": "<token>", "moneda": "USD", "cliente": "CURANT"},
+ "jb-produccion":   {"token": "<token>", "moneda": "EUR", "cliente": "JB"}}
 ```
 
-Crear o rotar un token: `python -c "import secrets; print(secrets.token_urlsafe(32))"`, editar el archivo y
-reiniciar la API. Sin `api_keys.json`, la API solo responde desde `127.0.0.1`.
+Cada token pertenece a UN cliente (`cliente` = `[Application].[ClientCode]` de WTCP, obligatorio; WTCP lo manda en la
+cabecera `X-Client-Code`) y tiene su moneda de salida (`moneda`, USD por defecto). Crear o rotar un token:
+`python -c "import secrets; print(secrets.token_urlsafe(32))"`, editar el archivo, comprobar con
+`deploy\windows\lanzar_api.ps1 -Comprobar` y desplegar con `-Redeploy`. El token se entrega al cliente por un canal
+privado, nunca en `C:\Share`. Sin `api_keys.json`, la API solo responde desde `127.0.0.1`.
 
 ```bash
 .venv/bin/python demo_api.py                                  # 0.0.0.0:8091 por defecto (variable DEMO_PORT)
