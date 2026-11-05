@@ -24,7 +24,7 @@
     }
   },
   "clasificacion": {
-    "_nota": "nc_activa: true cuando el clasificador desplegado sepa la Nomenclatura Combinada de la UE (8 dígitos; plan JB). Con false, pais_origen de la UE recibe 400. Se lee en cada petición, sin reiniciar.",
-    "nc_activa": false
+    "_nota": "nc_activa: true desde el 2026-11-05 (clasificador con la NC 2026 desplegado: versions.cn en su /api/health). Con false, pais_origen de la UE recibe 400. Se lee en cada petición, sin reiniciar.",
+    "nc_activa": true
   }
 }
