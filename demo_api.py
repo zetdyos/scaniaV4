@@ -678,8 +678,14 @@ class ClassifyItemIn(BaseModel):
     divisa: Optional[str] = None
 
 
+ORIGENES_CON_NOMENCLATURA = {"US"}  # US -> Schedule B; los países de la UE se añaden cuando exista la NC (plan JB)
+
+
 class ClassifyIn(BaseModel):
-    pais_origen: Optional[str] = Field(None, description="ISO de 2 letras (contexto; hoy no cambia la clasificación)")
+    pais_origen: Optional[str] = Field(None, description="ISO de 2 letras del país desde el que se exporta "
+                                       "([Application].[InvoiceAiOriginCountry] de WTCP). Elige la nomenclatura: "
+                                       "US (o vacío) = Schedule B de 10 dígitos. Otro país: 400 hasta que su "
+                                       "nomenclatura esté disponible (UE = Nomenclatura Combinada, en desarrollo)")
     items: list[ClassifyItemIn] = Field(..., description=f"Hasta {clasificacion.MAX_ITEMS} líneas")
 
 
@@ -747,6 +753,13 @@ def classify(body: ClassifyIn, client: str = Security(require_key)):
     las que el clasificador terminó; las demás se omiten y WTCP las vuelve a pedir (§8.2). Lo entregado no se guarda."""
     if DRAIN_FILE.exists():
         raise HTTPException(503, "server restarting: retry later", headers={"Retry-After": "120"})
+    # pais_origen elige la nomenclatura (usuario, 2026-11-05: CURANT manda "US", JB mandará "NL"). Hoy el clasificador solo
+    # sabe Schedule B (EE. UU.): otro país recibe 400, nunca un código de otra nomenclatura (un Schedule B no vale en una
+    # declaración de exportación de la UE). Vacío = "US", como hasta hoy.
+    origen = (body.pais_origen or "US").strip().upper()
+    if origen not in ORIGENES_CON_NOMENCLATURA:
+        raise HTTPException(400, f"unsupported pais_origen {origen}: SCANIA classifies only for exports from "
+                                 f"{', '.join(sorted(ORIGENES_CON_NOMENCLATURA))} today (EU Combined Nomenclature in development)")
     try:
         clasificacion.pendientes_correcciones(encolar_correcciones)  # reintento de correcciones que quedaron pendientes
         cid = client_id(client)  # por cliente: cada uno recibe solo lo que pidió (el clasificador no lo sabe)
