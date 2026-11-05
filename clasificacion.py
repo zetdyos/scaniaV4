@@ -48,6 +48,35 @@ ESPERA = float(os.environ.get("CLASIF_ESPERA", "40"))  # WTCP espera hasta 60 s 
 MAX_INTENTOS = 3
 TIEMPO_MAX_LINEA = float(os.environ.get("CLASIF_TIEMPO_MAX", "1200"))  # 20 min: el clasificador puede atender antes su interfaz
 OLVIDAR_DIAS = 7  # una línea en curso que WTCP no vuelve a pedir en una semana se olvida
+
+# Nomenclatura según el país desde el que se exporta (`pais_origen` de WTCP = [Application].[InvoiceAiOriginCountry];
+# usuario, 2026-11-05: CURANT manda "US", JB manda "NL"). US -> Schedule B (10 dígitos), como siempre. País de la UE ->
+# Nomenclatura Combinada (8 dígitos), solo con el interruptor scania_config.json -> clasificacion.nc_activa (se lee en
+# cada petición; se enciende cuando el clasificador desplegado ya sabe la NC). Un Schedule B nunca va a un país de la UE.
+PAISES_UE = {"AT", "BE", "BG", "HR", "CY", "CZ", "DK", "EE", "FI", "FR", "DE", "GR", "HU", "IE", "IT", "LV", "LT", "LU",
+             "MT", "NL", "PL", "PT", "RO", "SK", "SI", "ES", "SE"}
+NOMENCLATURAS = {"scheduleb": 10, "cn": 8}  # dígitos del código nacional
+CONFIG_FILE = HERE / "scania_config.json"
+
+
+def _config():
+    try:
+        return json.loads(CONFIG_FILE.read_text(encoding="utf-8")).get("clasificacion") or {}
+    except (OSError, ValueError):
+        return {}
+
+
+def nomenclatura_de(pais):
+    """(nomenclatura, "") para el país de exportación, o (None, motivo en inglés) si SCANIA no la sabe todavía."""
+    p = (pais or "US").strip().upper()
+    if p == "US":
+        return "scheduleb", ""
+    if p in PAISES_UE:
+        if _config().get("nc_activa"):
+            return "cn", ""
+        return None, (f"unsupported pais_origen {p}: SCANIA classifies only for exports from US today "
+                      "(EU Combined Nomenclature in development)")  # texto citado en el contrato (2026-11-05)
+    return None, f"unsupported pais_origen {p}: SCANIA classifies only for exports from the US and the EU"
 _LOCK = threading.Lock()
 _EN_COLA: set = set()  # claves con una tarea viva en la cola única (en memoria: tras un reinicio se vuelven a encolar)
 
@@ -107,8 +136,22 @@ def _guardar(p, data):
     tmp.replace(p)
 
 
-def resultado(it):
-    """Línea terminada del clasificador -> {estado, sugerencias, version_catalogo} (§8.2)."""
+def resultado(it, nomenclatura="scheduleb"):
+    """Línea terminada del clasificador -> {estado, sugerencias, version_catalogo} (§8.2). NC: los campos neutros del
+    clasificador (`national_*`, 8 dígitos); Schedule B: los de siempre (`code10`…), sin ningún cambio."""
+    if nomenclatura == "cn":
+        code = re.sub(r"\D", "", it.get("national_code") or it.get("national_code_fmt") or "")
+        meta = it.get("meta") or {}
+        version = meta.get("cn") or meta.get("nomenclature_version") or ""
+        if len(code) != NOMENCLATURAS["cn"] or (it.get("nomenclature") or "cn") != "cn":
+            return {"estado": "no_clasificado", "sugerencias": [], "version_catalogo": version}
+        segura = bool(it.get("national_advance")) and not it.get("needs_review") and not it.get("requires_confirmation")
+        score = it.get("national_score")
+        return {"estado": "sugerencia_segura" if segura else "dudosa",
+                "sugerencias": [{"codigo": code, "descripcion": it.get("national_desc") or "",
+                                 "confianza": float(score) if score is not None else None,
+                                 "canal": "clasificador", "calibrado": False}],
+                "version_catalogo": version}
     code10 = re.sub(r"\D", "", it.get("code10") or it.get("code10_fmt") or "")
     version = (it.get("meta") or {}).get("scheduleb") or ""
     if len(code10) != 10:
@@ -141,9 +184,13 @@ def _validar(items):
     return out
 
 
-def clave_cliente(cliente, descripcion):
-    """Clave de una descripción EN CURSO: por cliente (cada WTCP recibe solo lo que pidió; usuario, 2026-10-28)."""
-    return f"{cliente}|{clave(descripcion)}"
+def clave_cliente(cliente, descripcion, nomenclatura="scheduleb"):
+    """Clave de una descripción EN CURSO: por cliente (cada WTCP recibe solo lo que pidió; usuario, 2026-10-28) y, fuera
+    del Schedule B, por nomenclatura (la misma descripción con US y con NL son dos clasificaciones). La del Schedule B
+    queda como siempre: las líneas en curso de CURANT no cambian de clave."""
+    if nomenclatura == "scheduleb":
+        return f"{cliente}|{clave(descripcion)}"
+    return f"{cliente}|{nomenclatura}|{clave(descripcion)}"
 
 
 def procesar(k, texto, modelos_lock):
@@ -157,8 +204,11 @@ def procesar(k, texto, modelos_lock):
                 en = _leer(EN_CURSO_FILE)
                 if k not in en or en[k].get("line_id"):
                     return  # ya entregada u otra tarea ya la mandó
-            # Solo la descripción: el clasificador no sabe de clientes (datos mínimos entre servicios).
-            r = _pedir("POST", "/api/lines", json={"line": texto, "mode": "brief"})
+                nom = en[k].get("nom") or "scheduleb"
+            # Solo la descripción (y, fuera del Schedule B, la nomenclatura): el clasificador no sabe de clientes ni de
+            # países (datos mínimos entre servicios). La petición del Schedule B es la de siempre.
+            cuerpo = {"line": texto, "mode": "brief", **({"nomenclature": nom} if nom != "scheduleb" else {})}
+            r = _pedir("POST", "/api/lines", json=cuerpo)
             with _LOCK:
                 en = _leer(EN_CURSO_FILE)
                 if k in en:
@@ -176,14 +226,15 @@ def procesar(k, texto, modelos_lock):
         _EN_COLA.discard(k)
 
 
-def clasificar(items, cliente, encolar, espera=None):
+def clasificar(items, cliente, encolar, espera=None, nomenclatura="scheduleb"):
     """§8: items [{ref, descripcion, …}] -> {version_catalogo, items:[{ref, estado, sugerencias}]} con las líneas que el
     clasificador terminó. Lo que no terminó en `espera` s se omite y WTCP lo vuelve a pedir (§8.2). ValueError si la
-    entrada no vale; ClasificadorError(503) si el clasificador no está disponible."""
+    entrada no vale; ClasificadorError(503) si el clasificador no está disponible. `nomenclatura`: "scheduleb" (10
+    dígitos) o "cn" (8 dígitos), según `nomenclatura_de(pais_origen)`."""
     pares = _validar(items)
     espera = ESPERA if espera is None else espera
     fin = time.time() + espera
-    claves = {clave_cliente(cliente, d): d for _, d in pares}
+    claves = {clave_cliente(cliente, d, nomenclatura): d for _, d in pares}
     h = _salud()
     if h is None:
         raise ClasificadorError(503, "classifier unavailable")  # §8.3: WTCP reintenta más tarde
@@ -194,10 +245,11 @@ def clasificar(items, cliente, encolar, espera=None):
         for k in [k for k, v in en.items() if v.get("desde", 0) < viejo and k not in claves]:
             en.pop(k)
         for k, d in claves.items():
-            if k not in en and clave(d) in en and "|" not in clave(d):
+            if nomenclatura == "scheduleb" and k not in en and clave(d) in en and "|" not in clave(d):
                 en[k] = en.pop(clave(d))  # en curso desde antes de las claves por cliente (un solo WTCP): pasa a quien la pide
             if k not in en:
-                en[k] = {"texto": d, "line_id": None, "desde": time.time(), "errores": 0}
+                en[k] = {"texto": d, "line_id": None, "desde": time.time(), "errores": 0,
+                         **({"nom": nomenclatura} if nomenclatura != "scheduleb" else {})}
             if not en[k].get("line_id") and k not in _EN_COLA:
                 _EN_COLA.add(k)
                 encolar_ya.append(k)
@@ -219,7 +271,7 @@ def clasificar(items, cliente, encolar, espera=None):
                     continue
                 it = {"status": "error", "error": "line lost by the classifier"}
             if it.get("status") == "done":
-                listos[k] = resultado(it)
+                listos[k] = resultado(it, nomenclatura)
             elif it.get("status") in ("error", "cancelled"):
                 with _LOCK:
                     en = _leer(EN_CURSO_FILE)
@@ -238,9 +290,9 @@ def clasificar(items, cliente, encolar, espera=None):
             en.pop(k, None)
         _guardar(EN_CURSO_FILE, en)
     salida = [{"ref": ref, "estado": listos[k]["estado"], "sugerencias": listos[k]["sugerencias"]}
-              for ref, d in pares if (k := clave_cliente(cliente, d)) in listos]
+              for ref, d in pares if (k := clave_cliente(cliente, d, nomenclatura)) in listos]
     version = next((v["version_catalogo"] for v in listos.values() if v.get("version_catalogo")), "") \
-        or (h.get("versions") or {}).get("scheduleb") or ""
+        or (h.get("versions") or {}).get(nomenclatura) or ""
     return {"version_catalogo": version, "items": salida}
 
 

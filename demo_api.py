@@ -678,19 +678,16 @@ class ClassifyItemIn(BaseModel):
     divisa: Optional[str] = None
 
 
-ORIGENES_CON_NOMENCLATURA = {"US"}  # US -> Schedule B; los países de la UE se añaden cuando exista la NC (plan JB)
-
-
 class ClassifyIn(BaseModel):
     pais_origen: Optional[str] = Field(None, description="ISO de 2 letras del país desde el que se exporta "
                                        "([Application].[InvoiceAiOriginCountry] de WTCP). Elige la nomenclatura: "
-                                       "US (o vacío) = Schedule B de 10 dígitos. Otro país: 400 hasta que su "
-                                       "nomenclatura esté disponible (UE = Nomenclatura Combinada, en desarrollo)")
+                                       "US (o vacío) = Schedule B de 10 dígitos; país de la UE = Nomenclatura Combinada de 8 "
+                                       "dígitos (cuando esté activa; si no, 400); otro país: 400")
     items: list[ClassifyItemIn] = Field(..., description=f"Hasta {clasificacion.MAX_ITEMS} líneas")
 
 
 class Sugerencia(BaseModel):
-    codigo: str = Field(description="Schedule B, 10 dígitos")
+    codigo: str = Field(description="Schedule B de 10 dígitos (pais_origen US) o NC de 8 dígitos (UE)")
     descripcion: str = ""
     confianza: Optional[float] = Field(None, description="0 a 1 (score10 del clasificador)")
     canal: str = "clasificador"
@@ -756,16 +753,15 @@ def classify(body: ClassifyIn, client: str = Security(require_key)):
     # pais_origen elige la nomenclatura (usuario, 2026-11-05: CURANT manda "US", JB mandará "NL"). Hoy el clasificador solo
     # sabe Schedule B (EE. UU.): otro país recibe 400, nunca un código de otra nomenclatura (un Schedule B no vale en una
     # declaración de exportación de la UE). Vacío = "US", como hasta hoy.
-    origen = (body.pais_origen or "US").strip().upper()
-    if origen not in ORIGENES_CON_NOMENCLATURA:
-        raise HTTPException(400, f"unsupported pais_origen {origen}: SCANIA classifies only for exports from "
-                                 f"{', '.join(sorted(ORIGENES_CON_NOMENCLATURA))} today (EU Combined Nomenclature in development)")
+    nomenclatura, motivo = clasificacion.nomenclatura_de(body.pais_origen)
+    if nomenclatura is None:
+        raise HTTPException(400, motivo)
     try:
         clasificacion.pendientes_correcciones(encolar_correcciones)  # reintento de correcciones que quedaron pendientes
         cid = client_id(client)  # por cliente: cada uno recibe solo lo que pidió (el clasificador no lo sabe)
         return clasificacion.clasificar([it.model_dump() for it in body.items], cid,
                                         lambda *a: encolar(clasificacion.procesar, *a,
-                                                           f2.modelos_lock))
+                                                           f2.modelos_lock), nomenclatura=nomenclatura)
     except ValueError as e:
         raise HTTPException(400, str(e)) from None
     except clasificacion.ClasificadorError as e:

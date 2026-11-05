@@ -22,5 +22,9 @@
         "salida": 50.0
       }
     }
+  },
+  "clasificacion": {
+    "_nota": "nc_activa: true cuando el clasificador desplegado sepa la Nomenclatura Combinada de la UE (8 dígitos; plan JB). Con false, pais_origen de la UE recibe 400. Se lee en cada petición, sin reiniciar.",
+    "nc_activa": false
   }
 }
