@@ -110,7 +110,13 @@ EBAY_ORDER_RE = re.compile(r"Order\s*number:?\s*(\d{2}-\d{5}-\d{5})(?!\d)", re.I
 # Número: letras/cifras/guiones con >= 4 cifras; sin «$», puntos ni barras («Order Total $…», «Order Date 10.10.2026»).
 _REF_NUM = r"([A-Z0-9][A-Z0-9-]*[A-Z0-9])(?![A-Z0-9.,/$-])"
 PRINTED_REF_RES = [re.compile(r"(?<![A-Za-z])Order[ \t]*(?:No\.?|Number|#|ID)?[ \t]*(?:[:#][ \t]*){0,2}" + _REF_NUM, re.I),
-                   re.compile(r"(?<![A-Za-z])Invoice[ \t]*(?:No\.?|Number|#)?[ \t]*(?:[:#][ \t]*){0,2}" + _REF_NUM, re.I)]
+                   re.compile(r"(?<![A-Za-z])Invoice[ \t]*(?:No\.?|Number|#)?[ \t]*(?:[:#][ \t]*){0,2}" + _REF_NUM, re.I),
+                   # las mismas etiquetas en los idiomas de los clientes (2026-11-10: Amazon en español «N.º de pedido
+                   # 114-…», JB en neerlandés «Factuurnummer V012609269»), con la misma regla del mismo renglón
+                   re.compile(r"(?<![A-Za-z])(?:N(?:\.?\s*[º°o]\.?|[uú]m(?:ero)?\.?)\s*de\s*(?:pedido|orden|commande)|Num[ée]ro\s*de\s*commande"
+                              r"|Bestel(?:nummer|ling\s*nr\.?)|Ordernummer|Order\s*nr\.?)[ \t]*(?:[:#][ \t]*){0,2}" + _REF_NUM, re.I),
+                   re.compile(r"(?<![A-Za-z])(?:Factuur(?:nummer|\s*nr\.?)|N(?:\.?\s*[º°o]\.?|[uú]m(?:ero)?\.?)\s*de\s*factur[ae]"
+                              r"|Factura\s*(?:N\.?\s*[º°o]\.?|n[uú]m\.?)|Rechnungs(?:nummer|\s*nr\.?))[ \t]*(?:[:#][ \t]*){0,2}" + _REF_NUM, re.I)]
 
 
 def printed_ref(text):
@@ -2354,6 +2360,20 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
     issues += evidence_issues(lines)
     for l in others:  # no-mercadería: evidencia de sus valores, nunca "verificada" como artículo
         l["evidence"], l["verified"] = line_evidence(l, sq_text, ocr_amounts, False, ocr_units), False
+    # Subtotal de artículos de la cabecera: si el que quedó no es la suma de las líneas (Temu imprime «Item(s) total» con el
+    # precio TACHADO de la tienda, 27.40, y debajo el subtotal real, 22.65: WR00034480, 34474, 34789, 34801, 35310, 33230)
+    # y la suma de las líneas está impresa y con ella la cabecera cierra con el total impreso, el subtotal es ese. Solo en
+    # facturas que ya salen sin revisión: no cambia ninguna cifra que vaya a WTCP salvo esta, y la deja coherente.
+    s_lines = lines_sum(lines)
+    if not issues and s_lines is not None and fields.get("subtotal_articulos") and total and total_printed \
+            and abs(float(fields["subtotal_articulos"]) - s_lines) >= 0.01 and f"{s_lines:.2f}" in ocr_amounts:
+        extra = (float(fields["envio"] or 0) + float(fields["impuestos"] or 0)
+                 + sum(float(c["importe"] or 0) for c in fields["other_charges"])
+                 - sum(float(d["importe"] or 0) for d in fields["descuentos"]))
+        if abs(s_lines + extra - float(total)) < 0.01:
+            log(f"  subtotal de artículos de la cabecera {fields['subtotal_articulos']} -> {s_lines:.2f} (impreso, = suma de "
+                "las líneas, y con él la cabecera cierra con el total)")
+            fields["subtotal_articulos"] = f"{s_lines:.2f}"
     if others:  # mismo orden en que el 27B las devolvió; las goods del rescate visual no traen orden y van primero
         lines = sorted(lines + others, key=lambda l: l.get("order", -1))
     fields["origen_lineas"] = source
@@ -2457,8 +2477,15 @@ def order_fingerprints(docs, markdown):
         a, b = d["ocr"]["paginas"]
         ids = sorted({x.upper() for n in range(a, b + 1) for x in ORDER_ID_RE.findall(texts.get(n, ""))})
         out.append({"id": d["id"], "total": d["total"], "goods": goods, "ids": ids, "ref": (d.get("referencia") or "").upper(),
-                    "envios": d["ocr"].get("origen_lineas") == "envios"})
+                    "envios": d["ocr"].get("origen_lineas") == "envios",
+                    "inv": invoice_numbers("\n".join(texts.get(n, "") for n in range(a, b + 1)))})
     return out
+
+
+def invoice_numbers(text):
+    """Números de FACTURA impresos con su etiqueta en el mismo renglón («Invoice: 104429501», «Invoice # IN260376»)."""
+    return sorted({m.group(1).upper() for m in PRINTED_REF_RES[1].finditer(text or "")
+                   if sum(c.isdigit() for c in m.group(1)) >= 4})
 
 
 def same_order(a, b):
@@ -2472,6 +2499,11 @@ def partial_same_order(a, b):
     Dos envíos distintos del mismo pedido de Amazon no comparten artículos y no cuentan. Medido 2026-10-22 sobre el
     historial de WTCP: 14 parejas, todas para revisión humana."""
     if not a.get("ref") or a.get("ref") != b.get("ref"):
+        return False
+    # Dos FACTURAS distintas del mismo pedido (cada una con su número impreso, sin ninguno en común) no son el mismo papel:
+    # S&S Activewear, pedido 77443060, facturas 104429500 y 104429501 (34435 y 34640, dos envíos), con camisetas al
+    # mismo precio y descripción (el color va en otra columna). Sin número de factura en alguno, como antes.
+    if a.get("inv") and b.get("inv") and not set(a["inv"]) & set(b["inv"]):
         return False
     return bool({tuple(g) for g in a["goods"]} & {tuple(g) for g in b["goods"]})
 

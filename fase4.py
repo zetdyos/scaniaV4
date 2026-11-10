@@ -286,7 +286,14 @@ def comprobar(p, leido):
         key = p1.squash(desc)[:20]
         if not desc or not leido.descripcion(desc):
             fallos.append(f"description not in the OCR text: «{desc[:40]}»")
-        if amt is None or f"{amt}" not in impresos:
+        # Importe no impreso pero igual a cantidad impresa × precio unitario impreso (evidencia «calculado», como la fase
+        # 2): tablas que imprimen precio, cantidad, impuesto y un total CON impuesto por línea (34283 WebstaurantStore:
+        # 6 × 52.49 = 314.94 sin impuesto; la fila imprime 336.98). La cantidad tiene que estar impresa por sí misma: el
+        # producto solo no la respalda, nada más está impreso.
+        calc = (amt is not None and f"{amt}" not in impresos and unit is not None and f"{unit}" in impresos
+                and qty is not None and qty >= 1 and qty * unit == amt
+                and (qty == 1 or f2.qty_printed(qty, sq_text, key) or leido.cantidad(qty, desc, "")))
+        if (amt is None or f"{amt}" not in impresos) and not calc:
             fallos.append(f"amount {amt} of «{desc[:30]}» is not printed")
         elif amt == 0 and unit and f"{unit}" in impresos:
             # La misma regla que la fase 2 (decisión del usuario): un artículo a 0.00 CON precio unitario impreso puede
@@ -303,7 +310,7 @@ def comprobar(p, leido):
             fallos.append(f"quantity {qty} of «{desc[:30]}» is not backed by a printed unit price or quantity")
         lineas.append({"desc": desc, "qty": qty if qty is not None and qty >= 0 else 1,
                        "amount": f"{amt}" if amt is not None else "",
-                       "unit": f"{unit}" if unit is not None and f"{unit}" in impresos else ""})
+                       "unit": f"{unit}" if unit is not None and f"{unit}" in impresos else "", "calc": calc})
     if not lineas:
         fallos.append("no item lines")
     cab = {}
@@ -380,6 +387,45 @@ def perdidas(viejas, nuevas, impresos, leido=None):
     return out
 
 
+def sin_sobrantes(fuera, viejas, evals, log):
+    """Quita de `fuera` (cifras de la lectura anterior que Claude no conserva) las que son SOBRANTES de esa lectura, no
+    artículos perdidos. Solo en las páginas de un documento de Claude sin ningún fallo propio (todas sus cifras impresas,
+    sus líneas = subtotal impreso, la cuenta cierra con el total impreso), y solo si la lectura anterior NO cuadraba en esas
+    páginas y una de estas dos cuentas lo explica exactamente:
+    - quitando las cifras «perdidas», la lectura anterior da justo las líneas de Claude: eran de más (35487 Farmasi: el
+      27B tomó la cartera de pago «Farmasi Wallet 249.74» como artículo, 454.74 − 249.74 = 205.00; 32348: un sofá enviado
+      en 5 paquetes, cada paquete imprime el precio entero, 5 × 606.09 − 4 × 606.09 = 606.09);
+    - la lectura anterior perdió TODAS sus líneas y su suma es la de Claude más los impuestos impresos = el total impreso:
+      eran las mismas líneas con el impuesto dentro (34283 WebstaurantStore: 732.20 = 684.30 + 47.90).
+    Dos artículos iguales de verdad no entran: con ellos la lectura anterior ya cuadraba."""
+    if not fuera:
+        return fuera
+    quitar = set()
+    for e in evals:
+        if e["fallos"] or not e["lineas"] or not all(l["amount"] for l in e["lineas"]):
+            continue
+        viejas_e = [l for l in viejas if l.get("line_kind") == "goods" and l.get("importe_linea") and _en_paginas(l, e["paginas"])]
+        perdidas_e = [l for l in fuera if id(l) not in quitar and _en_paginas(l, e["paginas"])]
+        if not perdidas_e:
+            continue
+        sv = sum(Decimal(l["importe_linea"]) for l in viejas_e)
+        sl = sum(Decimal(l["importe_linea"]) for l in perdidas_e)
+        se = sum(Decimal(l["amount"]) for l in e["lineas"])
+        imp = sum(Decimal(c["importe"]) for c in e["listas"]["impuestos"])
+        if sv == se:
+            continue
+        if sv - sl == se:
+            motivo = f"la lectura anterior suma {sv}; sin esas cifras, {se} = las líneas de Claude"
+        elif imp and len(perdidas_e) == len(viejas_e) and sv == se + imp and e["cab"]["total"] == sv:
+            motivo = f"la lectura anterior ({sv}) son las mismas líneas con el impuesto ({imp}) dentro"
+        else:
+            continue
+        quitar |= {id(l) for l in perdidas_e}
+        log(f"  fase 4: {len(perdidas_e)} cifra(s) de la lectura anterior no cuentan como perdidas ({motivo}): "
+            + "; ".join(f"«{l['descripcion'][:30]}» {l['importe_linea']}" for l in perdidas_e[:4]))
+    return [l for l in fuera if id(l) not in quitar]
+
+
 # ----------------------------------------------------------------------------- aplicar a una factura
 
 def _texto_factura(res, paginas, para_claude=False):
@@ -431,13 +477,23 @@ class Leido:
         ws = _palabras(desc)
         if not ws:
             return False
+        if not hasattr(self, "_homo"):
+            self._homo = {_homoglifos(w) for w in self.palabras}
         for w in ws:
             if w in self.palabras or w in self.sq:
+                continue
+            # I/l/1 y O/0 son el mismo trazo para un OCR: «FIBERGlASS» y «FIBERGLASS» (35076, FiberGlass Coatings)
+            if _homoglifos(w) in self._homo:
                 continue
             if len(w) >= 5 and any(len(o) == len(w) and sum(a != b for a, b in zip(o, w)) <= 1 for o in self.palabras):
                 continue
             return False
         return True
+
+
+def _homoglifos(w):
+    """Palabra con los trazos que un OCR confunde unificados: i, l, 1 -> l; o, 0 -> o."""
+    return w.translate(str.maketrans("i10", "llo"))
 
 
 def _palabras(t):
@@ -463,7 +519,7 @@ def _lineas_json(lineas, leido, divisa, pagina, estimadas, en_revision):
                   else "aritmetica" if l["qty"] > 1 and l["unit"] and amt is not None and l["qty"] * Decimal(l["unit"]) == amt
                   else "asumido" if l["qty"] == 1 else "modelo")
         ev = {"descripcion": "leido" if leido.descripcion(l["desc"]) else "modelo",
-              "importe_linea": ("leido" if printed_amt else "modelo") if l["amount"] else "",
+              "importe_linea": ("leido" if printed_amt else "calculado" if l.get("calc") else "modelo") if l["amount"] else "",
               "precio_unitario": "leido" if l["unit"] else "", "cantidad": qty_ev}
         ocr = {"precio_unitario": l["unit"] or (f"{amt / l['qty']:.2f}" if amt is not None and l["qty"] else ""),
                "cantidad_impresa": qty_ev == "leido",
@@ -592,7 +648,7 @@ def resolver(doc, res, log, llamar=None, pista="", out=None):
     # Puerta de cobertura: nunca se pierde una cifra impresa. Lo que la lectura anterior leyó con importe impreso tiene
     # que seguir en la UNIÓN de las líneas de todos los documentos (34293: 22540.00 desaparecieron).
     union = [l for e in evals for l in e["lineas"]]
-    fuera = perdidas(doc["lineas"], union, leido.importes, leido)
+    fuera = sin_sobrantes(perdidas(doc["lineas"], union, leido.importes, leido), doc["lineas"], evals, log)
     cobertura = ""
     if fuera:
         suma = sum(Decimal(l["importe_linea"]) for l in fuera)

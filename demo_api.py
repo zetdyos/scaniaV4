@@ -376,7 +376,18 @@ def fingerprints_of(job_id):
 
 
 def with_refs(job_id, fps):
-    """Huellas guardadas antes de 2026-10-22 no traen la referencia: se completa desde result.json (misma factura por id)."""
+    """Huellas guardadas antes de 2026-10-22 no traen la referencia: se completa desde result.json (misma factura por id).
+    Las anteriores al 2026-11-10 no traen los números de factura impresos (`inv`): se leen de ocr.md."""
+    if fps and not all("inv" in f for f in fps):
+        try:
+            texts = f2.page_texts((JOBS_DIR / job_id / "ocr.md").read_text(encoding="utf-8"))
+            pags = {i["id"]: i["ocr"]["paginas"]
+                    for i in json.loads((JOBS_DIR / job_id / "result.json").read_text(encoding="utf-8"))}
+            fps = [f if "inv" in f else dict(f, inv=f2.invoice_numbers("\n".join(
+                texts.get(n, "") for n in range(pags[f["id"]][0], pags[f["id"]][1] + 1)))) if f["id"] in pags else f
+                   for f in fps]
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
     if all("ref" in f for f in fps):
         return fps
     try:

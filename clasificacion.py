@@ -46,6 +46,8 @@ MAX_REF = 50
 MAX_LARGO = 2000
 ESPERA = float(os.environ.get("CLASIF_ESPERA", "40"))  # WTCP espera hasta 60 s por llamada (§8.3)
 MAX_INTENTOS = 3
+# Motivo del clasificador para una línea TERMINADA sin código nacional (hs6/api/batch.py `no_code_reason`): no es un fallo.
+SIN_CODIGO_RE = re.compile(r"no (?:\d+-digit [^:]*code|national code): ")
 TIEMPO_MAX_LINEA = float(os.environ.get("CLASIF_TIEMPO_MAX", "1200"))  # 20 min: el clasificador puede atender antes su interfaz
 OLVIDAR_DIAS = 7  # una línea en curso que WTCP no vuelve a pedir en una semana se olvida
 
@@ -273,12 +275,16 @@ def clasificar(items, cliente, encolar, espera=None, nomenclatura="scheduleb"):
             if it.get("status") == "done":
                 listos[k] = resultado(it, nomenclatura)
             elif it.get("status") in ("error", "cancelled"):
+                # «no 10-digit code: …» / «no 8-digit CN code: …»: el clasificador terminó y no hay código (HS6 bajo su
+                # umbral, «Coco», «DELIVERY»); repetirla da lo mismo y gasta el 27B: se entrega ya como no_clasificado.
+                # Un error de verdad (caída, «line lost») sigue con sus MAX_INTENTOS.
+                definitivo = it.get("status") == "error" and bool(SIN_CODIGO_RE.match(str(it.get("error") or "")))
                 with _LOCK:
                     en = _leer(EN_CURSO_FILE)
                     if k in en:
                         en[k]["errores"] = en[k].get("errores", 0) + 1
                         en[k]["line_id"] = None  # se vuelve a mandar en la próxima petición
-                        if en[k]["errores"] >= MAX_INTENTOS:
+                        if definitivo or en[k]["errores"] >= MAX_INTENTOS:
                             listos[k] = {"estado": "no_clasificado", "sugerencias": [], "version_catalogo": ""}
                         _guardar(EN_CURSO_FILE, en)
         if len(listos) == len(claves) or time.time() >= fin:

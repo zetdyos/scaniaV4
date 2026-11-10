@@ -18,7 +18,7 @@ import re
 import time
 import zipfile
 from datetime import date, datetime
-from decimal import ROUND_HALF_UP, Decimal
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from pathlib import Path
 
 import requests
@@ -174,16 +174,73 @@ def _conv(v, r):
     return str((Decimal(str(v)) * r).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
 
 
+# Marca de moneda pegada a un importe impreso (delante o detrás); las más largas primero («US$» antes que «$»).
+_SIMBOLOS = [("US$", "USD"), ("USD", "USD"), ("EUR", "EUR"), ("€", "EUR"), ("GBP", "GBP"), ("£", "GBP"), ("CAD", "CAD"),
+             ("C$", "CAD"), ("$", "$")]
+_DOLARES = {"USD", "CAD", "AUD", "NZD", "SGD", "HKD", "MXN", "XCD"}
+
+
+def printed_currencies(amount, text):
+    """Monedas impresas junto a `amount` en el texto («$118.50», «EUR 106.14», «45,00 €»); «$» queda como «$» (dólar
+    sin país). Vacío si la cifra no aparece con marca."""
+    try:
+        a = Decimal(str(amount))
+    except (InvalidOperation, ValueError):
+        return set()
+    us = f"{a:,.2f}"
+    variants = {f"{a:.2f}", us, us.replace(",", "X").replace(".", ",").replace("X", "."), f"{a:.2f}".replace(".", ",")}
+    found = set()
+    for v in variants:
+        for m in re.finditer(r"(?<![\d.,])" + re.escape(v) + r"(?![\d])", text or ""):
+            before, after = text[max(0, m.start() - 6):m.start()].rstrip(), text[m.end():m.end() + 6].lstrip()
+            for sym, cur in _SIMBOLOS:
+                if before.endswith(sym) or after.startswith(sym):
+                    found.add(cur)
+                    break
+    return found
+
+
+def check_line_currencies(doc, markdown):
+    """La divisa de cada artículo la da el modelo; el código la COMPRUEBA con la marca impresa junto a su importe. Una línea
+    impresa en dólares («$118.50») en una factura cuyo resumen está en euros (Amazon cobrando en EUR: accu, poollight,
+    35358, 34723) pasa a USD: así la factura tiene dos monedas y no se convierte (`convert_invoice`: a revisión), en vez
+    de convertir como euros una cifra que ya está en dólares (118.50 -> 132.55). Devuelve las notas para el motivo."""
+    text = invoice_text(markdown, (doc.get("ocr") or {}).get("paginas"))
+    notes = []
+    for l in doc["lineas"]:
+        cur, amt = l.get("divisa") or "", l.get("importe_linea") or ""
+        if l.get("line_kind") != "goods" or not cur or not amt or cur in _DOLARES:
+            continue
+        # el importe, o el precio por unidad cuando solo se imprime ese (poollight: 4 × «$45.00» = 180.00)
+        marks = printed_currencies(amt, text) | printed_currencies((l.get("ocr") or {}).get("precio_unitario") or "", text)
+        if not marks or cur in marks:
+            continue
+        nueva = "USD" if marks == {"$"} or marks == {"$", "USD"} else (next(iter(marks)) if len(marks) == 1 else "")
+        if not nueva or nueva == "$":
+            continue
+        l["divisa"] = nueva
+        notes.append(f"item «{l['descripcion'][:40]}» is printed in {nueva} ({amt}) while the model gave {cur}")
+    return notes
+
+
 def convert_invoice(doc, dst, log, today=None, markdown=""):
     """Pasa los importes de una factura a la moneda `dst`. Devuelve True si convirtió. `markdown` (fase 1) sirve para
     hallar la fecha con etiqueta cuando la fase 2 no dejó fecha_pedido."""
     o = doc["ocr"]
+    notas_divisa = check_line_currencies(doc, markdown) if markdown else []
     cur = {l["divisa"] for l in doc["lineas"] if l.get("divisa")}
-    o["moneda_factura"] = next(iter(cur)) if len(cur) == 1 else ""
+    o["moneda_factura"] = next(iter(cur)) if len(cur) == 1 and not notas_divisa else ""
     o["tipo_cambio"] = None
+    from facturas_json import mark_review
+    if notas_divisa:
+        # Artículos en una moneda y el resumen en otra: nada se convierte (una sola tasa no vale para las dos) y la
+        # factura va a revisión aunque las líneas ya estén en la moneda del cliente (el total impreso no lo está).
+        mark_review(doc, "mixed currencies: " + "; ".join(notas_divisa) + f"; amounts not converted to {dst}; review "
+                    "against the paper")
+        log(f"  factura {doc['id']}: monedas mezcladas ({'; '.join(notas_divisa)[:200]}): sin convertir")
+        return False
     if not doc["lineas"] or cur == {dst}:
         return False
-    from facturas_json import mark_review
     if len(cur) != 1:
         what = "could not be determined" if not cur else "is not unique (" + ", ".join(sorted(cur)) + ")"
         mark_review(doc, f"the invoice currency {what}: amounts not converted to {dst}; review against the paper")
