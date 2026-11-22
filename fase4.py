@@ -34,7 +34,12 @@ Sin líneas de Claude, la factura sigue como estaba con su explicación.
 
 Configuración en `scania_config.json` -> `fase4` (se lee en cada factura, sin reiniciar): `activa` (true/false: el
 interruptor; con false no se llama nunca, haya o no clave), `modelo` (por defecto claude-sonnet-5-5, el probado el
-2026-10-23) y `precios_usd_por_millon` (precio de lista de la Claude API). La clave va en ANTHROPIC_API_KEY o en
+2026-10-23; desde el 2026-11-22 la config pone claude-opus-5-5), `effort` (output_config.effort de la API; vacío = el del
+modelo, que en Opus 5.5 es medium) y `precios_usd_por_millon` (precio de lista de la Claude API). Opus 5.5 frente a
+Sonnet 5.5 (2026-11-22, 40 trabajos auditados, fase 2 repetida sin GPU + llamada real, 4,87 USD): 30 iguales; Opus
+quita el único error sin revisión de la muestra (recargo de tarjeta como mercancía, 00035813) y rescata bien un Temu;
+deja en revisión 5 facturas que Sonnet resolvía bien, porque escribe avisos ciertos en `explicacion` (descripción tapada
+por el recibo de tarjeta, página que falta) y la explicación no vacía nunca se acepta; ningún error nuevo sin revisión. La clave va en ANTHROPIC_API_KEY o en
 anthropic_key.txt (fuera de git), o en el archivo de `archivo_clave`; activa sin clave = apagada, con aviso en el registro. Para pruebas, la variable
 FASE4=cli usa el CLI de Claude Code en lugar de la API.
 
@@ -94,6 +99,11 @@ def config():
 
 def modelo():
     return config().get("modelo") or "claude-sonnet-5-5"
+
+
+def esfuerzo():
+    """`output_config.effort` de la petición (low/medium/high/xhigh/max); vacío = el del modelo (Opus 5.5: medium)."""
+    return config().get("effort") or ""
 
 
 def modo():
@@ -186,9 +196,11 @@ def _llamar_api(pngs, texto, pista=""):
     content = [{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": base64.b64encode(p).decode()}}
                for p in pngs]
     content.append({"type": "text", "text": _prompt(texto, pista)})
+    cuerpo = {"model": modelo(), "max_tokens": MAX_TOKENS, "messages": [{"role": "user", "content": content}]}
+    if esfuerzo():
+        cuerpo["output_config"] = {"effort": esfuerzo()}
     r = requests.post(API_URL, timeout=TIMEOUT, headers={"x-api-key": _clave(), "anthropic-version": "2023-06-01",
-                                                          "content-type": "application/json"},
-                      json={"model": modelo(), "max_tokens": MAX_TOKENS, "messages": [{"role": "user", "content": content}]})
+                                                          "content-type": "application/json"}, json=cuerpo)
     r.raise_for_status()
     d = r.json()
     u = d.get("usage", {})

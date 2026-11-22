@@ -2,7 +2,9 @@
   "_nota": "Configuración de SCANIA (sin secretos: la clave de la Claude API va en ANTHROPIC_API_KEY o en anthropic_key.txt del repo, fuera de git; también puede indicarse otro archivo con fase4.archivo_clave). Se lee en cada factura: cambiar un valor no exige reiniciar la API.",
   "fase4": {
     "activa": true,
-    "modelo": "claude-sonnet-5-5",
+    "modelo": "claude-opus-5-5",
+    "effort": "high",
+    "_modelo": "2026-11-22: Opus 5.5 con effort high (medido frente a Sonnet 5.5 sobre 40 trabajos auditados; ver fase4.py). Para volver: modelo claude-sonnet-5-5 y effort vacio.",
     "_precios": "USD por millón de fichas, precio de lista de la Claude API (https://platform.claude.com/docs/en/about-claude/pricing, consultado 2026-10-23)",
     "precios_usd_por_millon": {
       "claude-sonnet-5-5": {
