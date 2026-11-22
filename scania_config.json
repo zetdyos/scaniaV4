@@ -26,5 +26,9 @@
   "clasificacion": {
     "_nota": "nc_activa: true desde el 2026-11-05 (clasificador con la NC 2026 desplegado: versions.cn en su /api/health). Con false, pais_origen de la UE recibe 400. Se lee en cada petición, sin reiniciar.",
     "nc_activa": true
+  },
+  "manuscrito": {
+    "_nota": "activa: manuscritos (recibos con los VALORES escritos a mano) a revisión. Se le pregunta al Qwen2.5-VL (:8088) '¿los dígitos son manuscritos?' SOLO cuando la factura saldría sin revisión, ninguna cantidad es impresa y no es marketplace (Amazon/Shein/Temu/eBay) -> ~15% de las sin-revisión. Medido 2026-11-20: el VL distingue 12/12 (recibos térmicos, fotos en ángulo y capturas digitales salen 'impreso'). Se lee en cada factura, sin reiniciar. OFF hasta validar en producción.",
+    "activa": false
   }
 }

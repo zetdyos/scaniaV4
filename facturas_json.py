@@ -599,7 +599,7 @@ VERIF_HEADER = "\n### Verificación de importes"  # sección de diagnóstico que
 _LLM_CACHE = {}  # (servidor, Markdown de la página) -> respuesta; se vacía por documento en build_all
 # Respuestas crudas de los modelos del último documento (build_all las vacía al empezar): la API las guarda en
 # modelos.json de cada trabajo para medir cambios del código y calibrar los modelos sin volver a llamarlos.
-MODEL_RAW = {"27b": {}, "27b_imagen": {}, "vl_pagina": {}, "vl_foto": {}, "ppocr": {}}
+MODEL_RAW = {"27b": {}, "27b_imagen": {}, "vl_pagina": {}, "vl_foto": {}, "ppocr": {}, "manuscrito": {}}
 # 27B con su proyector de visión (desde 2026-10-21, --image-max-tokens 2048 en el host): cuando una factura no cuadra con
 # la lectura de texto, se repite con la imagen de cada página delante del texto de GLM (ver build_all).
 IMAGE_MAX_TOKENS = 2048
@@ -743,6 +743,59 @@ def lines_with_vl(pdf, pages, server, timeout, log):
     finally:
         doc.close()
     return lines, total
+
+
+# --- Manuscritos a revisión (decisión del usuario 2026-11-20) ---------------------------------------------------
+# Un recibo con los VALORES del item table escritos a MANO no es verificable (los números manuscritos no cuentan,
+# regla #5) y debe ir a revisión. Hoy el pipeline solo sabe "¿está la cifra en el texto OCR?", así que un manuscrito
+# LEGIBLE (Sens De La Mode 3350) cuadra y pasa sin revisión mientras uno ilegible (H Y Jeans) ya va a LECTURA. Esto lo
+# cierra: cuando una factura SALDRÍA SIN REVISIÓN y "luce dudosa" (ninguna cantidad impresa y sin marcador de
+# marketplace), se le pregunta al Qwen2.5-VL si los dígitos son manuscritos; si sí, LECTURA. Interruptor
+# scania_config.json -> manuscrito.activa (se lee en cada factura, OFF por defecto, igual que la fase 4). Medido
+# 2026-11-20: dispara en el 15 % de las facturas sin revisión; el VL distingue manuscrito/impreso 12/12 (recibos
+# térmicos, fotos en ángulo y capturas digitales de Amazon salen "impreso") con el prompt de uniformidad de fuente.
+MANUSCRITO_PROMPT = (
+    "Look closely at the characters of the NUMBERS in the item table (quantities, prices, amounts). If they are a "
+    "uniform computer font - every identical digit has exactly the same crisp, regular shape, perfectly aligned - then "
+    "they are PRINTED (handwritten=false). If the digits are irregular pen strokes with varying shapes and sizes, drawn "
+    "by hand, then handwritten=true. A laser-printed invoice, a PDF, or a photo/screenshot of a phone or computer "
+    "screen is PRINTED, never handwritten. Judge only the digits, not the printed form lines.")
+MANUSCRITO_SCHEMA = {"type": "object", "additionalProperties": False,
+                     "properties": {"handwritten": {"type": "boolean"}, "reason": {"type": "string"}},
+                     "required": ["handwritten", "reason"]}
+# Marcadores de marketplace digital (Amazon, Shein, Temu, eBay): sus cifras son impresas, nunca se preguntan.
+MKT_REF_RE = re.compile(r"^(11[1-9]-\d{7}-\d{7}|GSU[0-9A-Z]{10,}|PO-\d|1[0-9]-\d{5}-\d{5})")
+_CONFIG_FILE = Path(__file__).resolve().parent / "scania_config.json"
+
+
+def manuscrito_activo():
+    """Interruptor scania_config.json -> manuscrito.activa (se lee en cada factura; off si falta el archivo o la clave)."""
+    try:
+        return bool(json.loads(_CONFIG_FILE.read_text(encoding="utf-8")).get("manuscrito", {}).get("activa"))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def is_handwritten(pdf, pages, server, timeout, log):
+    """True si el Qwen2.5-VL ve los VALORES del item table escritos a mano; None si falla. Solo la 1ª página del grupo."""
+    try:
+        with fitz.open(pdf) as doc:
+            page = doc[pages[0]]
+            dpi = p1.fit_dpi(page, 200, p1.QWEN_MAX_TOKENS)
+            img = base64.b64encode(page.get_pixmap(dpi=dpi, alpha=False).tobytes("png")).decode("ascii")
+        payload = {"messages": [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img}"}},
+            {"type": "text", "text": MANUSCRITO_PROMPT}]}],
+            "temperature": 0, "top_k": 1, "repeat_penalty": 1.05, "cache_prompt": False, "max_tokens": 300,
+            "response_format": {"type": "json_schema", "json_schema": {"name": "hw", "schema": MANUSCRITO_SCHEMA}}}
+        content = post_json(f"{server}/v1/chat/completions", payload, timeout, log=log)["choices"][0]["message"]["content"]
+        MODEL_RAW["manuscrito"][str(pages[0])] = content
+        hw = bool(json.loads(content).get("handwritten"))
+        log(f"  manuscrito? {hw} (Qwen2.5-VL)")
+        return hw
+    except Exception as e:  # noqa: BLE001  un fallo del VL nunca tumba el trabajo
+        log(f"  comprobación de manuscrito falló ({type(e).__name__}); sigue sin ella")
+        return None
 
 
 # ----------------------------------------------------------------------------- campos adicionales desde el OCR
@@ -2358,6 +2411,15 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
         l["evidence"] = line_evidence(l, sq_text, ocr_amounts, all_ok, ocr_units)
         l["verified"] = l.get("verified", all_ok) and "modelo" not in l["evidence"].values()
     issues += evidence_issues(lines)
+    # Manuscritos a revisión: si la factura saldría SIN REVISIÓN y luce dudosa (ninguna cantidad impresa y sin
+    # marcador de marketplace), preguntar al Qwen2.5-VL si los valores están escritos a mano (ver is_handwritten).
+    # El VL (la llamada) va al final del and: solo se dispara cuando todas las condiciones baratas pasan.
+    if (vl and not issues and lines and manuscrito_activo() and p1.server_ok(vl_server)
+            and not any((l.get("evidence") or {}).get("cantidad") == "leido" for l in lines)
+            and not MKT_REF_RE.match(inv["ref"] or next(iter(EBAY_ORDER_RE.findall(md)), "") or printed_ref(md) or "")
+            and is_handwritten(res["pdf"], pages, vl_server, timeout, log)):
+        issues.append("handwritten invoice: the item values are filled in by hand and cannot be verified against "
+                      "printed text; review against the paper")
     for l in others:  # no-mercadería: evidencia de sus valores, nunca "verificada" como artículo
         l["evidence"], l["verified"] = line_evidence(l, sq_text, ocr_amounts, False, ocr_units), False
     # Subtotal de artículos de la cabecera: si el que quedó no es la suma de las líneas (Temu imprime «Item(s) total» con el
