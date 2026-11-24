@@ -2465,13 +2465,15 @@ def build_invoice(inv_id, res, inv, use_llm, llm_server, vl_server, timeout, log
     }, source
 
 
-def split_by_orders(g0, res, inv, llm_server, vl_server, timeout):
+def split_by_orders(g0, res, inv, llm_server, vl_server, timeout, rescate=None):
     """Un PDF con varios pedidos sin marcador conocido (facturas Shein, eBay o de proveedor una tras otra): se
     corta en grupos de páginas consecutivas que cuadran CADA UNO con su propio total o subtotal impreso. Sin VL: un
     grupo que solo cuadrara con la lectura visual no prueba el corte. Desde cada página se busca el grupo más corto que
     cuadra; una página desde la que ninguno cuadra queda pendiente y las pendientes seguidas forman UNA factura que va
     a revisión como siempre (antes era todo o nada: una página mal leída dejaba el documento entero en revisión,
-    30276, 31620, 32413). Devuelve las facturas, o None si no hay al menos un grupo que cuadre y otra factura."""
+    30276, 31620, 32413). Devuelve las facturas, o None si no hay al menos un grupo que cuadre y otra factura.
+    `rescate(doc, source, inv_id, inv)`: la lectura con la imagen del 27B, solo para las páginas pendientes (desde el
+    2026-11-23 el corte va ANTES de la imagen: releer con imagen un archivo de 52 páginas antes de cortarlo costaba horas)."""
     pages, out, i, pending = inv["pages"], [], 0, []
     quiet = lambda m: None
 
@@ -2481,7 +2483,17 @@ def split_by_orders(g0, res, inv, llm_server, vl_server, timeout):
     abort = []
 
     def flush():
-        if pending:  # páginas que no cuadran con nada: una factura, con la lectura visual de siempre
+        if pending and rescate:  # como la factura entera: texto, luego la imagen solo de ESTAS páginas, luego el VL
+            pid, inv_p = g0 + len(out), own(pending)
+            doc, src = build_invoice(pid, res, inv_p, True, llm_server, vl_server, timeout, quiet, vl=False)
+            doc, src = rescate(doc, src, pid, inv_p)
+            if src == "llm" and (not doc["_cuadra"] or doc.get("_ambiguo")):
+                doc, src = build_invoice(pid, res, inv_p, True, llm_server, vl_server, timeout, quiet)
+            if not doc["total_is_printed"]:
+                abort.append(True)
+            out.append(doc)
+            pending.clear()
+        elif pending:  # páginas que no cuadran con nada: una factura, con la lectura visual de siempre
             doc, _ = build_invoice(g0 + len(out), res, own(pending), True, llm_server, vl_server,
                                    timeout, quiet)
             # Sin total impreso propio, esas páginas pueden ser el principio del pedido siguiente («Continued on next
@@ -2652,9 +2664,11 @@ def build_all(res, use_llm=True, llm_server=QWEN27_SERVER, vl_server=VL_SERVER, 
             # Medido y NO aplicado (2026-10-23, 35 facturas con «no printed total» como única causa, pasada con GPU):
             # disparar la imagen también sin total impreso no sacó ninguna de revisión (31930 salió por otra vía: PP-OCRv6
             # cuenta como lector del total impreso, ver printed_count); el resto no tiene total o no cuadra tampoco con la imagen.
-            if source == "llm" and not doc["_cuadra"] and server_has_vision(llm_server):
+            def con_imagen(doc, source, inv_id, inv_x):
+                if not (source == "llm" and not doc["_cuadra"] and server_has_vision(llm_server)):
+                    return doc, source
                 img_log = []
-                alt, alt_source = build_invoice(len(out), rs, inv, use_llm, llm_server, vl_server, timeout, img_log.append,
+                alt, alt_source = build_invoice(inv_id, rs, inv_x, use_llm, llm_server, vl_server, timeout, img_log.append,
                                                 vl=False, img=True)
                 # La imagen solo completa la lectura de texto, nunca la contradice: cada importe de artículo que la vía de
                 # texto leyó literal sigue en alguna línea (como importe o como precio unitario: «3» en la foto), y el
@@ -2672,10 +2686,17 @@ def build_all(res, use_llm=True, llm_server=QWEN27_SERVER, vl_server=VL_SERVER, 
                 if alt_source == "llm" and alt["_cuadra"] and not alt["motivo_revision"] and keeps:
                     log("     con la imagen de la página (27B con visión), todo lo impreso cuadra exactamente")
                     alt["ocr"]["origen_lineas"] = "llm+imagen"
-                    doc, source = alt, alt_source
+                    return alt, alt_source
+                return doc, source
+            # Primero el corte por pedidos (solo texto, respuestas del 27B ya en caché) y DESPUÉS la imagen, solo de las
+            # páginas que no cuadran con nada (2026-11-23, decisión del usuario: 00036732, 17 páginas de 10 vendedores, y
+            # 00036532, 52 páginas, releían con imagen el archivo entero antes de cortarlo: horas de GPU). Sin corte, la
+            # imagen del documento entero como antes.
             parts = None
             if source == "llm" and not doc["_cuadra"] and len(pages) > 1:
-                parts = split_by_orders(len(out), rs, inv, llm_server, vl_server, timeout)
+                parts = split_by_orders(len(out), rs, inv, llm_server, vl_server, timeout, rescate=con_imagen)
+            if not parts:
+                doc, source = con_imagen(doc, source, len(out), inv)
             if parts:
                 log(f"     no cuadra entero; {len(parts)} pedido(s) que cuadran cada uno con su total impreso: páginas "
                     + ", ".join(f"{p['ocr']['paginas'][0]}-{p['ocr']['paginas'][1]}" for p in parts))
